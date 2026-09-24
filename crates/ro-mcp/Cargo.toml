@@ -1,0 +1,27 @@
+[package]
+name = "ro-mcp"
+description = "MCP server for AI-driven ro operations"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ro-core.workspace = true
+ro-config.workspace = true
+ro-state.workspace = true
+ro-sync.workspace = true
+ro-context.workspace = true
+ro-review.workspace = true
+ro-sweep.workspace = true
+ro-jobs.workspace = true
+ro-output.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+rmcp = "0.1"

@@ -1,0 +1,20 @@
+[package]
+name = "ro-output"
+description = "Output formatting: text, JSON, NDJSON, TOON renderers"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ro-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+comfy-table.workspace = true
+owo-colors.workspace = true
+console.workspace = true
+time.workspace = true

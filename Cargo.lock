@@ -2927,321 +2927,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rfo"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "globset",
- "predicates",
- "rfo-config",
- "rfo-context",
- "rfo-core",
- "rfo-git",
- "rfo-github",
- "rfo-jobs",
- "rfo-output",
- "rfo-provider",
- "rfo-review",
- "rfo-state",
- "rfo-sweep",
- "rfo-sync",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rfo-ai-sync"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-git",
- "rfo-jobs",
- "rfo-ntm",
- "rfo-sync",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-config"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "dirs",
- "rfo-core",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "rfo-context"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-github",
- "rfo-output",
- "rfo-state",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-core"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "dirs",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "uuid",
-]
-
-[[package]]
-name = "rfo-dep-update"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-ntm",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-git"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "fs4",
- "gix",
- "regex",
- "rfo-core",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-github"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "octocrab",
- "reqwest",
- "rfo-core",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "rfo-jobs"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-core",
- "rfo-state",
- "rusqlite",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-mcp"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-context",
- "rfo-core",
- "rfo-jobs",
- "rfo-output",
- "rfo-review",
- "rfo-state",
- "rfo-sweep",
- "rfo-sync",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-ntm"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-output"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "console",
- "owo-colors",
- "rfo-core",
- "serde",
- "serde_json",
- "time",
-]
-
-[[package]]
-name = "rfo-provider"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "rfo-config",
- "rfo-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-review"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-output",
- "rfo-state",
- "rusqlite",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-state"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-sweep"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "globset",
- "regex",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-output",
- "rfo-provider",
- "rfo-state",
- "rfo-sync",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-sync"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "console",
- "indicatif",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-output",
- "rfo-state",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-testkit"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-core",
- "rfo-state",
- "rusqlite",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3285,6 +2970,292 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "ro"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "globset",
+ "predicates",
+ "ro-config",
+ "ro-context",
+ "ro-core",
+ "ro-git",
+ "ro-github",
+ "ro-jobs",
+ "ro-output",
+ "ro-provider",
+ "ro-review",
+ "ro-state",
+ "ro-sweep",
+ "ro-sync",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ro-config"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "ro-context"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-github",
+ "ro-output",
+ "ro-state",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "ro-dep-update"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-git"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "gix",
+ "regex",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-github"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "octocrab",
+ "reqwest",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "ro-jobs"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-core",
+ "ro-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ro-mcp"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "rmcp",
+ "ro-config",
+ "ro-context",
+ "ro-core",
+ "ro-jobs",
+ "ro-output",
+ "ro-review",
+ "ro-state",
+ "ro-sweep",
+ "ro-sync",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-output"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "comfy-table",
+ "console",
+ "owo-colors",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
+name = "ro-provider"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ro-config",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-review"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "comfy-table",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "ro-output",
+ "ro-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ro-state"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ro-sweep"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "comfy-table",
+ "globset",
+ "regex",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "ro-output",
+ "ro-provider",
+ "ro-state",
+ "ro-sync",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-sync"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "console",
+ "indicatif",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "ro-output",
+ "ro-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ro-testkit"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-core",
+ "ro-state",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -4850,29 +4821,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "xshell"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e7290c623014758632efe00737145b6867b66292c42167f2ec381eb566a373d"
-dependencies = [
- "xshell-macros",
-]
-
-[[package]]
-name = "xshell-macros"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32ac00cd3f8ec9c1d33fb3e7958a82df6989c42d747bd326c822b1d625283547"
-
-[[package]]
-name = "xtask"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "xshell",
-]
 
 [[package]]
 name = "yoke"

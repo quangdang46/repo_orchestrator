@@ -157,7 +157,7 @@ jobs:
             "https://github.com/axodotdev/cargo-dist/releases/download/v${DIST_VERSION}/cargo-dist-installer.sh" | sh
 
       # `dist build --artifacts=global` emits the cargo-dist universal installer
-      # scripts (rfo-installer.sh / rfo-installer.ps1) plus an updated
+      # scripts (ro-installer.sh / ro-installer.ps1) plus an updated
       # dist-manifest.json. The installers reference release-asset URLs derived
       # from the tag, so they don't need the matrix archives to be physically
       # present here.

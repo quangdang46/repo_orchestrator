@@ -1,0 +1,23 @@
+[package]
+name = "ro-state"
+description = "SQLite schema, migrations, and queries for ro"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ro-core.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

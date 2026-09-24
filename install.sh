@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# rfo installer (Linux + macOS, x86_64 + aarch64).
+# ro installer (Linux + macOS, x86_64 + aarch64).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/quangdang46/repo_forge_orchestrator/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main/install.sh | bash
 #
 # Environment overrides:
-#   RFO_VERSION       Tag to install (e.g. v0.1.0). Default: latest GitHub release.
-#   RFO_INSTALL_DIR   Where the `rfo` binary is placed. Default: $HOME/.local/bin.
-#   RFO_NO_VERIFY     If set to 1, skip SHA256 verification (NOT recommended).
-#   RFO_FORCE         If set to 1, overwrite an existing binary without prompting.
+#   RO_VERSION       Tag to install (e.g. v0.1.0). Default: latest GitHub release.
+#   RO_INSTALL_DIR   Where the `ro` binary is placed. Default: $HOME/.local/bin.
+#   RO_NO_VERIFY     If set to 1, skip SHA256 verification (NOT recommended).
+#   RO_FORCE         If set to 1, overwrite an existing binary without prompting.
 #
 # Exit codes:
 #   0  success
@@ -19,12 +19,12 @@
 
 set -euo pipefail
 
-REPO="quangdang46/repo_forge_orchestrator"
-BIN="rfo"
-VERSION="${RFO_VERSION:-latest}"
-INSTALL_DIR="${RFO_INSTALL_DIR:-$HOME/.local/bin}"
-NO_VERIFY="${RFO_NO_VERIFY:-0}"
-FORCE="${RFO_FORCE:-0}"
+REPO="quangdang46/repo_orchestrator"
+BIN="ro"
+VERSION="${RO_VERSION:-latest}"
+INSTALL_DIR="${RO_INSTALL_DIR:-$HOME/.local/bin}"
+NO_VERIFY="${RO_NO_VERIFY:-0}"
+FORCE="${RO_FORCE:-0}"
 
 # ---------- pretty output ----------
 if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
@@ -52,8 +52,8 @@ need() {
 }
 
 cleanup() {
-    if [ -n "${TMPDIR_RFO:-}" ] && [ -d "$TMPDIR_RFO" ]; then
-        rm -rf "$TMPDIR_RFO"
+    if [ -n "${TMPDIR_RO:-}" ] && [ -d "$TMPDIR_RO" ]; then
+        rm -rf "$TMPDIR_RO"
     fi
 }
 trap cleanup EXIT INT TERM
@@ -138,7 +138,7 @@ resolve_version() {
             | head -n1)"
         if [ -z "$tag" ]; then
             err "could not resolve latest release tag from $api"
-            err "GitHub may be rate-limiting; pin a version with RFO_VERSION=v0.1.0"
+            err "GitHub may be rate-limiting; pin a version with RO_VERSION=v0.1.0"
             exit 3
         fi
 
@@ -151,7 +151,7 @@ resolve_version() {
         if [ "$assets" = "EMPTY" ]; then
             err "release ${tag} has no assets yet (CI may still be building)"
             err "wait a few minutes and retry, or build from source:"
-            err "  git clone https://github.com/${REPO} && cd repo_forge && cargo build --release"
+            err "  git clone https://github.com/${REPO} && cd repo_orchestrator && cargo build --release"
             exit 3
         fi
 
@@ -169,7 +169,7 @@ main() {
     need uname
     need tar
 
-    info "rfo installer"
+    info "ro installer"
     info "repo:   https://github.com/${REPO}"
     info "user:   $(id -un 2>/dev/null || echo unknown)"
 
@@ -184,26 +184,26 @@ main() {
     archive_url="https://github.com/${REPO}/releases/download/${tag}/${archive_name}"
     checksum_url="${archive_url}.sha256"
 
-    TMPDIR_RFO="$(mktemp -d 2>/dev/null || mktemp -d -t rfo-install)"
+    TMPDIR_RO="$(mktemp -d 2>/dev/null || mktemp -d -t ro-install)"
 
     info "downloading ${archive_name}"
-    if ! http_get "$archive_url" "${TMPDIR_RFO}/${archive_name}"; then
+    if ! http_get "$archive_url" "${TMPDIR_RO}/${archive_name}"; then
         err "failed to download $archive_url"
         err "check that release ${tag} exists and includes ${archive_name}"
         exit 3
     fi
-    ok "downloaded $(du -h "${TMPDIR_RFO}/${archive_name}" | awk '{print $1}')"
+    ok "downloaded $(du -h "${TMPDIR_RO}/${archive_name}" | awk '{print $1}')"
 
     if [ "$NO_VERIFY" != "1" ]; then
         info "verifying SHA256"
-        if ! http_get "$checksum_url" "${TMPDIR_RFO}/${archive_name}.sha256"; then
+        if ! http_get "$checksum_url" "${TMPDIR_RO}/${archive_name}.sha256"; then
             err "failed to download checksum from $checksum_url"
-            err "set RFO_NO_VERIFY=1 to skip (not recommended)"
+            err "set RO_NO_VERIFY=1 to skip (not recommended)"
             exit 3
         fi
         local expected actual
-        expected="$(awk '{print $1}' "${TMPDIR_RFO}/${archive_name}.sha256")"
-        actual="$(sha256_of "${TMPDIR_RFO}/${archive_name}")"
+        expected="$(awk '{print $1}' "${TMPDIR_RO}/${archive_name}.sha256")"
+        actual="$(sha256_of "${TMPDIR_RO}/${archive_name}")"
         if [ "$expected" != "$actual" ]; then
             err "SHA256 mismatch!"
             err "  expected: $expected"
@@ -212,17 +212,17 @@ main() {
         fi
         ok "SHA256 verified"
     else
-        warn "RFO_NO_VERIFY=1 set; skipping checksum"
+        warn "RO_NO_VERIFY=1 set; skipping checksum"
     fi
 
     info "extracting archive"
-    ( cd "$TMPDIR_RFO" && tar -xf "$archive_name" )
+    ( cd "$TMPDIR_RO" && tar -xf "$archive_name" )
 
     # cargo-dist lays out the archive as: <bin>-<target>/<bin>
-    local extracted="${TMPDIR_RFO}/${BIN}-${target}/${BIN}"
+    local extracted="${TMPDIR_RO}/${BIN}-${target}/${BIN}"
     if [ ! -f "$extracted" ]; then
         # Fall back to a recursive find in case the layout changes.
-        extracted="$(find "$TMPDIR_RFO" -type f -name "$BIN" -perm -u+x 2>/dev/null | head -n1 || true)"
+        extracted="$(find "$TMPDIR_RO" -type f -name "$BIN" -perm -u+x 2>/dev/null | head -n1 || true)"
     fi
     if [ -z "$extracted" ] || [ ! -f "$extracted" ]; then
         err "could not locate '${BIN}' binary inside ${archive_name}"
@@ -232,7 +232,7 @@ main() {
     mkdir -p "$INSTALL_DIR"
     local dest="${INSTALL_DIR%/}/${BIN}"
     if [ -e "$dest" ] && [ "$FORCE" != "1" ]; then
-        warn "overwriting existing $dest (set RFO_FORCE=0 to refuse)"
+        warn "overwriting existing $dest (set RO_FORCE=0 to refuse)"
     fi
 
     install -m 0755 "$extracted" "$dest" 2>/dev/null || {

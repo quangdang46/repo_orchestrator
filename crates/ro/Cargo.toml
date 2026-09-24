@@ -1,0 +1,46 @@
+[package]
+name = "ro"
+description = "GitHub-first repo orchestration CLI"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[package.metadata.dist]
+dist = true
+
+[[bin]]
+name = "ro"
+path = "src/main.rs"
+
+[dependencies]
+ro-core.workspace = true
+ro-config.workspace = true
+ro-output.workspace = true
+ro-state.workspace = true
+ro-git.workspace = true
+ro-github.workspace = true
+ro-jobs.workspace = true
+ro-sync.workspace = true
+ro-context.workspace = true
+ro-review.workspace = true
+ro-sweep.workspace = true
+ro-provider.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+toml.workspace = true
+globset.workspace = true
+# tempfile is used by doctor tests in src/ (behind #[cfg(test)])
+tempfile.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true

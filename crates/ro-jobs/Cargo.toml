@@ -1,0 +1,22 @@
+[package]
+name = "ro-jobs"
+description = "Lightweight durable job execution and event recording"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ro-core.workspace = true
+ro-state.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+tokio.workspace = true

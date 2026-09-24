@@ -1,4 +1,4 @@
-# Cargo build configuration for repo_forge.
+# Cargo build configuration for repo_orchestrator.
 #
 # Notes:
 # - Keep this file minimal; per-crate flags live in each crate's Cargo.toml.

@@ -1,0 +1,20 @@
+[package]
+name = "ro-provider"
+description = "AI provider abstraction (Claude, Codex)"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ro-core.workspace = true
+ro-config.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait = "0.1"
