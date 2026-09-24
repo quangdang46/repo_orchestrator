@@ -23,6 +23,15 @@ enum OutputFormat {
     #[default]
     Text,
     Json,
+    Toon,
+}
+
+/// Print a value in TOON (compact tabular) form, the format `ru` emits.
+fn print_toon(value: &serde_json::Value) -> Result<()> {
+    let mut buf = Vec::new();
+    ro_output::text::write_toon(&mut buf, value)?;
+    print!("{}", String::from_utf8_lossy(&buf));
+    Ok(())
 }
 
 /// Auto-approve level for plan application.
@@ -155,6 +164,15 @@ enum Commands {
         /// Also prune missing repos
         #[arg(long)]
         missing: bool,
+        /// Scan the projects dir for working copies not in the inventory
+        #[arg(long)]
+        orphans: bool,
+        /// Move orphaned working copies into <state-dir>/archived
+        #[arg(long, conflicts_with = "delete")]
+        archive: bool,
+        /// Permanently delete orphaned working copies (destructive)
+        #[arg(long)]
+        delete: bool,
     },
 
     // ── Health ───────────────────────────────────────────────────────
@@ -426,6 +444,25 @@ fn repo_labels_by_id(conn: &ro_state::Connection) -> std::collections::HashMap<S
     map
 }
 
+/// Ask for a yes/no answer on stdin. Returns true only on `y`/`yes`.
+///
+/// Callers must gate on `--non-interactive` and TTY state before reaching
+/// here; this only handles the prompt itself.
+fn confirm(prompt: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        eprintln!("stdin is not a terminal; cannot prompt. Re-run with --non-interactive.");
+        return false;
+    }
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 fn resolve_paths(cli: &Cli) -> Result<ConfigPaths> {
     match (&cli.config_dir, &cli.state_dir) {
         (Some(config_dir), Some(state_dir)) => {
@@ -582,6 +619,8 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = resolve_paths(&cli)?;
     let db_path = paths.state_db();
+    let non_interactive = cli.non_interactive;
+    let _quiet = cli.quiet;
 
     match cli.command {
         // ── Repo management ──
@@ -621,6 +660,7 @@ fn run() -> Result<()> {
                         OutputFormat::Json => {
                             println!("{}", serde_json::to_string(&repo)?);
                         }
+                        OutputFormat::Toon => print_toon(&serde_json::to_value(&repo)?)?,
                     }
                 }
             }
@@ -715,6 +755,7 @@ fn run() -> Result<()> {
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string(r)?);
                     }
+                    OutputFormat::Toon => print_toon(&serde_json::to_value(r)?)?,
                 }
             }
         }
@@ -746,12 +787,59 @@ fn run() -> Result<()> {
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string(s)?);
                     }
+                    OutputFormat::Toon => print_toon(&serde_json::to_value(s)?)?,
                 }
             }
         }
 
-        Commands::Prune { archived, missing } => {
+        Commands::Prune {
+            archived,
+            missing,
+            orphans,
+            archive,
+            delete,
+        } => {
             let conn = ro_state::open_db(&db_path).context("opening state database")?;
+
+            if orphans || archive || delete {
+                use ro_sync::prune::{OrphanAction, find_orphans, handle_orphans};
+
+                if delete && !non_interactive && !std::io::IsTerminal::is_terminal(&std::io::stdin())
+                {
+                    eprintln!(
+                        "prune --delete needs an interactive terminal, or pass --non-interactive."
+                    );
+                    std::process::exit(3);
+                }
+
+                let found = find_orphans(&conn, &paths.state_dir.join("projects"))?;
+                if found.is_empty() {
+                    eprintln!("No orphan working copies found.");
+                } else {
+                    eprintln!("Found {} orphan working cop(ies):", found.len());
+                    for o in &found {
+                        eprintln!("  {}", o.path);
+                    }
+                }
+
+                let action = if delete {
+                    if !confirm("Permanently delete these directories? [y/N] ") {
+                        eprintln!("Aborted.");
+                        return Ok(());
+                    }
+                    OrphanAction::Delete
+                } else if archive {
+                    OrphanAction::Archive
+                } else {
+                    OrphanAction::Report
+                };
+
+                let done = handle_orphans(&found, action, &paths.state_dir)?;
+                if !done.is_empty() {
+                    eprintln!("Acted on {} orphan(s).", done.len());
+                }
+            }
+
             let mut pruned: Vec<prune::PruneResult> = Vec::new();
             if archived {
                 let results = prune::prune_archived(&conn)?;
@@ -805,6 +893,7 @@ fn run() -> Result<()> {
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string(snap)?);
                     }
+                    OutputFormat::Toon => print_toon(&serde_json::to_value(snap)?)?,
                 }
             }
         }
@@ -1230,6 +1319,7 @@ fn run() -> Result<()> {
                         serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
                     println!("{json}");
                 }
+                OutputFormat::Toon => print_toon(&serde_json::to_value(&report)?)?,
             }
             std::process::exit(report.exit_code());
         }
@@ -1325,6 +1415,13 @@ fn run() -> Result<()> {
                                     "is_fork": is_fork,
                                 });
                                 println!("{}", serde_json::to_string(&json)?);
+                            }
+                            OutputFormat::Toon => {
+                                let json = serde_json::json!({
+                                    "repo": format!("{}/{}", r.owner, r.name),
+                                    "is_fork": is_fork,
+                                });
+                                print_toon(&json)?;
                             }
                         }
                     }

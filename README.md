@@ -37,7 +37,7 @@ ro health --format json
 ro status --format json
 
 # Ranked attention
-ro inbox --format json
+ro health --format json
 
 # Plan automation
 ro review plan --format json
@@ -59,7 +59,7 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 | Pain | Symptom |
 |------|---------|
 | Drift | Working copies behind / dirty / conflicted |
-| Noise inbox | Issues/PRs/CI mixed without ranking |
+| Noise | Issues/PRs/CI mixed without ranking |
 | Blind automation | Scripts mutate without a reviewable plan |
 | Agent shell chaos | Models run raw `git`/`gh` with no safety gates |
 | No audit trail | “What did we change last Tuesday?” |
@@ -71,10 +71,10 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 | Capability | Command surface |
 |------------|-----------------|
 | Track & sync | `add` · `import` · `sync` · `status` · `prune` |
-| Attention | `health` · `inbox` |
+| Attention | `health` |
 | Risky ops | `review plan` · plan → apply → rollback |
 | Safety | secret scan · denylist · quality gates |
-| Agents | `--format json` · `robot-docs` · MCP-friendly structure |
+| Agents | `--format text|json|toon` · `robot-docs` · MCP-friendly structure |
 
 > **Status:** early development (v0.2.x) — public API and flags may shift before v1.0.
 
@@ -84,7 +84,7 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 |---------|--------------|
 | **Fleet inventory** | One SQLite DB for all tracked repos |
 | **First-class sync** | ff-only / rebase / merge, parallel, resume, autostash |
-| **Ranked attention** | Health scores + inbox instead of tab soup |
+| **Ranked attention** | Health scores instead of tab soup |
 | **Plan-then-apply** | Review/sweep flows produce plans before mutation |
 | **Agent-ready JSON** | Structured reads for coding agents and MCP |
 | **Doctor + self-update** | Diagnose, repair, upgrade in place |
@@ -100,7 +100,6 @@ ro import --org my-org --limit 50
 ro sync -j 4
 ro status --format json
 ro health
-ro inbox
 ro doctor
 ```
 
@@ -132,7 +131,7 @@ ro doctor
 | Manual `gh`/`git` | Manual | Manual | No | Fragile |
 | Ad-hoc scripts | Partial | No | Rarely | Opaque |
 | IDE multi-root | UI-only | Partial | No | Weak CLI |
-| **ro** | First-class | Ranked inbox | Plan/apply | JSON + MCP |
+| **ro** | First-class | Ranked health | Plan/apply | JSON + MCP |
 
 **When to use ro:**
 - You maintain a fleet of GitHub repos (personal monorepo farm, org mirror, agent lab)
@@ -193,7 +192,6 @@ ro import repos.list                 # or: ro import --stars / --org ORG / --use
 ro sync
 ro status
 ro health
-ro inbox
 ro doctor
 ```
 
@@ -220,8 +218,8 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 | Group | Command | What it does |
 |-------|---------|--------------|
 | Setup | `init` · `doctor [--fix]` | Config + SQLite; diagnose/repair |
-| Repos | `add` · `remove` · `list` · `import` · `prune` | Track inventory |
-| Sync | `sync` · `status` · `health` · `inbox` | Working copies + attention |
+| Repos | `add` · `remove` · `list` · `import` · `prune --orphans --archive` | Track inventory |
+| Sync | `sync` · `status` · `health` | Working copies + attention |
 | Runs | `run list/show/timeline` | Inspect past runs |
 | Conflicts | `conflict list/explain/abort/mark-resolved` | Merge/rebase recovery |
 | Review | `review plan` (+ apply/rollback flows) | Plan-then-apply |
@@ -243,7 +241,6 @@ ro sync --resume
 # Attention
 ro health --format json
 ro status my-org/service-a
-ro inbox
 
 # Safety-oriented automation
 ro review plan

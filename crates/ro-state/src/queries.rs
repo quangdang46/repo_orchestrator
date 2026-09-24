@@ -1,6 +1,6 @@
 //! Typed queries for ro state.
 //!
-//! Health scoring, inbox scoring, context queries.
+//! Health scoring, context queries.
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -161,112 +161,6 @@ pub fn score_all_health(conn: &Connection) -> Result<Vec<HealthSnapshot>> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Inbox item representing something needing attention.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InboxItem {
-    pub repo_id: String,
-    pub owner: String,
-    pub name: String,
-    pub priority: i64,
-    pub reason: String,
-}
-
-/// Mark an inbox item as done (dismissed). Idempotent.
-///
-/// Future `compute_inbox` calls will exclude this repo's inbox entry.
-pub fn mark_inbox_done(conn: &Connection, repo_id: &str) -> Result<()> {
-    let now = now_secs();
-    conn.execute(
-        "INSERT OR REPLACE INTO inbox_dismissed (repo_id, dismissed_at) VALUES (?1, ?2)",
-        params![repo_id, now],
-    )?;
-    Ok(())
-}
-
-/// Clear dismissals older than the given timestamp. Returns count cleared.
-pub fn purge_inbox_dismissals(conn: &Connection, older_than: i64) -> Result<usize> {
-    let n = conn.execute(
-        "DELETE FROM inbox_dismissed WHERE dismissed_at < ?1",
-        params![older_than],
-    )?;
-    Ok(n)
-}
-
-/// Compute inbox items for all repos.
-pub fn compute_inbox(conn: &Connection) -> Result<Vec<InboxItem>> {
-    let mut items = Vec::new();
-    let mut stmt = conn.prepare(
-        "SELECT r.id, r.owner, r.name, r.archived, r.disabled \
-         FROM repos r \
-         WHERE r.id NOT IN (SELECT repo_id FROM inbox_dismissed) \
-         ORDER BY r.owner, r.name",
-    )?;
-    let rows: Vec<(String, String, String, bool, bool)> = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)? != 0,
-                row.get::<_, i64>(4)? != 0,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for (id, owner, name, archived, disabled) in rows {
-        let mut priority = 0i64;
-        let mut reasons = Vec::new();
-
-        if disabled {
-            priority += 10;
-            reasons.push("disabled".into());
-        }
-        if archived {
-            priority += 3;
-            reasons.push("archived".into());
-        }
-
-        // Check for failed syncs
-        let failed: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_results WHERE repo_id = ?1 AND status = 'error'",
-                params![id],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
-        if failed > 0 {
-            priority += 5 * failed.min(3);
-            reasons.push(format!("{failed} failed syncs"));
-        }
-
-        // Check for recent failures
-        let recent: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM failures WHERE fingerprint LIKE '%' || ?1 || '%' AND last_seen_at > ?2",
-                params![id, now_secs() - 86400],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0);
-        if recent > 0 {
-            priority += 3 * recent.min(3);
-            reasons.push(format!("{recent} recent failures"));
-        }
-
-        if !reasons.is_empty() {
-            items.push(InboxItem {
-                repo_id: id,
-                owner,
-                name,
-                priority,
-                reason: reasons.join(", "),
-            });
-        }
-    }
-
-    items.sort_by_key(|item| std::cmp::Reverse(item.priority));
-    Ok(items)
-}
 
 // ---------------------------------------------------------------------------
 // Helpers

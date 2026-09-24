@@ -187,4 +187,36 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("a: 1"));
     }
+
+    #[test]
+    fn toon_renders_uniform_arrays_as_a_table() {
+        let v = serde_json::json!([
+            {"owner": "alice", "name": "one", "dirty": false},
+            {"owner": "bob",   "name": "two", "dirty": true},
+        ]);
+        let mut buf = Vec::new();
+        write_toon(&mut buf, &v).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+
+        assert_eq!(lines.len(), 3, "header plus one row per element");
+        // Header keys are sorted, so the column order is dirty, name, owner.
+        assert_eq!(lines[0], "dirty\tname\towner");
+        assert_eq!(lines[1], "false\tone\talice");
+        assert_eq!(lines[2], "true\ttwo\tbob");
+    }
+
+    #[test]
+    fn toon_falls_back_for_ragged_arrays() {
+        // Different key sets mean no single header applies, so the tabular
+        // path must not be used.
+        let v = serde_json::json!([
+            {"a": 1},
+            {"b": 2},
+        ]);
+        let mut buf = Vec::new();
+        write_toon(&mut buf, &v).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.starts_with("a\t"), "ragged input must not get a header");
+    }
 }
