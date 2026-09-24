@@ -20,16 +20,6 @@ pub fn write_compact<W: Write>(w: &mut W, value: &serde_json::Value) -> anyhow::
     Ok(())
 }
 
-/// Write a pretty-printed JSON value to stdout.
-pub fn print_pretty(value: &serde_json::Value) {
-    let _ = write_pretty(&mut std::io::stdout(), value);
-}
-
-/// Write a compact JSON value to stdout.
-pub fn print_compact(value: &serde_json::Value) {
-    let _ = write_compact(&mut std::io::stdout(), value);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

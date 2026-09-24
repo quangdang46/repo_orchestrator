@@ -9,13 +9,9 @@ members = [
     "crates/ro-github",
     "crates/ro-jobs",
     "crates/ro-sync",
-    "crates/ro-context",
     "crates/ro-review",
     "crates/ro-sweep",
-    "crates/ro-provider",
-    "crates/ro-mcp",
     "crates/ro-dep-update",
-    "crates/ro-testkit",
 ]
 resolver = "3"
 default-members = ["crates/ro"]
@@ -40,13 +36,9 @@ ro-git         = { path = "crates/ro-git" }
 ro-github      = { path = "crates/ro-github" }
 ro-jobs        = { path = "crates/ro-jobs" }
 ro-sync        = { path = "crates/ro-sync" }
-ro-context     = { path = "crates/ro-context" }
 ro-review      = { path = "crates/ro-review" }
 ro-sweep       = { path = "crates/ro-sweep" }
-ro-provider    = { path = "crates/ro-provider" }
-ro-mcp         = { path = "crates/ro-mcp" }
 ro-dep-update  = { path = "crates/ro-dep-update" }
-ro-testkit     = { path = "crates/ro-testkit" }
 
 # External — shared across multiple crates
 anyhow          = "1.0"

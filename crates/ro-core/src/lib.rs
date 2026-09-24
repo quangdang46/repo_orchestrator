@@ -4,7 +4,6 @@
 //! and shared constants.
 
 pub mod error;
-pub mod paths;
 pub mod redaction;
 pub mod repo_spec;
 

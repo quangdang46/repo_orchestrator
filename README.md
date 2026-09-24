@@ -307,11 +307,11 @@ ro doctor
                             │
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼
-        ro-review    ro-jobs/sweep   ro-mcp / output
+        ro-review    ro-jobs/sweep   output       
         plan/apply    run timeline     agent surfaces
 ```
 
-Workspace highlights: `ro-core`, `ro-config`, `ro-state`, `ro-git`, `ro-github`, `ro-sync`, `ro-review`, `ro-sweep`, `ro-mcp`, `ro-provider`, …
+Workspace highlights: `ro-core`, `ro-config`, `ro-state`, `ro-git`, `ro-github`, `ro-sync`, `ro-review`, `ro-sweep`, `ro-jobs`, `ro-output`, …
 
 ---
 

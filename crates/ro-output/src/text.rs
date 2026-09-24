@@ -13,11 +13,6 @@ pub fn header(text: &str) {
     println!("{}\n{}", text, "─".repeat(text.chars().count()));
 }
 
-/// Write a key-value pair to stdout.
-pub fn kv(key: &str, value: &str) {
-    println!("{INDENT}{key}: {value}");
-}
-
 /// Render a JSON value as text to a writer.
 ///
 /// Objects render as `key: value` lines. Arrays render as bullet
