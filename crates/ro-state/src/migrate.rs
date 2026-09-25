@@ -311,8 +311,8 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO plans (id, repo_id, status, created_at) \
-             VALUES ('p1', 'r1', 'draft', 0)",
+            "INSERT INTO plans (id, repo_id, kind, status, created_at) \
+             VALUES ('p1', 'r1', 'review', 'draft', 0)",
             [],
         )
         .unwrap();
