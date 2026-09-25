@@ -278,6 +278,92 @@ mod tests {
         assert_eq!(v, 4);
     }
 
+    /// The upgrade path, which no other test in the workspace exercises.
+    ///
+    /// A fresh database applies V1 through V4 in one go, so it cannot catch a
+    /// migration that only works on an empty schema. A database that already
+    /// carries V1+V2+V3 — with a real repo row, a real `plans` row, and the
+    /// `default_branch` column populated — is the only thing that proves the
+    /// migration does what it claims to an existing user.
+    #[test]
+    fn v3_database_upgrades_to_v4() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Build a v3 database: everything up to and including V3, nothing after.
+        // `_meta` is created by `run()` itself, not by any migration, so the
+        // fixture has to make it the way the binary would.
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute_batch(V1_INITIAL_SCHEMA).unwrap();
+        conn.execute_batch(V2_REPO_TAGS).unwrap();
+        conn.execute_batch(V3_DROP_INBOX).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES ('version', '3')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, branch, alias, clone_url, \
+             local_path, visibility, default_branch, archived, disabled, added_at, updated_at) \
+             VALUES ('r1', 'github.com', 'acme', 'api', 'main', NULL, \
+             'https://github.com/acme/api.git', '/tmp/api', 'public', 'main', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO plans (id, repo_id, status, created_at) \
+             VALUES ('p1', 'r1', 'draft', 0)",
+            [],
+        )
+        .unwrap();
+
+        // Preconditions, so a typo in the fixture fails here and not later.
+        assert_eq!(current_version(&conn).unwrap(), 3);
+        assert!(table_exists(&conn, "plans"), "fixture should have plans");
+        assert!(
+            column_exists(&conn, "repos", "default_branch"),
+            "fixture should have default_branch"
+        );
+
+        run(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert!(
+            !table_exists(&conn, "plans"),
+            "V4 must drop the plans table"
+        );
+        assert!(
+            !column_exists(&conn, "repos", "default_branch"),
+            "V4 must drop repos.default_branch"
+        );
+        // The row it was attached to must survive: the migration drops a
+        // column, not a repository.
+        let name: String = conn
+            .query_row("SELECT name FROM repos WHERE id = 'r1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "api", "the repo row must survive the migration");
+
+        // Re-running must not fail on the already-dropped column.
+        run(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 4);
+    }
+
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+        // A missing column is what we want to detect, so a failed PRAGMA is
+        // the answer rather than a panic.
+        conn.prepare(&format!("SELECT {column} FROM {table} LIMIT 1"))
+            .is_ok()
+    }
+
     #[test]
     fn all_tables_exist() {
         let conn = fresh();
