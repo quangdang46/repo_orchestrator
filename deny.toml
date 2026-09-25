@@ -38,12 +38,13 @@ yanked = "deny"
 # RUSTSEC-2025-0140 — `gix-date` <= 0.9.x is yanked/unmaintained, transitive
 # via `gix 0.71.x`. Revisit when gix bumps to a release that pulls in
 # gix-date >= 0.12.0.
-# RUSTSEC-2024-0436 — `paste` is unmaintained but pulled in transitively via
-# `rmcp 0.1.x`. Revisit when rmcp drops the dep or switches to `pastey`.
+# RUSTSEC-2024-0436 was removed here: both `paste` and `rmcp` left the lockfile
+# when the AI sidecar was cut, so the advisory no longer names anything in the
+# graph. Leaving it is at best noise and at worst a cargo-deny hard failure on
+# the next version bump.
 ignore = [
     "RUSTSEC-2025-0119",
     "RUSTSEC-2025-0140",
-    "RUSTSEC-2024-0436",
 ]
 
 # ---------------------------------------------------------------------------

@@ -4,10 +4,12 @@
 # - Keep this file minimal; per-crate flags live in each crate's Cargo.toml.
 # - We do NOT set `[net] offline = true` here so CI / contributors can fetch
 #   crates normally. Local hermetic builds should set CARGO_NET_OFFLINE=1.
-# - `xtask` is the canonical entrypoint for project-level scripts.
+#
+# The `xtask` alias was removed: there is no `crates/xtask`, so `cargo xtask`
+# failed on every invocation. Project scripts go through plain cargo aliases
+# or the CI workflows.
 
 [alias]
-xtask = "run --package xtask --"
 
 # Default registry settings — keep stock so `cargo publish` would work later.
 [registries.crates-io]
