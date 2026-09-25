@@ -4,6 +4,22 @@
 *.db-shm
 *.db-wal
 
+# frankensqlite sidecars (br 0.7 engine). `*.db-wal` above does NOT cover
+# the suffixed variants (-wal-cert, -wal-cert-head, …), and the
+# namespace-gate files have no `db` in the expected place, so each family
+# needs its own entry. `br doctor` flags the gap as
+# `gitignore.beads_inner_present`; it is the only WARN in an otherwise
+# healthy workspace, and it means eight live sidecars show up as untracked
+# and get committed.
+*.db-wal*
+*.db-lock-*
+*.vacuum-wal-cert*
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+# the migration-state file uses a dot where the others use a hyphen
+*.fsqlite-migration-state
+*-fsqlite-migration-state
+
 # Lock files
 *.lock
 
