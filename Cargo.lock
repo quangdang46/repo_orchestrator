@@ -2540,12 +2540,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
-name = "owo-colors"
-version = "4.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d211803b9b6b570f68772237e415a029d5a50c65d382910b879fb19d3271f94d"
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2936,7 +2930,6 @@ dependencies = [
  "ro-git",
  "ro-github",
  "ro-jobs",
- "ro-output",
  "ro-review",
  "ro-state",
  "ro-sweep",
@@ -2944,6 +2937,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "time",
  "tokio",
  "toml",
  "tracing",
@@ -3029,20 +3023,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ro-output"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "console",
- "owo-colors",
- "ro-core",
- "serde",
- "serde_json",
- "time",
-]
-
-[[package]]
 name = "ro-review"
 version = "0.2.0"
 dependencies = [
@@ -3052,7 +3032,6 @@ dependencies = [
  "ro-core",
  "ro-git",
  "ro-jobs",
- "ro-output",
  "ro-state",
  "rusqlite",
  "serde",
@@ -3091,7 +3070,6 @@ dependencies = [
  "ro-core",
  "ro-git",
  "ro-jobs",
- "ro-output",
  "ro-state",
  "ro-sync",
  "rusqlite",
@@ -3115,7 +3093,6 @@ dependencies = [
  "ro-core",
  "ro-git",
  "ro-jobs",
- "ro-output",
  "ro-state",
  "rusqlite",
  "serde",

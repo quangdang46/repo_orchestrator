@@ -3,7 +3,6 @@ members = [
     "crates/ro",
     "crates/ro-core",
     "crates/ro-config",
-    "crates/ro-output",
     "crates/ro-state",
     "crates/ro-git",
     "crates/ro-github",
@@ -29,7 +28,6 @@ categories = ["command-line-utilities", "development-tools"]
 # Core crates (local)
 ro-core        = { path = "crates/ro-core" }
 ro-config      = { path = "crates/ro-config" }
-ro-output      = { path = "crates/ro-output" }
 ro-state       = { path = "crates/ro-state" }
 ro-git         = { path = "crates/ro-git" }
 ro-github      = { path = "crates/ro-github" }
