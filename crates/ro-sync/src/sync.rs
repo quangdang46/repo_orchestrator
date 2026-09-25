@@ -120,7 +120,9 @@ pub fn sync_repo(
         }
         // Clone
         let clone_opts = ro_git::mutation::CloneOpts {
-            branch: repo.branch.clone().or(repo.default_branch.clone()),
+            // V4 dropped the cached default_branch; the tracked branch is the
+            // only hint left for a clone target.
+            branch: repo.branch.clone(),
             ..Default::default()
         };
         match ro_git::mutation::clone(&repo.clone_url, local, &clone_opts) {
@@ -233,7 +235,6 @@ pub fn sync_repo(
             .ok()
             .flatten()
             .or(repo.branch.clone())
-            .or(repo.default_branch.clone())
             .unwrap_or_else(|| "main".into());
 
         let pull_strategy = match opts.strategy {
@@ -412,7 +413,6 @@ mod tests {
             clone_url: remote.to_string_lossy().to_string(),
             local_path: local_path.to_string_lossy().to_string(),
             visibility: "unknown".into(),
-            default_branch: None,
             archived: false,
             disabled: false,
         };

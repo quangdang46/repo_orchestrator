@@ -27,7 +27,6 @@ pub struct TrackedRepo {
     pub clone_url: String,
     pub local_path: String,
     pub visibility: String,
-    pub default_branch: Option<String>,
     pub archived: bool,
     pub disabled: bool,
 }
@@ -43,7 +42,7 @@ impl std::fmt::Display for TrackedRepo {
 }
 
 const REPO_COLUMNS: &str = "id, host, owner, name, branch, alias, clone_url, local_path, \
-                             visibility, default_branch, archived, disabled";
+                             visibility, archived, disabled";
 
 fn row_to_tracked(row: &rusqlite::Row<'_>) -> std::result::Result<TrackedRepo, rusqlite::Error> {
     Ok(TrackedRepo {
@@ -56,9 +55,8 @@ fn row_to_tracked(row: &rusqlite::Row<'_>) -> std::result::Result<TrackedRepo, r
         clone_url: row.get(6)?,
         local_path: row.get(7)?,
         visibility: row.get(8)?,
-        default_branch: row.get(9)?,
-        archived: row.get::<_, i64>(10)? != 0,
-        disabled: row.get::<_, i64>(11)? != 0,
+        archived: row.get::<_, i64>(9)? != 0,
+        disabled: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -114,8 +112,8 @@ pub fn add(conn: &Connection, spec_str: &str, projects_dir: &Path) -> Result<Tra
 
     conn.execute(
         "INSERT INTO repos (id, host, owner, name, branch, alias, clone_url, local_path, \
-                            visibility, default_branch, archived, disabled, added_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unknown', NULL, 0, 0, ?9, ?10)",
+                            visibility, archived, disabled, added_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'unknown', 0, 0, ?9, ?10)",
         params![
             id,
             spec.host,
@@ -141,7 +139,6 @@ pub fn add(conn: &Connection, spec_str: &str, projects_dir: &Path) -> Result<Tra
         clone_url: spec.clone_url,
         local_path,
         visibility: "unknown".to_string(),
-        default_branch: None,
         archived: false,
         disabled: false,
     })
@@ -451,7 +448,6 @@ mod tests {
             clone_url: String::new(),
             local_path: String::new(),
             visibility: "unknown".into(),
-            default_branch: None,
             archived: false,
             disabled: false,
         };

@@ -266,7 +266,7 @@ mod tests {
     fn migration_records_version() {
         let conn = fresh();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
     }
 
     #[test]
@@ -275,7 +275,7 @@ mod tests {
         run(&conn).unwrap();
         run(&conn).unwrap();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
     }
 
     #[test]

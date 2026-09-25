@@ -25,9 +25,8 @@ pub struct RepoStatus {
 /// Queries the state DB for repo metadata, then uses `ro_git::read`
 /// functions to inspect the actual repository on disk.
 pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
-    let mut stmt = conn.prepare(
-        "SELECT owner, name, branch, local_path, default_branch FROM repos WHERE id = ?1",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT owner, name, branch, local_path FROM repos WHERE id = ?1")?;
     let row = stmt
         .query_row([repo_id], |row| {
             Ok((
@@ -35,21 +34,20 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
             ))
         })
         .with_context(|| format!("repo with id={repo_id} not found"))?;
 
-    let (owner, name, tracked_branch, local_path, default_branch) = row;
+    let (owner, name, tracked_branch, local_path) = row;
     let path = std::path::PathBuf::from(&local_path);
 
     let (branch, is_dirty, ahead, behind) = if path.join(".git").exists() {
         let branch = ro_git::read::current_branch(&path)?;
         let is_dirty = ro_git::read::is_dirty(&path)?;
-        let upstream_branch = branch
-            .as_ref()
-            .or(tracked_branch.as_ref())
-            .or(default_branch.as_ref());
+        // The cached default_branch is gone as of V4. The branch git reports
+        // is authoritative; the tracked branch is only a fallback for a
+        // detached HEAD.
+        let upstream_branch = branch.as_ref().or(tracked_branch.as_ref());
         let (ahead, behind) = if let Some(ref b) = upstream_branch {
             let upstream = format!("origin/{b}");
             let ab = ro_git::read::ahead_behind(&path, &upstream)?;
