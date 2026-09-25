@@ -854,7 +854,7 @@ This is also the honest answer to "how do I add a new agent". It is not a plugin
 
 **The actual rule: always `git push`.** The config selects the **credential source**, not the executable. There is no `provider` setting any more: the key name in `[auth]` *is* the transport, so the two can never disagree.
 
-- **`https = "<ref>"`** supplies an HTTPS credential. **A `GH_TOKEN` in the environment does not authenticate `git push` — git does not read it, full stop.** The concrete mechanisms, in order of preference:
+- **`https = "<ref>"`** supplies an HTTPS credential. **`git` itself does not read `GH_TOKEN`** — whether the variable reaches git at all depends on the credential helper, which is the subtlety this section exists to get right. The concrete mechanisms, in order of preference:
   1. `git -c http.https://github.com/.extraheader="AUTHORIZATION: basic <base64(x-access-token:TOKEN)>" push` — a per-invocation header, nothing persisted, no global config mutated. This is the mechanism the plan specifies.
   2. A scoped `credential.helper` invocation.
   3. `gh auth setup-git` (mutates the user's global git config; least preferred for that reason).
@@ -1276,7 +1276,28 @@ This is the single most important correction in the plan, so state it plainly.
 | Identity source | `gh api user --jq .login` | `git config user.email` |
 | Reads the ambient SSH key? | no | yes |
 
-**`GH_TOKEN` in the child environment does not authenticate `git push`.** Git never reads that variable. The env-injection seam in `RunOpts` is still necessary for the `gh` subprocess that does the identity lookup — and **only** for it: the agent engine's environment has the token *stripped*, see the subtraction section above. If the credential is not injected as an `extraheader` (or via a scoped credential helper, or `gh auth setup-git`), the gh-credentialed push silently falls back to whatever SSH key is configured — **which is the exact leak the vision calls a HARD RULE, arriving through a different door.** This is the failure mode most likely to ship looking green: every test that only asserts "a push was attempted" passes while the push went out over the wrong identity. At least one test (§8, #29) must assert the credential reached git.
+****`GH_TOKEN` in the child environment does not, by itself, authenticate `git push` — but the reason is narrower than "git ignores it", and the distinction is load-bearing.**
+
+Verified on this machine, with `credential.helper = manager` (Git Credential Manager, the default on a modern Windows and macOS install):
+
+```
+GH_TOKEN=ghp_MARKER   git credential fill  ->  username=x-access-token  password=ghp_MARKER
+(no GH_TOKEN)         git credential fill  ->  username=qdang46          password=<keyring>
+```
+
+So **GCM does read `GH_TOKEN`** and will hand it to git. An earlier revision of this document said "git never reads that variable, full stop", and that was **too strong and, on a GCM machine, false** — an implementer who tested it would have found the plan wrong, and then either dropped the `extraheader` (breaking every machine without a helper) or lost an afternoon.
+
+The accurate statement has three parts:
+
+1. **The `git` binary does not read `GH_TOKEN`.** It asks a credential helper.
+2. **Some helpers honour it — Git Credential Manager does.** Others do not, and a user with `credential.helper=` cleared, or on a machine where the helper stores a different account, gets nothing.
+3. **Therefore ro does not rely on it.** The `extraheader` mechanism is chosen precisely because it depends on **no helper being present at all**, applies to exactly one invocation, and never touches stored credentials.
+
+This is the same reason the plan does not use `gh auth setup-git`: it mutates the user's global git config, and a tool that silently rewrites global config to make its own auth work is a tool that leaves a mess when it is uninstalled.
+
+**The failure mode this prevents is unchanged and still the important one.** If the credential is not injected as an `extraheader` (or a scoped helper, or setup-git), the push falls through to whatever SSH key is configured — the exact leak the vision's HARD RULE forbids, arriving through a different door. It is the failure most likely to ship looking green: every test that only asserts "a push was attempted" passes while the push went out over the wrong identity. Test §8 #29 asserts the credential **reached git** — the extraheader, specifically — rather than that a push was attempted.
+
+The env-injection seam in `RunOpts` is still necessary for the `gh` subprocess that does the identity lookup — and **only** for it: the agent engine's environment has the token *stripped*, see the subtraction section above.
 
 **The no-fallback rule, restated over the credential source:**
 
@@ -1852,7 +1873,7 @@ CI runs a 3-OS matrix and the two red tests today are Windows-only, so the Windo
 
 **The baseline is red in three places, and one of them is a production crash.** Clippy fails on all three OSes (`prune.rs:135`). Two tests fail on Windows (the orphan separator bug). And `ro import --stars` **panics in production** on any machine where a token is discoverable, because `import.rs:29` builds the octocrab client before `Runtime::new()` on line 31 — it passes on CI only because `gh` is off PATH there. Do not start disk-touching work on top of this.
 
-**A credential design that silently does nothing.** `GH_TOKEN` in the child environment does not authenticate `git push`; git never reads it. If the token is not injected as an `extraheader` (or via a scoped credential helper, or `gh auth setup-git`), the gh-credentialed push falls through to whatever SSH key is configured — the exact leak the vision's HARD RULE forbids, arriving through a different door. This is the most likely way the auth work ships *looking* green, because every test that asserts only "a push was attempted" will pass. Test #29 exists specifically to close it.
+**A credential design that silently does nothing — and the trap is that it half-works.** On a machine with Git Credential Manager, setting `GH_TOKEN` *does* authenticate a push; on a machine without it, the identical code silently falls through to the configured SSH key. A test suite run on the first machine passes and the tool ships broken on the second. That is why the credential is injected as an `extraheader` — it works identically on both — and why the test asserts the header reached git rather than that a push was attempted. This is the most likely way the auth work ships *looking* green, because every test that asserts only "a push was attempted" will pass. Test #29 exists specifically to close it.
 
 **Identity and transport leakage is today's unguarded default, not a future risk.** `mutation::push` is a bare `git push` using whatever SSH key or credential manager the repo already has — no token injection, no login check, no email check, no `gh` path. Worse, `AuthToken` derives `Debug`, so `{:?}` prints the raw token and `redact()` is opt-in and manual. Fix the manual `Debug` **before** tokens start flowing into child processes and argv.
 
