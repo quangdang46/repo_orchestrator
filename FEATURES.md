@@ -105,11 +105,6 @@ Bring every tracked repo in line with its remote.
 Per-repo state: current branch, whether the worktree is dirty, and how far
 ahead or behind the remote it is. Omit the repo to get every tracked repo.
 
-### `ro health [REPO]`
-A 0–100 score per repo with a class of `excellent`, `healthy`, `attention`,
-`risky` or `critical`. Use `--filter health:<N>` elsewhere to find the bad ones
-in bulk — for example feeding `ro sweep commit-sweep --filter`.
-
 ### `ro prune`
 Two independent kinds of cleanup.
 
@@ -170,19 +165,6 @@ Surfaces repos with an in-progress merge or rebase, explains what state each
 one is in, and lets you bail out or record that you have handled it by hand.
 
 ---
-
-## Review
-
-Plan-then-apply automation with a rollback path.
-
-| Command | Effect |
-|---|---|
-| `ro review plan` | Build a review plan. Creates nothing. |
-| `ro review approve` | Mark a plan as approved |
-| `ro review reject` | Discard a plan |
-| `ro review apply` | Execute an approved plan |
-| `ro review rollback` | Undo a previously applied plan |
-| `ro review list-plans` | Show known plans |
 
 ---
 

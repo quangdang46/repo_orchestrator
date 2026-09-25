@@ -18,7 +18,6 @@
 //! command does not have to be documented in order to pass.
 
 use assert_cmd::Command;
-use predicates::prelude::*;
 
 /// Files whose `ro <word>` mentions are promises ro makes to a reader.
 const DOCS: &[&str] = &["README.md", "FEATURES.md"];

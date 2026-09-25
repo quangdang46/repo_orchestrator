@@ -31,16 +31,13 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main
 
 ```bash
 # Fleet health
-ro health --format json
 
 # Status of all tracked repos
 ro status --format json
 
 # Ranked attention
-ro health --format json
 
 # Plan automation
-ro review plan --format json
 ```
 
 **Output conventions**
@@ -98,7 +95,6 @@ ro init
 ro add quangdang46/repo_orchestrator
 ro sync -j 4
 ro status --format json
-ro health
 ro doctor
 ```
 
@@ -189,14 +185,12 @@ ro init
 ro add quangdang46/repo_orchestrator
 ro sync
 ro status
-ro health
 ro doctor
 ```
 
 ### Robot / JSON surface
 
 ```bash
-ro health --format json
 ro status --format json
 ro list --format json
 ro schema
@@ -235,11 +229,9 @@ ro sync --dry-run
 ro sync --resume
 
 # Attention
-ro health --format json
 ro status my-org/service-a
 
 # Safety-oriented automation
-ro review plan
 ro doctor --fix
 ```
 

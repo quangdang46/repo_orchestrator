@@ -2930,7 +2930,6 @@ dependencies = [
  "ro-git",
  "ro-github",
  "ro-jobs",
- "ro-review",
  "ro-state",
  "ro-sweep",
  "ro-sync",
@@ -3017,27 +3016,6 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ro-review"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "ro-config",
- "ro-core",
- "ro-git",
- "ro-jobs",
- "ro-state",
- "rusqlite",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -3426,12 +3404,6 @@ name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
-
-[[package]]
-name = "similar"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "simple_asn1"

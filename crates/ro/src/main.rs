@@ -219,8 +219,6 @@ enum ConflictCommands {
 }
 
 #[derive(Debug, Subcommand)]
-
-#[derive(Debug, Subcommand)]
 enum SweepCommands {
     /// Sweep commit with safety checks
     Commit {
@@ -827,7 +825,6 @@ fn run() -> Result<()> {
                 filter,
                 all,
                 dry_run,
-                auto_approve,
                 output,
             } => {
                 let use_ndjson = output.as_deref() == Some("json");

@@ -24,8 +24,8 @@ use tempfile::TempDir;
 /// entry, and that is deliberate — the failure is supposed to be a red test a
 /// human reads, not a type error.
 const EXPECTED_COMMANDS: &[&str] = &[
-    "init", "add", "remove", "list", "sync", "status", "prune", "health", "run", "conflict",
-    "review", "sweep", "doctor", "config", "schema",
+    "init", "add", "remove", "list", "sync", "status", "prune", "run", "conflict", "sweep",
+    "doctor", "config", "schema",
 ];
 
 fn schema() -> Value {
@@ -177,7 +177,7 @@ fn schema_documents_nothing_that_was_removed() {
     // the test is that the machine-readable surface cannot keep advertising a
     // command the binary no longer has — the failure that took three commits
     // and a hand-written JSON literal to notice.
-    for gone in ["import", "fork", "self-update", "robot-docs"] {
+    for gone in ["import", "fork", "self-update", "robot-docs", "health", "review"] {
         assert!(
             !reported.contains(&gone),
             "`{gone}` was removed but `ro schema` still advertises it"
