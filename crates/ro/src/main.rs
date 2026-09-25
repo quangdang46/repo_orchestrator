@@ -13,7 +13,7 @@ mod doctor;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use ro_config::paths::ConfigPaths;
 use ro_sync::sync::SyncStrategy;
 
@@ -213,12 +213,9 @@ enum Commands {
         sub: Option<ConfigCommands>,
     },
 
-    // ── Robot docs ───────────────────────────────────────────────────
-    /// Machine-readable CLI documentation (JSON)
-    RobotDocs {
-        /// Topic: commands, quickstart, examples, exit-codes, formats, schemas
-        topic: Option<String>,
-    },
+    // ── Schema ───────────────────────────────────────────────────────
+    /// Machine-readable CLI reference, generated from the live command tree
+    Schema,
 
 }
 
@@ -427,68 +424,79 @@ fn main() {
     }
 }
 
-fn generate_robot_docs(topic: Option<&str>) -> serde_json::Value {
-    match topic {
-        Some("commands") => serde_json::json!({
-            "commands": [
-                {"name": "init", "description": "Initialize config + SQLite state directory"},
-                {"name": "add", "description": "Add a repo to tracking", "args": ["<spec>"]},
-                {"name": "remove", "description": "Remove a repo from tracking", "args": ["<key>"]},
-                {"name": "list", "description": "List tracked repos", "flags": ["--owner", "--format"]},
-                {"name": "sync", "description": "Sync all tracked repos", "flags": ["--strategy", "--dry-run", "--clone-only", "--pull-only", "--autostash", "--parallel", "--timeout", "--resume"]},
-                {"name": "status", "description": "Show status of tracked repos", "args": ["[repo]"]},
-                {"name": "prune", "description": "Prune removed/missing repos", "flags": ["--archived", "--missing"]},
-                {"name": "health", "description": "Show health score for repos", "args": ["[repo]"]},
-                {"name": "run", "description": "Run management", "subcommands": ["list", "show", "timeline"]},
-                {"name": "conflict", "description": "Conflict resolver", "subcommands": ["list", "explain", "abort", "mark-resolved"]},
-                {"name": "review", "description": "Review plan/apply", "subcommands": ["plan", "approve", "reject", "apply", "rollback", "list-plans"]},
-                {"name": "sweep", "description": "Sweep commands", "subcommands": ["commit", "agent"]},
-                {"name": "doctor", "description": "Diagnose installation health", "flags": ["--fix"]},
-                {"name": "config", "description": "Show or set config", "subcommands": ["print", "set"]},
-                {"name": "robot-docs", "description": "Machine-readable CLI documentation"},
-                {"name": "fork", "description": "Fork management", "subcommands": ["status", "sync", "clean"]},
-            ]
-        }),
-        Some("exit-codes") => serde_json::json!({
-            "exit_codes": [
-                {"code": 0, "meaning": "success"},
-                {"code": 1, "meaning": "one or more failures"},
-                {"code": 64, "meaning": "usage error"},
-            ]
-        }),
-        Some("formats") => serde_json::json!({
-            "formats": [
-                {"name": "text", "description": "Human-readable terminal output (default)"},
-                {"name": "json", "description": "One JSON document per line (NDJSON-friendly)"},
-            ]
-        }),
-        Some("quickstart") => serde_json::json!({
-            "steps": [
-                "ro init",
-                "ro add owner/repo",
-                "ro sync",
-                "ro status",
-                "ro health",
-            ]
-        }),
-        Some("examples") => serde_json::json!({
-            "examples": [
-                {"description": "Daily check-in", "commands": ["ro sync", "ro health", "ro status"]},
-                {"description": "Review a change", "commands": ["ro review plan owner/repo --summary 'Bump deps' --risk medium", "ro review list-plans", "ro review apply <plan-id>"]},
-                {"description": "Safe commit", "commands": ["ro sweep commit --path . --message 'chore: format'"]},
-            ]
-        }),
-        Some("schemas") => serde_json::json!({
-            "schemas": {
-                "sync_result": {"repo_id": "string", "action": "string", "status": "string", "duration_ms": "u64", "error": "string|null"},
-                "health_snapshot": {"id": "string", "repo_id": "string", "score": "i64", "class": "string"},
-            }
-        }),
-        _ => serde_json::json!({
-            "topics": ["commands", "quickstart", "examples", "exit-codes", "formats", "schemas"],
-            "usage": "ro robot-docs <topic>"
-        }),
+/// Build the machine-readable CLI reference by walking the live clap tree.
+///
+/// The previous `ro robot-docs` was a hand-written `json!` literal listing
+/// commands and flags. It had already drifted in four places — it omitted
+/// `commit-sweep`, omitted `prune --orphans/--archive/--delete`, listed only
+/// two output formats, and recommended a command that was being deleted. A
+/// mirror of the clap tree that is written by hand is wrong the moment it is
+/// written, and nothing in the build or the test suite can see it.
+///
+/// Serializing `Cli::command()` makes that class of drift impossible rather
+/// than merely fixing today's instance: a command that is added to the enum
+/// appears here automatically, and one that is removed disappears. The
+/// shape is a stable JSON contract, not the clap API — args are flattened
+/// into `long`/`short`/`help` so a consumer does not have to parse
+/// `clap::Arg` to find out what a flag is.
+fn schema_json() -> serde_json::Value {
+    fn arg_json(a: &clap::Arg) -> serde_json::Value {
+        let mut o = serde_json::Map::new();
+        o.insert("name".into(), a.get_id().as_str().into());
+        if let Some(l) = a.get_long() {
+            o.insert("long".into(), l.into());
+        }
+        if let Some(s) = a.get_short() {
+            o.insert("short".into(), s.to_string().into());
+        }
+        o.insert("required".into(), a.is_required_set().into());
+        if let Some(h) = a.get_help() {
+            o.insert("help".into(), h.to_string().into());
+        }
+        if !a.get_possible_values().is_empty() {
+            o.insert(
+                "values".into(),
+                a.get_possible_values()
+                    .iter()
+                    .map(|v| serde_json::Value::from(v.get_name()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            );
+        }
+        serde_json::Value::Object(o)
     }
+
+    fn command_json(c: &clap::Command) -> serde_json::Value {
+        let mut o = serde_json::Map::new();
+        o.insert("name".into(), c.get_name().into());
+        if let Some(a) = c.get_about() {
+            o.insert("about".into(), a.to_string().into());
+        }
+        let args: Vec<_> = c
+            .get_arguments()
+            .filter(|a| !a.is_hide_set())
+            .map(arg_json)
+            .collect();
+        if !args.is_empty() {
+            o.insert("args".into(), args.into());
+        }
+        let subs: Vec<_> = c.get_subcommands().map(command_json).collect();
+        if !subs.is_empty() {
+            o.insert("subcommands".into(), subs.into());
+        }
+        serde_json::Value::Object(o)
+    }
+
+    let root = Cli::command();
+    let mut o = serde_json::Map::new();
+    o.insert("name".into(), root.get_name().into());
+    o.insert("version".into(), root.get_version().unwrap_or_default().into());
+    if let Some(about) = root.get_about() {
+        o.insert("about".into(), about.to_string().into());
+    }
+    let subs: Vec<_> = root.get_subcommands().map(command_json).collect();
+    o.insert("commands".into(), subs.into());
+    serde_json::Value::Object(o)
 }
 
 /// Resolve multi-repo targets from --repos/--filter/--all flags.
@@ -1250,10 +1258,10 @@ fn run() -> Result<()> {
             }
         }
 
-        // ── Robot docs ──
-        Commands::RobotDocs { topic } => {
-            let docs = generate_robot_docs(topic.as_deref());
-            println!("{}", serde_json::to_string_pretty(&docs)?);
+        // ── Schema ──
+        Commands::Schema => {
+            let schema = schema_json();
+            println!("{}", serde_json::to_string_pretty(&schema)?);
         }
     }
 

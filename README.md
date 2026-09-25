@@ -74,7 +74,7 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 | Attention | `health` |
 | Risky ops | `review plan` · plan → apply → rollback |
 | Safety | secret scan · denylist · quality gates |
-| Agents | `--format text|json|toon` · `robot-docs` · MCP-friendly structure |
+| Agents | `--format text|json|toon` · `ro schema` · MCP-friendly structure |
 
 > **Status:** early development (v0.2.x) — public API and flags may shift before v1.0.
 
@@ -113,7 +113,7 @@ ro doctor
    Review, sweep, and train-style flows should produce an inspectable plan before apply.
 
 3. **Agents get JSON, not scraped TUI.**  
-   Prefer `--format json` and `robot-docs` over parsing human text.
+   Prefer `--format json` and `ro schema` over parsing human text.
 
 4. **Safety gates over clever scripts.**  
    Secret scan, denylist paths, and quality checks beat “trust the model with raw git.”
@@ -199,8 +199,7 @@ ro doctor
 ro health --format json
 ro status --format json
 ro list --format json
-ro robot-docs commands
-ro robot-docs quickstart
+ro schema
 ```
 
 Prefer structured reads over scraping TUI/text when driving agents.
@@ -223,7 +222,7 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 | Review | `review plan` (+ apply/rollback flows) | Plan-then-apply |
 | Sweep | `sweep …` | Commit / agent sweep helpers |
 | Config | `config` | Show / set configuration |
-| Meta | `robot-docs` | Machine-readable docs |
+| Meta | `schema` | Machine-readable CLI reference |
 
 ```bash
 # Inventory
@@ -283,7 +282,7 @@ ro doctor
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ CLI (crates/ro)                                            │
-│  init · add · sync · health · review · robot-docs · …       │
+│  init · add · sync · health · review · schema · …          │
 └────────────────────────────┬────────────────────────────────┘
                              │
      ┌───────────────────────┼───────────────────────┐
