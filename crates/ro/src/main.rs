@@ -1281,7 +1281,6 @@ fn run() -> Result<()> {
             }
         }
 
-        // ── Self-update ──
         // ── Robot docs ──
         Commands::RobotDocs { topic } => {
             let docs = generate_robot_docs(topic.as_deref());

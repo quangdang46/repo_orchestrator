@@ -11,7 +11,6 @@ members = [
     "crates/ro-sync",
     "crates/ro-review",
     "crates/ro-sweep",
-    "crates/ro-dep-update",
 ]
 resolver = "3"
 default-members = ["crates/ro"]
@@ -38,7 +37,6 @@ ro-jobs        = { path = "crates/ro-jobs" }
 ro-sync        = { path = "crates/ro-sync" }
 ro-review      = { path = "crates/ro-review" }
 ro-sweep       = { path = "crates/ro-sweep" }
-ro-dep-update  = { path = "crates/ro-dep-update" }
 
 # External — shared across multiple crates
 anyhow          = "1.0"

@@ -2980,21 +2980,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ro-dep-update"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "ro-config",
- "ro-core",
- "ro-git",
- "ro-jobs",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "ro-git"
 version = "0.2.0"
 dependencies = [
