@@ -443,11 +443,14 @@ fn schema_json() -> serde_json::Value {
     fn arg_json(a: &clap::Arg) -> serde_json::Value {
         let mut o = serde_json::Map::new();
         o.insert("name".into(), a.get_id().as_str().into());
+        // clap reports the long/short *names*; emit them invocable. A consumer
+        // that has to remember that "strategy" means "--strategy" is doing the
+        // parsing this flattening exists to remove.
         if let Some(l) = a.get_long() {
-            o.insert("long".into(), l.into());
+            o.insert("long".into(), format!("--{l}").into());
         }
         if let Some(s) = a.get_short() {
-            o.insert("short".into(), s.to_string().into());
+            o.insert("short".into(), format!("-{s}").into());
         }
         o.insert("required".into(), a.is_required_set().into());
         if let Some(h) = a.get_help() {
