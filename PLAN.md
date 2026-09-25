@@ -1,6 +1,6 @@
 # ro — Repositioning Plan
 
-`ro` today is a 12-crate Rust workspace whose entire user-facing surface is 18 top-level clap subcommands crammed into one 1473-line file (`crates/ro/src/main.rs`), of which roughly a third is on the vision's cut list and none of the three things that matter most — `ro repos`, `ro checkpoint`, engine dispatch — exist. The goal is to strip the GitHub-first "orchestrator with a review lifecycle and a health score" down to an opinionated, agent-first fleet tool: one command (`ro checkpoint`) that scans a set of opted-in local repos, hands each dirty one to a pluggable commit engine (claude / codex / git), and commits + pushes either straight onto the current branch or onto a fresh WIP branch with a PR — with per-repo failure isolation, a real auth/identity policy, and a JSON surface an agent can drive headlessly.
+`ro` today is a 12-crate Rust workspace whose entire user-facing surface is 18 top-level clap subcommands crammed into one 1473-line file (`crates/ro/src/main.rs`), of which roughly a third is on the vision's cut list and none of the three things that matter most — `ro repos`, `ro sync`, engine dispatch — exist. The goal is to strip the GitHub-first "orchestrator with a review lifecycle and a health score" down to an opinionated, agent-first fleet tool: one command (`ro sync`) that scans a set of opted-in local repos, hands each dirty one to a pluggable commit engine (claude / codex / git), and commits + pushes either straight onto the current branch or onto a fresh WIP branch with a PR — with per-repo failure isolation, a real auth/identity policy, and a JSON surface an agent can drive headlessly.
 
 ## Where we are today
 
@@ -21,31 +21,41 @@ crates/ro-dep-update 344 LOC, 0 callers, 0 dependents                     -> CUT
 
 Hard ground truth that shapes everything below. `cargo check --workspace --all-targets` is green. **`cargo clippy --all-targets --all-features` is also red today** — one warning at `crates/ro-sync/src/prune.rs:135` (`if let Ok(p) = r` where only the `Ok` variant is used → `.flatten()`), and CI runs `-D warnings` on a 3-OS matrix, so the clippy job fails on all three platforms right now. **Tests: 2 Windows failures in `ro-sync` (`prune::tests::find_orphans_returns_empty_when_all_tracked`, `prune::tests::find_orphans_reports_untracked_working_copies`) plus 1 in `ro-github` (`import::tests::fetch_without_source_errors`) — the ro-github one is *not* a Windows bug, it is a live production panic (see 1f).**
 
-The plan lands **five modules** (Registry, Git, Agent, Auth, GitHub — see §5), ten top-level commands, and 4 migrations. Every new crate and every new manifest entry is named in the phase that creates it; the twelve crates above collapse to five without adding a single new concern, and the moves happen inside PR 2 and PR 3 rather than in a behaviour-free structural PR nobody reviews.
+The plan lands **four modules** (Registry, Git, Agent, Auth — see §5), ten top-level commands in three tiers (daily / registry / setup — see §3), and 5 migrations. Every new crate and every new manifest entry is named in the phase that creates it; the twelve crates above collapse to five without adding a single new concern, and the moves happen inside PR 2 and PR 3 rather than in a behaviour-free structural PR nobody reviews.
 
 ---
 
 ## 1. The plan at a glance
 
+**Eleven commands in three tiers, and four of them are the daily loop.** An earlier revision of this document said "five commands" for several sections while the tree beside it listed eight; the number was never load-bearing and the contradiction was. The tiers are the real structure:
+
+| Tier | Commands | What it is for |
+|---|---|---|
+| **Core workflow** | `add` · `sync` · `commit` · `push` | the daily loop. `add` once, then `sync` in the morning, `commit` when the work is ready, `push` when it is going out. |
+| **Management** | `list` · `status` · `remove` · `doctor` | reading and repairing the registry. None of them create work. |
+| **Setup** | `init` · `config` · `schema` | bootstrap, settings, and the machine-readable surface for agents. Rarely typed. |
+
+Everything else the tool could be is a flag, a column in SQLite, or a later version.
+
 | Phase | Outcome | Rough size |
 |---|---|---|
-| **1. Baseline + safe cuts** | Green clippy + green tests; 3 crates and 7 command surfaces deleted; V4 drops the `plans` table and the `repos.default_branch` column; `ro schema` replaces the hand-written `robot-docs` | ~1 PR, mostly deletions |
-| **2. Identity, config, onboarding** | nested `ro.local.toml` (`[identity]`/`[auth]`/`[agent]`) + 3-tier precedence; three-mode `ro init`; `ro repos update`/`doctor`/`tag`/`untag`/`tags`; `ro repos add` remote-only + the drive-letter fix; `ro run prune --keep`; `toml_edit` `config set` | ~1100 LOC new, ~300 cut |
-| **3. Git, credential, safety** | branch/stage-all/diff primitives; **per-repo author via `git -c user.name/email`**; `RunOpts` env seam with a real timeout; fixed `RepoLock`; the **keychain/env credential resolver** + `SecretString`; the extraheader push path; `AuthPolicy` in `ro-core` | ~1100 LOC new |
-| **4. Engine abstraction + sweep cut** | `ro-engine` crate: `enum EngineKind` + `trait Engine` + claude/codex/git built-ins; the `Bucket` classifier and the whole `ro sweep` namespace die atomically | ~700 LOC new, ~900 cut |
-| **5. Fleet verbs + surface** | `ro checkpoint` (positional repos, per-repo identity, WIP/direct), **`ro pr`**, **`ro conflict` as the resolve assistant**, run history, the `ro repos` regroup, docs, the full test suite | ~2600 LOC new, ~2500 cut |
+| **1. Baseline + safe cuts** | Green clippy + green tests; 3 crates and 8 command surfaces deleted; V4 drops `plans`; `ro schema` replaces the hand-written `robot-docs`; **the registry gains the per-repo credential/engine columns** | ~1 PR, mostly deletions |
+| **2. Registry + global config** | `ro add`/`ro list`/`ro remove` as the whole inventory surface; per-repo credential + engine + branch **in SQLite**; `toml_edit`-based `ro config set`; `ro doctor` gains a **push-permission probe** | ~900 LOC new, ~600 cut |
+| **3. Git + credential substrate** | branch/stage-all/diff primitives; `RunOpts` env seam with a real timeout; fixed `RepoLock`; the **keychain/env credential resolver** + `SecretString`; the **extraheader** push path; per-repo author via `GIT_CONFIG_*` | ~1000 LOC new |
+| **4. Engine abstraction + sweep cut** | `ro-engine` crate: `enum EngineKind` + `trait Engine` + claude/codex/git; the `Bucket` classifier and the whole `ro sweep` namespace die atomically | ~700 LOC new, ~900 cut |
+| **5. `ro ship` + surface** | the fleet loop: scan → rebase → engine commits → push; per-repo transaction isolation; the alias deprecations; docs; the full test suite | ~1900 LOC new, ~2500 cut |
 
 ### The five phases are the five PRs
 
-The phases are not ten small steps — they are five PRs, each one mergeable and each leaving the tree green. §2's `1`, `1a`…`1j` are checklist items *inside* PR 1, not separate units of work. Review this as a PR series, not a phase list:
+§2's `1`, `1a`…`1j` are checklist items *inside* PR 1, not separate units of work. Review this as a PR series:
 
 | PR | Contains | Gate before merge |
 |---|---|---|
-| **PR 1** — baseline + cuts | Everything in §2. Fix the Windows separator bug, the clippy failure, the `ro import` panic; delete 3 crates, toon, fork, import, self-update, the health *display* and the whole review lifecycle; `V4_DROP_PLANS` (drops `plans` and `repos.default_branch`); land `ro schema` alongside the `robot-docs` removal | `cargo test` and `cargo clippy -D warnings` green on all three OSes; V4 applied to a copy of a pre-existing `state.db` without error, and `ro pr` still works against that upgraded database |
-| **PR 2** — identity, config, onboarding | nested `ro.local.toml` (`[identity]`/`[auth]`/`[agent]`) + 3-tier precedence + `deny_unknown_fields`; three-mode `ro init`; `ro repos update`/`doctor`/`tag`/`untag`/`tags`; `ro repos add` remote-only + the drive-letter fix; global-only `allow_fallback`; `toml_edit` `config set`; compat shim for `[providers]`; `ro run prune --keep`; fold `ro-jobs` into Registry and `ro-config` into Registry | unit tests for `init_mode` and `resolve_effective`; no existing user config becomes unloadable; `token = …` in a `ro.local.toml` is an **error**, not a silently-ignored key |
-| **PR 3** — git, credential, identity | branch/stage-all/diff primitives; **per-repo author applied via `git -c user.name=… -c user.email=…`**; `RunOpts` env seam with a real timeout; `RepoLock` relocated and its TOCTOU fixed; the **keychain/env credential resolver** behind a `SecretString` that cannot be `Debug`-printed; the `extraheader` push path; `AuthPolicy` + `CommitIdentity` in `ro-core` | the credential test asserts the extraheader reaches git, not merely that a push was attempted; a `SecretString` appears as `***` in a captured log line; a repo with `identity.email` commits as that author while the *other* repo in the same run commits as a different one |
+| **PR 1** — baseline + cuts | Everything in §2. Fix the Windows separator bug, the clippy failure, the `ro import` panic; delete `ro-review`, `ro-dep-update`, `ro-output`, toon, fork, import, self-update, the health *display* and the whole review lifecycle; `V4_DROP_PLANS`; land `ro schema` alongside the `robot-docs` removal | `cargo test` and `cargo clippy -D warnings` green on all three OSes; V4 applied to a copy of a pre-existing `state.db` without error |
+| **PR 2** — registry + global config | `ro add`/`list`/`remove` (flat, no `ro repos` namespace (reverted — see §3)); **`V5` adds `credential_ref`, `engine`, `engine_args` to `repos`**; `ro config set` via `toml_edit`; `ro doctor` probes **write access per remote**, not just token presence; the `[providers]` compat shim | a `credential` column that resolves and one that does not, side by side in a fixture; `ro doctor` reports `push: false` for a repo it cannot push to |
+| **PR 3** — git + credential | branch/stage-all/diff primitives; `RunOpts` env seam with a real timeout; `RepoLock` relocated and its TOCTOU fixed; the keychain/env resolver behind a `SecretString`; the extraheader push path; `AuthPolicy` + `CommitIdentity` in `ro-core` | the credential test asserts the **extraheader reached git**, not merely that a push was attempted; a `SecretString` renders `***` in a captured log |
 | **PR 4** — `ro-engine` | the new crate with `enum EngineKind` + `trait Engine` + claude/codex/git; the `Bucket` classifier and the `ro sweep` namespace die **in the same commit**; per-engine timeout and child-tree kill | `ro sweep commit-sweep` is never alive-but-hollow at any commit in the series |
-| **PR 5** — fleet verbs + surface | `ro checkpoint` (positional repos, per-repo identity, WIP/direct/`off`); **`ro pr`**; **`ro conflict` as the resolve assistant**; run history; the `ro repos` regroup with aliases; docs rewrite; the full test suite | dry-run and execute both green; partial failure exits 1; protected-branch, author, and credential cases covered; a conflicted repo round-trips through `ro conflict` → manual edit → `--continue` → pushed |
+| **PR 5** — `ro ship` + surface | the fleet loop, rebase-before-engine, the alias deprecations, docs, the full test suite | dry-run and execute both green; partial failure exits 1; the credential test passes across a 3-repo run with three different accounts |
 
 **Do not merge PR 4 and PR 5.** PR 4 leaves the tool without a fleet-commit command, which is unusable but honest; merging them hides the atomic sweep cut inside a large diff and makes the riskiest deletion in the series unreviewable.
 
@@ -54,8 +64,8 @@ The phases are not ten small steps — they are five PRs, each one mergeable and
 - **No daemon, no background sync, no cloud resume, no watch mode.** `ro sync --resume` gets deleted, not implemented. This was cut twice in review and stays cut: a background process is the single thing that most makes a CLI hard to reason about, and every run being explicit with dry-run as the default is load-bearing for the rest of the design. A `watch:` block that monitors a subset of repos is the same idea wearing a config file — it needs a lifecycle, a log destination, and an answer to what happens when it disagrees with a manual run. Revisit only if the fleet passes ~50 repos and the per-run cost is actually the bottleneck.
 - **No workspace or group abstraction.** There is no `Workspace` entity, no `ro workspace`, and no `group`. Selection is a flat set of repo names, aliases, and `owner/name` positionals, plus `--all`. `repo_tags` already carries a tag, and `--tag <T>` filters on it; a "group" is a tag with a different word in front of it, and adding a second mechanism for the same selection produces two answers to "which repos does this run touch?". If groups become load-bearing later, they are a named tag — not a new table, not a new command.
 - **No `ro clone`.** Cloning a remote repo and registering it is `ro repos add <REMOTE-SPEC>`, which is clone-then-register. A second verb for the same act is a second thing to document and a second thing to get wrong.
-- **No plaintext token in any config file, including `ro.local.toml`.** The per-repo file holds `credential = "keychain:<name>"` or `credential = "env:<VAR>"` and never the secret. This is the one place where following an obvious-looking example would be actively harmful: a `token = "ghp_…"` key in a file ro writes and the user commits-adjacent to is a live credential in plaintext, and the research already found `AuthToken` deriving `Debug`, so it is one `tracing` field away from a log file.
-- **No AI commit-message *generator* inside ro — but the engine does write the messages.** To be unambiguous, because this reads as a contradiction otherwise: `ro checkpoint` with the default `claude` or `codex` engine reads the diff and produces conventional commit messages, and that is the flagship behaviour. What is deleted is ro's *own* deterministic bucketing (`Bucket::classify` / `scope_of` / `task_id_of` and the message template), which existed to split commits **without** a model. The `git` engine is the only one that falls back to a fixed message, because it has no reasoning step. The boundary is: ro transacts and configures, the engine reasons.
+- **No plaintext token in any config file, including `.ro/config.local.toml`.** The per-repo file holds `credential = "keychain:<name>"` or `credential = "env:<VAR>"` and never the secret. This is the one place where following an obvious-looking example would be actively harmful: a `token = "ghp_…"` key in a file ro writes and the user commits-adjacent to is a live credential in plaintext, and the research already found `AuthToken` deriving `Debug`, so it is one `tracing` field away from a log file.
+- **No AI commit-message *generator* inside ro — but the engine does write the messages.** To be unambiguous, because this reads as a contradiction otherwise: `ro sync` with the default `claude` or `codex` engine reads the diff and produces conventional commit messages, and that is the flagship behaviour. What is deleted is ro's *own* deterministic bucketing (`Bucket::classify` / `scope_of` / `task_id_of` and the message template), which existed to split commits **without** a model. The `git` engine is the only one that falls back to a fixed message, because it has no reasoning step. The boundary is: ro transacts and configures, the engine reasons.
 - **No `ro review` lifecycle.** plan/approve/reject/apply/rollback/list-plans all go.
 - **No health score in the UI.** The 0-100 number and the Excellent/Healthy/Attention/Risky/Critical classes never render — `ro status` shows the raw facts instead (dirty, ahead, behind, conflict, protected). The *computation* stays: `--filter health:<N>` remains a real selector, so a 20-repo fleet run can target only the repos that actually need attention. A score is a filter, not a display. This is cheaper than it sounds: the scorer already exists and already has tests.
 - **No TOON.** Text + JSON + NDJSON.
@@ -63,10 +73,16 @@ The phases are not ten small steps — they are five PRs, each one mergeable and
 - **No `ro fork`.** It is already a stub: `fork clean` only *prints* `cleaned branch {b}` and deletes nothing, so `--dry-run` is a meaningless distinction; `fork sync` only runs `git fetch upstream` and never pulls or pushes. `FEATURES.md:205` documents `--strategy ff-only|rebase|merge` and `--push` flags that do not exist. Not "cheap" to keep.
 - **No `ro import` from GitHub stars/orgs.** Bulk-loading a cloud org list is orthogonal to managing a local fleet.
 - **No TUI, no interactive wizard, no engine discovery at init.** `ro init` never scans PATH for coding agents and never asks a question. With no arguments it finishes in about a second and prints two lines. (It *does* read the filesystem when you point it at a repo or a directory — that is the onboarding half, and it is opt-in by construction. See the three modes in section 3.)
-- **No async runtime in the git mutation layer.** The git layer is synchronous today and stays that way — do not introduce a runtime for it. This is *not* a workspace-wide prohibition: the GitHub layer is async today, and section 5 resolves that by removing the need for it in `ro checkpoint` (shell out to `gh`).
+- **No async runtime in the git mutation layer.** The git layer is synchronous today and stays that way — do not introduce a runtime for it. This is *not* a workspace-wide prohibition: the GitHub layer is async today, and section 5 resolves that by removing the need for it in `ro sync` (shell out to `gh`).
 - **No free-form plugin registry.** Exactly three engines ship, registered in a fixed three-entry table. The vision forbids a plugin registry; a config-driven one over a user-editable `[engines.*]` table is the same thing wearing a costume.
 - **No *silent* auto-management.** No repo ever enters the inventory without you asking for it. `ro repos scan` is read-only and writes nothing; the only ways in are an explicit `ro init` inside a repo, `ro init --add-dir <DIR>`, or `ro repos add`. What is dropped is the idea that "ro owns everything under a projects directory" — the boundary is the inventory table, and you cross it on purpose.
-- **No per-command config file in a repo dotfolder.** `ro.local.toml` sits at the repo root, single file.
+- **`.ro/` holds one file, and that is now justified rather than merely tolerated.** An earlier revision rejected a dotfolder for containing a single file, on grounds of tidiness. The better argument is the gitignore: `.ro/config.local.toml` as an entry names **one file**, so the first thing ro later adds to that directory — a cache, a state marker, a lock — silently starts showing up as untracked. `.ro/` is a directory pattern that is correct the day it is created and stays correct. Same reason `.claude/`, `.config/` and `.vscode/` are directories.
+- **No per-repo file by default.** The common case needs none: per-repo settings — credential reference, author profile, engine, tracked branch, tags — live in the **registry**, as columns on the `repos` row, because the registry already stores the repo's path, remote and identity, so a file would be a second copy of facts ro already has.
+- **`.ro/config.local.toml` is the escape hatch, under a `.ro/` directory, and it outranks the registry.** One bare file, gitignored, every key optional, a partial overlay rather than a replacement. It is for the cases the registry cannot cover: a repo you did not register through ro, a colleague's clone, a setting that must travel with the code on a machine that is not yours. It is also the only per-repo config format ro will ever support — a second one would make "which file wins" unanswerable.
+- **No `ro repos` namespace (reverted — see §3).** `ro add`, `ro list`, `ro remove` are top-level, as they are today. The regroup that moved six commands under a namespace bought discoverability and cost muscle memory on the four most-used verbs in the tool; across a surface this size there is nothing for a namespace to disambiguate. Aliases are therefore unnecessary for the new verbs and still load-bearing for the ones being **removed** (`prune`, `health`, `review`, `fork`, `sweep`, `robot-docs`).
+- **No run history, no `ro run`, no `ro conflict`, no standalone `ro pr`.** This is the real cost of the five-command surface and it should be written down rather than discovered later: **there is no audit trail.** "What did ro push last Tuesday, with which account" becomes unanswerable except from the refs and the remote's own history. A fleet tool that pushes with your credentials and leaves no record of having done so is a tool you will be afraid to run unattended. The mitigation in V1 is that every run prints a per-repo summary line naming repo, branch, engine, and the account the credential resolved to — **on stdout, not in a database**, because a database nobody queries is not an audit trail. If that is not enough, run history is the first thing to add back, and `ro-state`'s `runs`/`run_events` tables already exist for it.
+- **`ro doctor` checks push permission, not just token presence.** Checking "do I have a token" is the check that lets a wrong-account situation through. The check that matters is "can this credential write to this specific remote", because a token with `repo` scope and no write access on one repo is a completely ordinary state — it is the state this repository was in when this plan was written.
+- **`[git] default_branch` is not a setting.** The default branch is read live from `git symbolic-ref --short refs/remotes/origin/HEAD`, then `gh repo view --json defaultBranchRef`. A single global value is wrong the moment one repo is on `master` or `trunk` — and several of the repos this tool exists to manage are. A cache of a branch name is a field that goes stale on a rename.
 
 ---
 
@@ -93,7 +109,7 @@ Order is by safety. Every item is independently revertable. Do not reorder 1h be
 
 - **What:** `Commands::Fork` + the `ForkCommands` enum + the ~79-line handler arm in `main.rs` (lines 1391-1469).
 - **Also delete by hand** (`pub` in a lib crate, so no `dead_code` warning fires): `ro_git::read::merged_branches` (`read.rs:145`) and `ro_git::mutation::fetch_remote` (`mutation.rs:208`).
-- **Exception — do NOT delete `ro_git::read::has_remote` (`read.rs:124`).** It is exactly the primitive `ro checkpoint` needs for the "no GitHub remote → local commit only" rule. It happens to be called only from the fork path today, but it survives into Phase 3.
+- **Exception — do NOT delete `ro_git::read::has_remote` (`read.rs:124`).** It is exactly the primitive `ro sync` needs for the "no GitHub remote → local commit only" rule. It happens to be called only from the fork path today, but it survives into Phase 3.
 - **Verdict: SAFE-TO-DELETE.**
 
 ### 1c. `ro self-update` — SAFE, ~25 LOC
@@ -116,7 +132,7 @@ Order is by safety. Every item is independently revertable. Do not reorder 1h be
 - **Why the whole crate goes:** `ro_output::{OutputFormat, parse_output_format, render}` have **zero** external callers — `write_value` is reached only from inside the dead `render()` at `ro-output/src/lib.rs:68`. `json::{write_pretty, write_compact}`, all of `format::*`, `text::header`, and `NdjsonWriter` are the same. Cutting toon orphans the entire `ro_output::text` module, and what remains is a crate the binary barely uses.
 - **What moves, and where:** the **8 live `NdjsonEvent` constructors** are called at `main.rs:1087, 1099, 1107, 1124, 1130, 1116, 1145, 1152` inside the `sweep agent` handler, and `text::write_toon` at `main.rs:32`. Under the new architecture the orchestrator lives in the `ro` binary (see section 5), so both move into `crates/ro/src/ndjson.rs` (the `NdjsonEvent { kind, ts, #[serde(flatten)] payload }` envelope, kept verbatim) and `crates/ro/src/render.rs`. `ro-output` is deleted from `[workspace] members`.
 - **Test accounting:** `ro-output` has 25 tests. TOON kills 4, the dead `OutputFormat`/`parse_output_format`/`render` kill 5 more in `lib.rs`, `json.rs` kills 2, `format.rs` kills 6 — **~17 die, ~5 survive** (the `ndjson.rs` ones). Do not let "only 2 symbols are called" understate the live NDJSON surface: it is 9 call sites.
-- **Text rendering, stated explicitly so nobody hunts for a renderer that does not exist:** text output is **hand-rolled `println!` per command handler**, which is what happens today. `--format text` stays the default on `ro repos list`, `ro repos scan`, `ro status`, `ro sync`, and `ro checkpoint`; `json` and `ndjson` are the machine surfaces. There is no shared text renderer and the plan does not build one.
+- **Text rendering, stated explicitly so nobody hunts for a renderer that does not exist:** text output is **hand-rolled `println!` per command handler**, which is what happens today. `--format text` stays the default on `ro repos list`, `ro repos scan`, `ro status`, `ro sync`, and `ro sync`; `json` and `ndjson` are the machine surfaces. There is no shared text renderer and the plan does not build one.
 - **Verdict: SAFE-TO-DELETE.**
 
 ### 1f. `ro import` + `ro-github/src/import.rs` — SAFE, ~300 LOC
@@ -130,7 +146,7 @@ Order is by safety. Every item is independently revertable. Do not reorder 1h be
 
 **Only `ro review` drops a table.** The health scorer survives — see 1g below. The two cuts still land together because both are referenced by the same `delete_repo_cascade` literal lists, and the `plans` table is the only one going.
 
-- [ ] **Health UI only — keep the computation.** Delete `Commands::Health`, its handler arm, the `HealthClass` display enum, and the health entries in the (now-deleted) robot-docs literals. **Keep `crates/ro-state/src/queries.rs` in full** (275 LOC, 7 tests: `HealthClass`, `HealthSnapshot`, `score_repo_health`, `latest_health`, `score_all_health`, `row_to_health`), **keep `pub mod queries;`** in `ro-state/src/lib.rs`, and **keep the `health:<N>` branch in `resolve_multi_repo_targets`** so `--filter health:<N>` keeps working on `ro checkpoint`. The score is a selector, not a display: nothing renders it, but `ro checkpoint --filter health:critical` still narrows a 20-repo fleet to the repos that need a human. `HealthClass` keeps its `Debug`/`Serialize` derives because the filter now consumes it; delete only the `Display` impl if it exists to feed the removed table output.
+- [ ] **Health UI only — keep the computation.** Delete `Commands::Health`, its handler arm, the `HealthClass` display enum, and the health entries in the (now-deleted) robot-docs literals. **Keep `crates/ro-state/src/queries.rs` in full** (275 LOC, 7 tests: `HealthClass`, `HealthSnapshot`, `score_repo_health`, `latest_health`, `score_all_health`, `row_to_health`), **keep `pub mod queries;`** in `ro-state/src/lib.rs`, and **keep the `health:<N>` branch in `resolve_multi_repo_targets`** so `--filter health:<N>` keeps working on `ro sync`. The score is a selector, not a display: nothing renders it, but `ro sync --filter health:critical` still narrows a 20-repo fleet to the repos that need a human. `HealthClass` keeps its `Debug`/`Serialize` derives because the filter now consumes it; delete only the `Display` impl if it exists to feed the removed table output.
 - [ ] **Review:** delete `crates/ro-review/` (541 LOC, 13 tests), `Commands::Review`, the `ReviewCommands` enum, `fn parse_risk`, its handler arm, `AutoApproveLevel`, `ReviewConfig`, the matching `validate.rs:50-61` review blocks, the `[review]` block in `DEFAULT_CONFIG_TOML`, and the `paths.rs` test assertion on `review`.
 - [ ] **Good news:** `ro-review::apply_plan` (`apply.rs:22-45`) only runs `UPDATE plans SET status='applied'` — `ro review apply` never touched a repo. Deletion carries zero behavioral or data-loss risk.
 - [ ] **Do NOT confuse** `ro_sweep::agent::SweepSummary.plan_created: bool` (in-memory, live, `main.rs:1113`) and `ro_output::ndjson::NdjsonEvent::plan_created` with the `plans` table. They are unrelated to ro-review.
@@ -140,7 +156,7 @@ Order is by safety. Every item is independently revertable. Do not reorder 1h be
   ALTER TABLE repos DROP COLUMN default_branch;
   ```
   **`repo_health_snapshots` is NOT dropped** — the health scorer survives as the `--filter health:` selector — so the migration does not touch the health FK chain at all. **Do NOT edit `V1_INITIAL_SCHEMA`** — `migrate::run` records applied versions in `_meta.version` and only applies migrations with `version > current`, so a V1 edit never reaches an already-initialized DB. Update the hard-coded table list in `all_tables_exist` and the index list in `all_indexes_exist`, and drop **only the `plans` assertions** from the `remove_clears_dependent_rows` test at `manage.rs:437` — the `repo_health_snapshots` assertions and the `score_repo_health` calls at `ro-sync/prune.rs:369,381` all stay live. The `ALTER TABLE` is SQLite 3.35+ (2021); the workspace pins `rusqlite` with `bundled`, so check the bundled version rather than assuming.
-- [ ] **`default_branch` has readers that must be rewritten, not just a column to drop.** `ro pr --base` and the empty-repo base inference both read it today; both move to `git symbolic-ref` and `gh repo view --json defaultBranchRef` (see §3). `ro repos update --default-branch` is deleted with the column. Grep for the name before running the migration — a `SELECT` left behind is a runtime failure on an upgraded database, and the migration itself will succeed.
+- [ ] **`default_branch` has readers that must be rewritten, not just a column to drop.** The rebase base inside `ro push` and the empty-repo base inference both read it today; both move to `git symbolic-ref --short refs/remotes/origin/HEAD`, which is one git command and answers the question for any clone (§6.3). With pull requests cut there is no second consumer — no PR base to compute — so `gh repo view --json defaultBranchRef` goes too. The `--default-branch` flag is deleted with the column. **Grep for the name before running the migration**: a `SELECT` left behind is a runtime failure on an upgraded database, and the migration itself will succeed.
 - [ ] **⚠ Fix `ro-sync/src/manage.rs` in the same commit — one entry, not two.** `NULLABLE_FK_TABLES` contains `"plans"` as a **raw string literal**; remove it. `CHILD_TABLES` contains `"repo_health_snapshots"` and that entry **stays**. Getting this backwards is the single highest-risk item in the migration: dropping a table without editing this file leaves `cargo check`, `cargo clippy`, **and `cargo test` green** and then breaks `ro remove` / `ro repos prune` at runtime with a SQLite no-such-table error. Invisible to every static check.
 - **Verdict: DELETE-WITH-FOLLOWUP, one PR.**
 
@@ -173,7 +189,7 @@ Then delete: `ro_output::*` (whole crate, 1e); `ro_git::mutation::reset_hard` (d
 
 ### 1j. Held back for Phase 4 / Phase 5 — do NOT cut yet
 
-- **`ro sweep commit-sweep`** is the only working fleet-commit path. It stays until `ro checkpoint` ships. **But** the `Bucket` classifier deletion moves *into the same commit* that cuts the `sweep` namespace (Phase 4, see AA) — never leave the flagship command compiled-but-gutted.
+- **`ro sweep commit-sweep`** is the only working fleet-commit path. It stays until `ro sync` ships. **But** the `Bucket` classifier deletion moves *into the same commit* that cuts the `sweep` namespace (Phase 4, see AA) — never leave the flagship command compiled-but-gutted.
 - **`ro sync --parallel/-j`, `--resume`, `--timeout`:** delete the *flags* in Phase 5. Do not delete them now — the real bounded-executor work needs the fleet loop from Phase 5. Meanwhile **stop advertising them** in README/FEATURES: a silently-accepted no-op flag is worse than an error. Note `--timeout` is worse than advertised — `SyncOptions.timeout_secs` is set at `main.rs:739` and **never read anywhere in `ro-sync/src/sync.rs`** (only the struct field at `:40` and the `Default` impl at `:54`). It is a no-op flag today, and it is **not** a config-precedence instance: `timeout.unwrap_or(30)` is a hardcoded literal that never consults `core.timeout_secs`.
 - **`--quiet` and `--verbose`:** delete **both** in Phase 5. `--verbose` is never read anywhere. `--quiet` is a dead binding at `main.rs:623` (`let _quiet = cli.quiet;`) with exactly one real read at `main.rs:704` — inside the `ro import` branch that 1f deletes, so it has zero readers afterwards. This resolves the contradiction between the section-3 command tree and the cut list: the target tree below carries neither flag.
 
@@ -181,564 +197,489 @@ Then delete: `ro_output::*` (whole crate, 1e); `ro_git::mutation::reset_hard` (d
 
 ## 3. Renames & command surface
 
+
+Three commands keep their names — `ro add`, `ro list`, `ro remove` — because an earlier revision moved them under a `ro repos` namespace (reverted — see §3) and that turned out to cost more than it bought. At ten commands a namespace has something to disambiguate; at five there is nothing for it to do, and the regroup broke the four most-used verbs in the tool for no gain. Everything else is either promoted, cut, or fixed:
+
 | Before | After | Kind |
 |---|---|---|
-| `ro sweep commit-sweep` | `ro checkpoint` | **Promote + reshape** (not a rename) |
-| `ro sweep commit --path P --message M` | `ro checkpoint NAME --message MSG` | Fold into checkpoint |
-| `ro sweep agent --output json` | `ro checkpoint --format ndjson` | Move + unify flag namespace |
-| `ro add <SPEC>` | `ro repos add <REMOTE-SPEC>` | **Regroup** (alias kept one release) + **narrowed**: remote spec only, no local paths |
-| `ro remove <KEY>` | `ro repos remove <KEY>` | **Regroup** (alias kept one release) |
-| `ro list` | `ro repos list` | **Regroup** (alias kept one release) |
-| `ro prune` | `ro repos prune` | **Regroup** (alias kept one release) |
-| (new) | `ro repos scan <DIR>` | New, read-only |
-| (new) | `ro repos tag <REPO> <TAG>` | New, needed by `--tag` |
-| `ro robot-docs <TOPIC>` | `ro schema` | **Replace** with a clap-derived JSON surface (Phase 1, same PR) |
-| `ro health [REPO]` | (command gone) — `ro status` already shows the raw facts. `--filter health:<N>` survives as a selector | **Delete UI, keep compute** |
-| `ro review *` | (gone) | Delete |
-| `ro fork *`, `ro import`, `ro self-update` | (gone) | Delete |
-| `ro sweep *` | (gone) | Delete in Phase 4, atomically with the classifier |
-| `ro sync --resume` | (gone) | Delete (no daemon to resume into) |
+| `ro sweep commit-sweep` | `ro sync` | **Promote + reshape** — not a rename |
+| `ro sweep commit --path P --message M` | `ro sync NAME` | Folded in |
+| `ro sweep agent --output json` | `ro sync --format ndjson` | Unify the flag namespace |
+| `ro add` / `ro list` / `ro remove` | *(unchanged)* | **Regroup reverted** |
+| `ro status` | **stays `ro status`** | Kept as its own command — see the note below |
+| `ro health [REPO]` | *(command gone)* — `ro list` shows the raw facts. `--filter health:<N>` survives as a selector | **Delete UI, keep compute** |
+| `ro robot-docs <TOPIC>` | `ro schema` | **Replace** with a clap-derived JSON surface, in the same PR as the removal |
+| `ro review *`, `ro fork *`, `ro import`, `ro self-update`, `ro prune` | *(gone)* | Delete |
+| `ro sweep *` | *(gone)* | Delete in PR 4, atomically with the classifier |
+| `ro sync --resume` | *(gone)* | Delete — no daemon to resume into |
+| `--format toon` | `--format json` | Delete |
 | `ro --config-dir D` alone | actually honoured | **Bug fix** |
+| exit `0/1/64` (claimed) / `2` (clap) / `3` (prune) | `0/1/2` fleet outcomes, `64` usage, a distinct fatal code | Reconcile |
 | exit `0/1/64` (claimed) / `2` (clap) / `3` (prune) | `0/1/2` fleet outcomes, `64` usage, distinct fatal code | Reconcile |
 
 ### Target command tree
 
 ```
-ro [<GLOBAL FLAGS>] [<REPO>…]            # bare = checkpoint the cwd repo, dry-run
-ro [<GLOBAL FLAGS>] <COMMAND> …
+ro [<GLOBAL FLAGS>] <COMMAND>
 
-  init        # three modes, disambiguated by argv + cwd — see below
-             [--add-dir <PATH>] [--add-repo <PATH>] [--engine <NAME>]
-             [--auth gh|git] [--non-interactive] [--force]
-  repos       <SUBCOMMAND>
-               add <REMOTE-SPEC>    # clone + register. REMOTE SPEC ONLY — no local paths
-               remove <KEY>
-               list     [--owner <OWNER>] [--format text|json]
-               scan <DIR> [--depth <N>] [--format text|json]   # read-only, adds nothing
-               update   <KEY> [--name <NEW>] [--owner <NEW>] [--alias <NEW>]
-                       [--branch <NAME>] [--archive | --unarchive]
-               prune    [--archived] [--missing] [--orphans] [--archive | --delete]
-               doctor   [--format text|json]                   # read-only inventory audit
-               tag      <REPO> <TAG>...
-               untag    <REPO> <TAG>...
-               tags     [<REPO>] [--format text|json]
-  status      [<REPO>…] [--format text|json]
-  sync        [<REPO>…] [--strategy ff-only|rebase|merge] [--format text|json]
-             [--dry-run] [--clone-only] [--pull-only] [--autostash]
-             [-j <N>] [--timeout <SECS>]                    # PULL: reconcile with remote
-  checkpoint  [<REPO>…] (flag table lives with the command itself)
-             # PUSH: agent commits, ro pushes. direct | wip | off
-  pr          [<REPO>] [--base <BRANCH>] [--title <T>] [--body <B>]
-             [--draft | --ready] [--format text|json]
-  conflict    list [--format text|json]                     # every repo mid-merge/rebase
-             <REPO> [--strategy rebase|merge]               # fetch + integrate + resolve
-             <REPO> --continue                              # finish a manual resolution
-             explain <REPO> | abort <REPO>
-  run         list [--limit <N>] | show <RUN_ID> | timeline <RUN_ID>
-             prune --keep <N>                               # retention, never automatic
-  doctor      [--fix] [--format text|json]
-  config      [print | set <KEY=VALUE>]
-  schema                                    # generated from the clap tree
+  add <URL|PATH>     # register a repo. A URL is cloned; a PATH is adopted in place.
+                     #   --name <ALIAS>     display + lookup alias
+                     #   --tag <T>          repeatable; writes repo_tags
+                     #   --clone-to <DIR>   where a URL clone lands
+                     #   --branch <B>       clone -b <B>. A CLONE PARAMETER, see note.
+                     #   --credential <REF> per-repo credential reference
+                     #   --engine <NAME>    per-repo engine for this row
+                     #   --author <PROFILE> which [identity.*] profile commits this repo
+
+  list [<REPO>…]     # the registry itself: identity and configuration per row
+                     #   --tag <T>  --paths  --format text|json
+
+  status [<REPO>…]   # the fleet's state. Reads; writes nothing.
+                     #   --tag <T>  --dirty  --ahead  --behind  --format text|json
+
+  sync [<REPO>…]     # bring local copies up to date. Commits nothing.
+                     #   no args = every repo in the registry
+                     #   clone if missing -> fetch -> pull --rebase
+                     #   --all              same as no args, said explicitly (scripts)
+                     #   --tag <T>
+                     #   --strategy rebase|merge|ff-only
+                     #   --autostash        stash local changes, pull, pop back
+                     #   --prune            `git remote prune` — dead refs only
+                     #   --dry-run          --format text|json|ndjson
+
+  commit [<REPO>…]   # AI commits. NOTHING is pushed. The local half.
+                     #   scan -> preflight -> engine groups the work -> commits
+                     #   --all  --tag <T>
+                     #   --engine <NAME>     overrides the row, then [agent] engine
+                     #   --prompt <TEXT>     overrides [agent] prompt for this run
+                     #   --message <MSG>     one commit with this subject
+                     #   --amend             fold into HEAD. Refuses if HEAD is pushed.
+                     #   --dry-run           THE DEFAULT
+                     #   --execute           --format text|json|ndjson
+
+  push [<REPO>…]     # the remote half. Commits first if there is anything uncommitted.
+                     #   per repo: rebase -> [commit] -> push
+                     #   --all  --tag <T>
+                     #   --onto <BRANCH>    rebase onto something other than the
+                     #                       repo's own default branch
+                     #   --resolve           let the engine resolve REAL conflicts
+                     #   --yes               auto-answer the rebase prompt
+                     #   --include-archived  --format text|json|ndjson
+
+  ship [<REPO>…]     # THE command. commit + push, end to end, in one word.
+                     #   no args = every repo in the registry
+                     #   same flags as commit and push, minus --amend
+                     #   the default the docs lead with; commit and push are the
+                     #   advanced spellings for when you want them separately
+
+  doctor [<REPO>…]   # git, gh, engines, credentials, and PER-REMOTE WRITE ACCESS
+                     #   --fix               apply only the repairs that are unambiguous
+                     #   --format text|json
+
+  config [print | set <KEY=VALUE>]
+
+  init             # create ~/.config/ro/config.toml + the registry. Idempotent.
 ```
 
-Ten top-level commands, plus a bare form. `--quiet` and `--verbose` are gone (1j); do not re-add them to this tree.
+**Ten commands in three tiers, and five of them are the daily loop.** An earlier revision of this document said "five commands" for several sections while the tree beside it listed eight; the number was never load-bearing and the contradiction was. The tiers are the real structure:
 
-**Bare `ro` is `ro checkpoint` on the current repo — and it is safe because it is dry-run.** The single most common action in the tool's whole life is "I'm in a repo with uncommitted work, what would you do with it", and that should not require remembering a subcommand. `ro` with no subcommand resolves cwd to one repo, resolves that repo's `ro.local.toml`, and prints the checkpoint plan. **It does not commit, does not push, and does not spawn an agent**, because `checkpoint`'s default is `--dry-run` and the bare form inherits that default rather than overriding it. `ro` with positionals and no subcommand is the same thing over a named set: `ro cass backend` previews both.
-
-This is the one place where a magic default is worth it, and the reason is that the default it picks is read-only. A bare `ro` that committed would be indefensible; a bare `ro` that tells you what it would do is the whole tool in one word.
-
-**One more case, and it is the one that removes the last reason to `cd`: bare `ro` outside any repo previews the whole managed inventory.**
-
-```
-ro                    # inside a git repo  -> that one repo, dry-run
-ro                    # not in a repo      -> every MANAGED repo, dry-run
-ro cass backend       # named set          -> those, dry-run
-```
-
-That third-to-second transition is the whole multi-repo use case in one word, and it is scoped to the **inventory** — a set you put there deliberately with `ro init` or `ro repos add`. It is not a filesystem scan. The difference is the entire safety argument:
-
-| | inventory (what this does) | scanning parent folders (what was proposed) |
+| Tier | Commands | What it is for |
 |---|---|---|
-| Which repos | the ones you registered | every `.git` it can reach |
-| A repo you forgot about | invisible, safe | silently committed and pushed |
-| A clone someone left in `~/tmp` | invisible | pushed with your identity |
-| New repo you just made | not managed until you say so | picked up on the next run |
-| What "managed" means | a row you added | filesystem layout |
+| **Daily** | `sync` · `status` · `commit` · `push` · `ship` | the loop. `sync` in the morning, `ship` when the work is ready. |
+| **Registry** | `add` · `list` · `doctor` | registering and inspecting. None of them create work. |
+| **Setup** | `init` · `config` | bootstrap and settings. Rarely typed. |
 
-Auto-discovery means the set of repos ro will **push to with your credential** is decided by where you happen to be standing. A directory scan that reaches one repo too far is not a bug report, it is a disclosure. The inventory is a slower way to build the same list, and the speed-up is the exact thing that is dangerous here.
+Everything else the tool could be is a flag, a column in SQLite, or a later version.
 
-`--all` remains for scripts, and it means the same thing the bare form outside a repo means: the managed set. Nothing in the tool ever guesses.
+### `ro ship` is the command the docs lead with
 
-**Repo selection is positional, everywhere — and cwd is the no-argument case.** `ro checkpoint cass voice-ai-agent`, `ro sync cass`, `ro status backend`, and bare `ro` inside a repo. Not `--repo NAME`: it is what people actually type and it reads like a git command. `--all` remains the explicit "every managed repo" escape for scripts, because a bare `ro checkpoint --all` on a 20-repo fleet is a decision you want to be visible about. Accept a bare name, an alias, or `owner/name` in one positional and resolve it the same way in all three verbs — one resolver, one set of errors.
+It is the one that answers the question the tool exists for, and it is **not a new pipeline** — it is the §6.3 pipeline with a different stopping point, the same way `ro commit` and `ro push` are. `ship` runs steps **a–i**; `commit` runs **a–g**; `push` runs **a–i** but commits only what is uncommitted. Three spellings, one function, so they cannot drift.
+
+`commit` and `push` exist for the case where you want them separately: **`ro commit` then read `git log` before anything leaves the machine.** That is a real workflow and it is the reason the pair is not folded away — but it is the reason they are flags of `ship`, not the reason `ship` is optional. Everything the tool is *for* happens in one word.
+
+### No pull requests in V1
+
+`ro push` pushes. That is the end of it — no `gh pr create`, no `gh pr list`, no PR flags, no WIP branch.
+
+This was on the table repeatedly and cut three times, so the reasoning is recorded rather than restated. The tool's premise is **"I am in a hurry, across twenty repos, and I need this work off my machine now."** A pull request is the opposite shape: it is a request for someone else's attention, on a branch that is meant to last, reviewed before it lands. Building PR handling into an emergency-save tool answers a question the user is not asking, and it drags in four things the tool does not otherwise need:
+
+| Cut | Why it goes with it |
+|---|---|
+| `gh pr create` / `gh pr list` | the feature itself |
+| the WIP branch (`ro/wip/<slug>-<run>`) | existed only to have something to open a PR from. Without PRs, `ro push` pushes the branch you are on, which is what the rush scenario wants anyway |
+| `--base`, `--title`, `--body`, `--draft`, `--ready`, `--no-pr` | every one of them exists only to configure a PR |
+| `gh` as a push-path dependency | the only reason `ro` needed the GitHub CLI at all. `gh` survives only for optional credential discovery; the push itself is `git push` with a per-invocation header |
+
+**What is lost, plainly.** A branch can no longer be parked somewhere safe *by ro* and turned into a reviewable proposal. If that is wanted, `git push` is one command and the hosting web UI is one click, and neither needs a fleet orchestrator to do it for twenty repos at once.
+
+**What replaces it: `--onto`.** `ro push` still needs to know what to rebase onto, and it reads the repo's own `origin/HEAD` — no configuration, no `gh repo view`, no PR base to compute. `--onto <BRANCH>` overrides it for the rare case where the work belongs on something other than the default branch, which is the one real use the PR base served.
+### `ro clone` and `ro resolve` are not commands
+
+`ro clone` is what `ro sync` already does for a row whose working copy is missing. `ro resolve` is a stage inside `ro push`, reached with `--resolve`. Both were proposed as verbs; both are a flag and a step respectively, and neither needs a name of its own.
+
+### No `ro auth`
+
+**`ro` does not log in to GitHub. `gh` does that.** There is no `ro auth login`, no `ro auth logout`, no `ro auth list`, and there is no backend, no account, no session, and no secret store.
+
+This is not a missing feature, it is a consequence of what the tool is: a local orchestration CLI for repositories you have already cloned. A `login` verb would have to answer "log in to what, store where, how do you log out" — and the honest answer to all three is "export an environment variable in your shell profile", which is precisely what `gh auth login` already does better, into the OS keyring rather than a file.
+
+Config holds a **reference**, never a value:
+
+~~~text
+[github]
+token = "env:GH_PERSONAL_TOKEN"      the variable to read
+[github]
+token = "keychain:gh-personal"       the keyring entry to read
+~~~
+
+The secret is read at push time and exists in ro's memory and in the argv of the one `git` invocation that needs it. There is nothing to log in to, nothing to log out of, and nothing for a stolen database to leak — which is the entire reason the column is validated to reject anything that does not parse as `<scheme>:<name>`.
+
+**Global flags: `--config-dir`, `--state-dir`, `--non-interactive`, `--format`.** That is the whole set, and two flags that were proposed are absent for reasons worth recording:
+
+- **No global `--json`.** There is exactly one output selector, `--format text|json|ndjson`, applied per command. The codebase today has the opposite problem — a `toon` ValueEnum on one path and a free-form `--output json` String on another, where only the literal `"json"` is honoured — and adding a third spelling does not fix that, it entrenches it. A global `--json` boolean and a per-command `--format json` is two mechanisms that can disagree, and the one that loses is silent.
+- **No global `-q` / `-v` / `--quiet` / `--verbose`.** Both already exist in the clap tree and both are deleted: `cli.verbose` is read nowhere, and `cli.quiet` has a dead `let _quiet = cli.quiet;` binding plus exactly one real read, which is inside the `ro import` branch that PR 1 removes. A verbosity flag that nothing reads is a promise the tool does not keep, and the output that actually needs suppressing — per-repo progress under `-j 4` — is handled by the progress renderer instead.
+
+**`--parallel` moves to `-j <N>`**, consistent with the rest of the tool, rather than being spelled two ways.
+
+### Four flags that are not copied verbatim, and why
+
+**`ro sync --force` is refused, and this is the most important deviation in the table.** The proposal was "skip dirty check". A dirty worktree plus `pull --rebase` is exactly the situation where a *forced* operation destroys work: the plausible implementations are `git reset --hard` (throws away every uncommitted change in a repo nobody was looking at) or `git checkout -f` (same, quieter), and this is a flag that would be typed by someone who is, by the premise of the whole tool, **rushing**. The correct answer to a dirty worktree is `--autostash`: stash, pull, pop, and if the pop conflicts, say so and leave the stash in the list for a human. So `--autostash` exists and `--force` does not. A tool whose entire premise is *"I am in a hurry across 20 repos"* should not have a flag that discards work faster than a human can read the help.
+
+**`ro remove --delete` is gated, not removed.** Deleting a working copy is a legitimate operation and it is the only way to reclaim disk. It is also the exact operation that the Windows orphan bug would have aimed at *managed* repositories — the research found `prune --delete` reporting every tracked repo as an orphan on Windows, which is a data-loss bug wearing a cleanup command's clothes. So: `--delete` is refused without either an interactive confirmation or `--non-interactive`, the target path is printed in full before the prompt, the path is checked against the registry one last time immediately before `remove_dir_all`, and **a directory containing a `.git` whose origin matches a *different* registered repo is refused outright** — that is a copy-paste accident, not a cleanup.
+
+**`ro commit --amend` refuses when HEAD is already on the remote.** Amending a pushed commit produces a history rewrite, and the next `ro push` would need `--force-with-lease` to reconcile it — which means a flag intended for "I forgot a file" can silently turn into a force-push. The guard is a `git branch -r --contains HEAD` check, and the error says so: *"HEAD is already on origin/<branch>; amending would require a force-push. Push with --force-with-lease if that is what you want."* Amending a purely local commit is free and stays.
+
+**`ro add --branch` sets the clone branch, it does not seed a cached column.** `git clone -b <B>` is what the user wants when adding a repo that is not on its default branch, and it is a clone parameter with no lifetime. A `repos.default_branch` column was **dropped in V4** for a reason: `git symbolic-ref` and `gh repo view` both answer it live, and a cache of a branch name is a field that goes stale the moment someone renames `main` to `trunk`. Re-adding the column to hold a value git can be asked is the drift this plan has spent two rounds removing. The column stays dropped; `--branch` becomes a one-shot argument to the clone.
+
+**`ro add --private` is renamed `--credential <REF>`.** The proposed name describes visibility and the proposed meaning was "use credential profile"; a flag whose name says one thing and does another is how `--force` ended up meaning three different things across three commands. If repo visibility is ever a real setting it gets its own name.
+
+
+**Three tiers, and the tiers are the point.** `init`, `config` and `schema` are setup rather than verbs: `init` creates the config dir and database, `config` prints and edits global settings, `schema` emits the clap tree for agents. They are not part of the daily loop. Everything the tool *does* every day is in the core and management tiers above.
+
+**There is no `ro checkpoint`, no `ro pr`, no `ro conflict`, no `ro run`, and no `ro repos` namespace (reverted — see §3).** PR creation is step four of `ro sync`, not a separate command: the common case is "I have work and I want it somewhere safe", and splitting that into two verbs meant the first one always had to know whether the second was coming. Conflict resolution is a *stage inside* a sync, not a mode you enter separately. Run history is stdout, not a database (see the audit-trail note in §1).
+**Repo selection is positional, and no argument means the whole registry.** `ro sync` with no arguments is every repo in the registry — that is the daily invocation, and it replaces the `cd && ro ship` loop entirely. `ro sync cass voice-ai-agent` is a subset, and `--all` says the same thing explicitly for scripts. Not `--repo NAME`: it is what people actually type and it reads like a git command. `--all` remains the explicit "every managed repo" escape for scripts, because a bare `ro sync --all` on a 20-repo fleet is a decision you want to be visible about. Accept a bare name, an alias, or `owner/name` in one positional and resolve it the same way in all three verbs — one resolver, one set of errors.
 
 Note what this is **not**: `cd repo-a && ro` in a loop. The positional form exists so you can stay in one directory and name the fleet. An earlier proposal to make the loop the interface — `cd a && ro ship; cd b && ro ship` — is precisely the workflow this tool was built to remove, and it is the reason the positional form and the inventory exist at all.
 
 **`ro clone` does not exist.** Cloning a remote repo and registering it is `ro repos add <REMOTE-SPEC>`, which is clone-then-register. A second verb for the same act is a second thing to document and a second thing to get wrong. If you want it to read better at the top level, the honest form is an alias, not a subcommand.
 
-### The three `ro init` modes — one verb, disambiguated by argv and cwd
+### `ro add` is the only door into the registry, and it takes a local path
 
-`ro init` is the onboarding verb. It is dumb about *engines* and competent about *repos*, and the two never mix: it never scans PATH for `claude`/`codex`, never asks a question, never validates a binary. Availability is still checked lazily at `ro checkpoint` time.
-
-| Invocation | What it does | Cost |
-|---|---|---|
-| `ro init` (no args, not in a git repo) | **Global bootstrap.** Write `~/.config/ro/config.toml` with the hardcoded `engine = "claude"` + `auth = "gh"`, create the config dir, print the path and the one-line override hint. Nothing else. | ~1s |
-| `ro init` (no args, **inside** a git repo) | **Onboard that repo.** The global bootstrap, plus: write `ro.local.toml` at the repo root, append it to `.gitignore` idempotently, and insert the repo into the inventory. This is the common case — `cd my-repo && ro init`. | ~1s |
-| `ro init --add-dir <DIR>` | **Onboard a workspace.** Scan `<DIR>` for git repos, print what it found, and register each one **with an explicit summary and a confirmation in a TTY** (`--non-interactive` registers all and skips the prompt). Each registered repo gets its `ro.local.toml` + `.gitignore` entry. | seconds, scales with repo count |
-| `ro init --add-repo <PATH>` | **Onboard one specific repo** without scanning a parent. Equivalent to `cd <PATH> && ro init`. | ~1s |
-
-Two rules keep this from becoming the magic the plan rejected:
-
-- **Mode selection is by argv and cwd, never a guess.** No args + `.git` in cwd → onboard that repo. No args + no `.git` → global only. `--add-dir` is always explicit. There is no recursive walk of the current directory, ever — that is what `ro init --add-dir .` is for, and the user types the dot.
-- **`--add-dir` is still opt-in.** It is a flag, not a default. `ro repos scan` remains read-only and writes nothing. The point is that you can onboard 20 repos in one command *because you asked for 20 repos*, not because ro decided your projects directory is a fleet.
-
-### `ro init` vs `ro repos add` — the split, and why it matters
-
-Today these overlap and neither is right. `ro repos add` records a repo and remembers where it "will live at" without cloning; the actual clone happens later in `ro sync --clone-only`. The result is a state you cannot get out of: an inventory row pointing at a directory that does not exist. That is the "tracked but not cloned" row the checkpoint edge-case table in section 6 has to handle at all.
-
-| Situation | Command | Result |
-|---|---|---|
-| The repo is already on disk, and I am standing in it | `ro init` | onboard: `ro.local.toml` + `.gitignore` + inventory row, working copy untouched |
-| I want a repo I do not have yet | `ro repos add github.com/owner/repo` | **clone and register** — a working copy exists when the command returns, or it failed and there is no inventory row |
-
-`ro repos add` becomes clone-then-register, and it is **all-or-nothing per repo**: on clone failure it writes no row. That deletes the "tracked but not cloned" state from the data model instead of teaching the rest of the system to tolerate it. `ro sync --clone-only` stays for the repos that were added by older versions or by `ro import`-era tooling, but nothing new produces that state.
-
-### `ro repos update` — the missing CRUD verb
-
-`repos` has add, remove, list, scan, prune, tag and **no way to change a row**. Today, renaming a repo or flipping `archived` means `ro remove` followed by a re-`add` — and `remove` cascades through `CHILD_TABLES`/`NULLABLE_FK_TABLES`, so the cycle really does drop that repo's `repo_tags` rows and its `repo_health_snapshots` history. For a fleet tool whose whole point is a stable inventory, that is the wrong shape.
-
-`ro repos update <KEY>` is a targeted, idempotent column edit against the existing `repos` table. It never touches a working copy and never renames a directory — it changes what the inventory *believes*, and reconciling disk stays the user's job.
-
-**The key is `(host, owner, name)`, not `(owner, name)`** — that is the table's `UNIQUE` constraint (`migrate.rs:81`). Parse `<KEY>` as the existing `owner/name` form with an optional `host/` prefix defaulting to `github.com`, so the common case stays short.
-
-The columns that exist today (`migrate.rs:66-82`) and are worth exposing:
-
-- `--name <NEW>` / `--owner <NEW>` — change the inventory identity. Refuses if the new `(host, owner, name)` already exists: that is a merge, not an update.
-- `--alias <NEW>` — the `alias` column exists and has no writer anywhere in the workspace. A short human label (`backend`, `oss`, `work`) is what `--tag` wants to be and is cheaper to type.
-- `--default-branch <NAME>` — **removed.** The `repos.default_branch` column is dropped in V4; `ro pr --base` resolves from `git symbolic-ref` and `gh repo view` instead. Correcting a branch name by hand was only ever patching a cache of a value two live sources already answer.
-- `--branch <NAME>` — the tracked `branch TEXT` column, currently the checkout ro assumes. Correcting it by hand is the escape hatch when the inventory and disk disagree. This one stays, because it is the branch *ro* is tracking locally, not a fact about the remote.
-- `--archive` / `--unarchive` — toggle `archived`, which exists and is **never filtered** today (see the fleet-correctness note below).
-
-**No `--remote` flag, and this is deliberate.** There is no remote column and no remotes table — the full table list is `repos, runs, run_events, sync_results, jobs, job_events, plans, failures, repo_health_snapshots, context_cache, audit_log, repo_tags`. Remotes are read live from the working copy through git, and mirroring them into the inventory would create a second source of truth that drifts the moment anyone runs `git remote set-url`. Fixing a remote is `git remote set-url` in the repo, which is one command ro does not need to wrap. Adding a remotes table in v1 would be the same over-engineering this plan exists to remove.
-
-Everything not named is untouched. No `--force`, no bulk mode, no dry-run in v1: a single-row edit is cheap to undo by re-running with the old value, and the surface stays scriptable without a confirmation prompt. `ro repos update --archive`, combined with the `archived = 0` filter, is also the *supported* way to park a repo — which the plan otherwise has no mechanism for.
-
-### `ro repos add` is remote-only, and must reject a local path out loud
-
-Two verbs, two meanings, no overlap: `ro init` registers a repo **you already have, on disk**; `ro repos add` fetches a repo **you do not have**. The second is a network act, so its argument has to be a remote spec and nothing else. A user who types `ro repos add .` or `ro repos add C:\work\backend` must get an error that names the right command, not a row in the inventory.
-
-`RepoSpec::parse` already rejects most local paths by accident — it requires an `owner/name` split on `/`, so `.` and `C:\work\backend` fail with "expected owner/repo". **But the Windows forward-slash form parses as a valid spec and that is a real bug:**
+Three things were true at once in earlier revisions and could not all stay true: `repos` was a namespace, `ro add` took a remote spec, and `ro init` had three modes. At a small surface, the namespace has nothing to disambiguate and `ro add` is a verb the user already knows from every other tool. So:
 
 ```
-ro repos add C:/work/backend
-  -> from_host_owner_name("github.com", "C:/work/backend", …)   repo_spec.rs:107
-  -> splitn('/', 2) gives ["C:", "work/backend"]
-  -> owner = "C:", name = "work/backend"
-  -> clone_url = "https://github.com/C:/work/backend.git"
+cd voice-ai-dashboard && ro add          # no argument = the cwd repo
+ro add ~/work/backend --engine codex     # with overrides, recorded on the row
+ro add github.com/acme/api               # a remote spec: clone, then register
 ```
 
-A row is inserted for an owner that does not exist, and the failure surfaces much later as a clone error against a nonsense URL. Fix it in `RepoSpec` rather than in the command handler, so every caller inherits it: reject a spec whose `owner` matches `^[A-Za-z]:$` (a Windows drive letter) and reject any spec containing a backslash. Add both as `RepoSpec` test cases — they are two lines and they are the difference between a clear error and a corrupt row.
+**A local path and a remote spec are both accepted, and the disambiguation is structural rather than a guess.** A value containing a `/` after a recognised host prefix (`github.com/…`, `https://…`, `git@…`) parses as a remote spec; anything else that resolves to a directory containing `.git` is a local path. `ro add` refuses anything that is neither, with a message naming the two accepted forms.
 
-`ro init` is the only verb that accepts a filesystem path, and it takes the path implicitly from cwd or from `--add-dir`/`--add-repo`. A user reaching for `ro repos add <path>` has the wrong command; the error message says so.
+**The `RepoSpec` drive-letter bug is a live hazard here and must be fixed in `ro-core`, not in the handler.** `repo_spec.rs` splits on `/` and requires two parts, so `ro add .` and `ro add C:\work\backend` fail correctly — but `ro add C:/work/backend` parses as `owner = "C:"`, `name = "work/backend"`, and inserts a row for an owner that does not exist, with a clone URL of `https://github.com/C:/work/backend.git`. It fails much later, as a clone error against a nonsense URL. Reject a drive-letter owner and reject any backslash inside `RepoSpec::parse` so every caller inherits the fix. Two test cases, three lines of code.
 
-### `ro repos doctor` — read-only inventory audit
+**Cloning is all-or-nothing per repo.** A failed clone writes no row. That is the whole reason "tracked but not cloned" stops being a state the system has to tolerate: the state is never created rather than being handled.
 
-The inventory drifts. A folder gets renamed, a disk gets swapped, a clone gets deleted, the `origin` URL stops matching `clone_url`. Today every consumer discovers this independently and inconsistently: `status_repo` has a `<local_path>/.git` guard, the checkpoint edge-case table has a `NotCloned` reason, `ro repos prune --missing` can find them, and the bare-orphan half of `prune` does a third thing. Three partial answers to one question.
+### Everything that was a command is now a column
 
-`ro repos doctor` is that question, asked once, changing nothing:
+Six capabilities from the previous revision did not survive the cut to a small surface, and it is worth being explicit about where each one went — and about the one that simply did not:
 
-```
-✓ backend                       present, clean
-✗ dashboard (missing)           no directory at the recorded local_path
-⚠ worker (remote mismatch)      origin is git@github.com:acme/worker, inventory says acme/worker.git
-⚠ gateway (not a repo)          path exists but has no .git
-○ legacy-api (not cloned)       recorded, never cloned — run: ro repos add acme/legacy-api
-```
-
-Four checks, all of which already exist as ad-hoc logic somewhere: **missing** (no directory), **not a repo** (directory but no `.git`), **remote mismatch** (live `origin` vs the recorded `clone_url`), **not cloned** (the legacy state from the init/add split). Read-only, always. No `--fix`: every remedy is destructive or opinionated — a missing directory means `ro repos remove`, a mismatch means the user should look at it — and a tool that guesses which of those you meant is a tool that deletes something.
-
-This is deliberately **not** folded into `ro status`. `ro status` answers "what state is each repo in right now" and runs on every fleet operation; `ro repos doctor` answers "is my inventory still true", is a maintenance command you run when something looks wrong, and is the one you paste into an issue.
-
-### `untag` and `tags` — the tag table needs to be able to shrink
-
-The `repo_tags` table (`migrate.rs:212-218`) is `PRIMARY KEY (repo_id, tag)` with `ON DELETE CASCADE` and an index on `tag`. With only `tag`, the table can grow forever: the only way to remove a tag is to edit SQLite by hand, which is precisely the failure mode that makes people stop using a tool.
-
-Three verbs complete the CRUD and all three are one statement each:
-
-| Verb | SQL |
+| Was | Now |
 |---|---|
-| `ro repos tag <REPO> <TAG>…` | `INSERT OR IGNORE INTO repo_tags (repo_id, tag) VALUES (?, ?)` |
-| `ro repos untag <REPO> <TAG>…` | `DELETE FROM repo_tags WHERE repo_id = ? AND tag = ?` |
-| `ro repos tags [<REPO>]` | `SELECT tag FROM repo_tags WHERE repo_id = ? ORDER BY tag` |
+| `ro repos update --name/--owner/--alias/--branch/--archive` | `ro config set repos.<name>.<key> = <value>` |
+| `ro repos doctor` (inventory drift audit) | folded into `ro doctor`, which now checks write access per remote as well |
+| `ro repos tag` / `untag` / `tags` | **cut.** No `--tag` filter exists any more, so tags have no consumer |
+| `ro repos scan` | **cut.** Discovery was always the unsafe part; `ro add` is the only door |
+| `ro repos prune` | **cut** |
+| `ro run` / `ro run list` / `show` / `timeline` / `prune` | **cut.** No audit trail. See §1. |
+| `ro pr` | step four of `ro sync` |
+| `ro conflict` | a stage inside `ro sync`, reached on a real conflict |
+| `ro repos` namespace (reverted — see §3) | flattened back to `ro add` / `list` / `remove` |
 
-Both writers take **multiple** tags — `ro repos tag a backend oss work` is the shape people actually type, and looping in the handler is three lines. `tag` uses `INSERT OR IGNORE` so tagging twice is a no-op, not an error. `untag` on a tag that is not there is also a no-op with exit 0, because "make it so" is idempotent and an error would make shell loops awkward. `idx_repo_tags_tag` already makes `--tag <T>` selection indexed, so no schema work is needed.
+**The `tag` / `untag` cut is the one that costs something real**, and it should be recorded as a decision rather than an oversight. The `repo_tags` table has no writer and no reader today (`--filter tag:orch` matches on `label.contains("orch")` against the literal string `owner/name`, so it is a fake that silently selects the wrong repos). Shipping a writer without a remover would have been worse — the table could grow but never shrink, and the only way to remove a tag would be hand-editing SQLite. Cutting the whole feature is the correct response to a feature with no consumer, and if filtering by a saved set is ever wanted it comes back as one column and one flag, not as a table and three verbs.
 
-This is the same hole the `update` verb fills for `repos`. Audit every writer in the plan for its missing remover; `tag`/`untag` is the only one.
+### Deprecation is a release-note line, not an alias strategy
 
-### `ro run prune --keep <N>` — retention, never automatic
+Nothing is being **moved**, so there are no new spellings to alias — `ro add`, `ro list`, `ro remove` keep the names they have today, and the survey confirms there are **zero aliases anywhere in the current clap tree**, so nothing is in the way. What is being *removed* is the other list:
 
-`runs`, `run_events`, `sync_results`, and `failures` all grow without bound, and a 20-repo fleet that checkpoints on every panic generates runs faster than anyone expects. There is no retention today and no plan for one, which means the first person to notice does it by deleting `state.db` and loses the inventory with it.
+| Removed | Replacement |
+|---|---|
+| `ro sweep commit-sweep` / `commit` / `agent` | `ro sync` |
+| `ro status` | `ro list` |
+| `ro health` | `ro list` shows the raw facts; the scorer survives as a `--filter` |
+| `ro review *` | *(nothing — it did nothing but `UPDATE plans`)* |
+| `ro fork *` | *(nothing — it was already a stub)* |
+| `ro robot-docs` | `ro schema` |
+| `ro import` | *(nothing — it panicked in production)* |
+| `ro self-update` | *(nothing)* |
+| `ro prune` | *(nothing)* |
+| `ro sync --resume` | *(nothing — no daemon to resume into)* |
+| `--format toon` | `--format json` |
 
-`ro run prune --keep <N>` keeps the **N most recent runs** and deletes their events, results, and failures by `run_id` cascade. Explicit, never automatic: no time-based expiry, no size cap, no "clean up on startup". An automatic policy would eventually delete the run that explains a bad push, and the failure mode is silent and discovered too late.
+**Two of these deserve a deprecation shim rather than a clean break**, because they are on the daily path of anyone already using this tool:
 
-`--keep` is required. There is no default, because "prune to what?" has no safe answer and a default is how data disappears. Deleting a run also has to be announced in the output — `--format json` reports `{deleted: N, oldest_kept: "<run-id>"}` — so a script that calls it can log what it destroyed. One `DELETE … WHERE run_id IN (SELECT id FROM runs ORDER BY started_at DESC LIMIT -1 OFFSET ?)` over the four tables, with the run count printed before and after.
-
-Note the interaction with the V4 migration: `prune` here deletes **rows**, never tables, and is unrelated to `V4_DROP_PLANS`.
-
-### `ro pr` — push a branch and open the PR, without committing
-
-The plan originally had no standalone PR verb: creating a PR was `ro checkpoint --wip`, which commits, branches, pushes, and opens the PR as one transaction. That is the right shape for *"I have WIP and want it somewhere safe."* It is the wrong shape for *"my branch is already committed and pushed, I just need the PR"* — which is most PRs, most days. Forcing those through `checkpoint` means either committing again for no reason or inventing a flag combination whose only job is to disable three of the four steps.
-
-`ro pr [<REPO>]` does exactly two things: ensure the current branch is on the remote, then `gh pr create`. It does **not** commit, does not create a branch, and does not switch branches. If the tree is dirty it says so and stops — a PR is a statement about a specific commit, and silently including uncommitted work in a branch you did not just push is how a WIP file ends up in a reviewed PR.
-
-**`--base` is resolved from git and GitHub, never from config or a database cache.** An earlier draft preferred the inventory's `default_branch` column, then a second revision kept it as a fallback. Both are gone: the column duplicated a fact two live sources already answer authoritatively, and a cache of a branch name is a field that goes stale on a rename.
-
-```
-1. --base, if given
-2. `git symbolic-ref --short refs/remotes/origin/HEAD`  ->  origin/main
-   (for a non-origin remote, try the remote actually configured in the row)
-3. `gh repo view --json defaultBranchRef -q .defaultBranchRef.name`
-4. error, naming all three
-```
-
-Two live sources, one cache, no fallback. A repo renamed `main` → `trunk` upstream is caught by step 2 or step 3 without the user editing anything. Steps 2 and 3 fail together only when there is no remote or `gh` is unavailable — in which case the honest answer is to ask rather than guess, and `--base` is right there in the error.
-
-The `repos.default_branch` column is **dropped in V4** alongside `plans`, and `ro repos update --default-branch` goes with it. Nothing reads the column after this change, and leaving an unread column is exactly the dead-schema problem this plan has been cutting everywhere else.
-
-`--title` and `--body` default to nothing, which is correct: `gh pr create` derives a title from the commits and ro has no opinion. `--draft` and `--ready` are the same thing at different times; `--draft` is the default because a PR opened seconds after a push is almost never ready for review.
-
-**Output is a result, not a browser launch.** Print the number, the title, and the URL, and stop:
+- **`ro sweep commit-sweep --all --execute` → `ro sync --execute`.** A hidden `#[command(alias = …)]` on `sync` for one release, printing a deprecation line naming the replacement. This is the single most-used invocation in the tool today.
+- **`ro status` keeps its name and its own job.** An earlier revision folded it into `ro list`; that was a mistake the two-command split makes obvious. The distinction is not cosmetic and it is the same one git draws:
 
 ```
-✓ PR created
-#142  feat: retry extraction
-     https://github.com/quangdang46/cass/pull/142
+ro list     ->  WHAT IS REGISTERED      identity: owner, path, remote, engine, credential profile, author profile, tags
+ro status   ->  WHAT STATE IS IT IN     branch, dirty, ahead, behind, conflict, last sync
 ```
 
-No browser is opened. That is partly a portability decision — `xdg-open`/`open`/`start` are three different calls with three different failure modes, and a CLI that hangs waiting on a browser is a CLI someone runs in a script — and partly the simpler one: the URL on screen is clickable in every terminal worth using.
+`ro list` answers *"what have I set up"* and reads from the registry's configuration. `ro status` answers *"what happened to it"* and reads from git. A repo can be perfectly configured and broken, or configured correctly and behind by nine commits — collapsing those into one command means one of the two answers has to get worse. Neither is deprecated.
 
-Duplicate handling is the one behaviour worth spelling out, and it matches `checkpoint --wip`: **if an open PR already exists for this head, update it and print the existing URL rather than opening a second one.** A second PR for the same branch is the failure everyone hits when they re-run a script.
+Everything else goes in one release with a **table in the release notes mapping old to new**, and the docs rewritten so no removed command appears. An alias with no announced removal is an indefinite compatibility tax; two aliases with announced removals is a courtesy.
 
-The branch naming, the push path, and the `gh pr create` call are shared with `checkpoint --wip`. If they are not shared, the two will drift and one of them will eventually push a branch the other cannot find.
-
-### `ro conflict` is the resolve assistant, not just a detector
-
-The plan's original `ro conflict` was `list | explain | abort | mark-resolved` — detection, explanation, and bailing out. That is half a feature: knowing a repo is wedged without help getting it unwedged just moves the work back to the terminal. The verb stays `conflict` (not a new `ro resolve`); the subcommands are the question and the action.
+**`ro doctor` gains the check that matters more than any of this.** Today it verifies that *a* GitHub token exists. The check that actually prevents a failed run is whether *this repo credential* can *write to this repo remote* — because a token with `repo` scope and no write access on one repository is an entirely ordinary state, and it is the state this very repository was in when this plan was written: `qdang46` authenticated, `quangdang46/repo_orchestrator` remote, `push: false`, discovered only at the push step as a 403. `ro doctor` should report, per remote, the account the credential resolves to, and whether it can write.
 
 ```
-ro conflict list                          every repo mid-merge or mid-rebase
-ro conflict <REPO>                        fetch, integrate, help finish
-ro conflict <REPO> --continue             finish after a manual resolution
-ro conflict explain <REPO>                what state is it in and why
-ro conflict abort <REPO>                  bail out, restoring the pre-operation ref
+✓ git                    2.45.0
+✓ gh                     2.89.0
+✓ claude                 /usr/local/bin/claude
+✓ codex                  not installed            (informational — not a default)
+
+repos:
+  ✓ voice-ai-dashboard    company  (me@corp.com)     write: yes
+  ✗ cass                 personal (me@gmail.com)   write: NO   <- 403, push will fail
 ```
 
-`ro conflict <REPO>` is the flow, and it is the one place where opening a tool for the user is the right default:
-
-```
-fetch origin
-   ↓
-rebase onto <base>            (--strategy merge for the other mode)
-   ↓
-clean?  ── yes ──→ continue, push, done
-   │
-   no
-   ↓
-show the conflicted paths, grouped by conflict type
-offer: open mergetool  |  list the files  |  abort
-   ↓
-(user resolves in their own editor)
-   ↓
-ro conflict <REPO> --continue
-   → stage what they resolved, run rebase --continue, push if the ref moved
-```
-
-Two rules keep this from becoming a merge tool that half-knows what it is doing:
-
-- **`--continue` verifies before it continues.** It checks the index is actually free of unmerged entries before running `rebase --continue`. Running it with unresolved conflicts produces a second, more confusing failure, and the user learns to avoid the command.
-- **`abort` restores, it does not reset.** Record the pre-operation `HEAD` in the run row first, then `git rebase --abort` / `git merge --abort`, then verify the ref matches what you recorded. A tool that aborts a rebase has already thrown away commits unless the ref was captured first.
-
-This is **one repo at a time, never a fleet loop.** The same rule as checkpoint: cloning mid-transaction is how a typo in a local path becomes a network operation. Resolve is interactive by nature, and an interactive command over 20 repos is not a command.
-
-#### Most rejections are not conflicts — rebase before you call an agent
-
-A `git push` that is rejected is overwhelmingly **not** a merge conflict. It is a branch that fell behind, and the fix is mechanical: `git fetch` → `git rebase origin/<base>` → `git push --force-with-lease`. There is nothing for a language model to reason about, and dispatching one would be paying a model to run three git commands. The engine is for cases that actually need judgement.
-
-So the flow inverts the naive one — **ro tries the mechanical fix first, and only involves the agent on a real conflict**:
-
-```
-push rejected
-   │
-   ├─ ask: rebase onto origin/<base> and retry?  (default yes; --yes for CI)
-   │
-   ├─ git fetch && git rebase origin/<base>
-   │     │
-   │     ├─ clean ──→ git push --force-with-lease     ← the common case, no agent
-   │     │
-   │     └─ CONFLICT
-   │           │
-   │           ├─ --resolve : dispatch the engine, second time, with a conflict
-   │           │            prompt. It edits files and `git add`s the resolutions.
-   │           │            It does NOT run `rebase --continue` and does NOT push —
-   │           │            ro does both, after verifying the index is clean.
-   │           └─ no flag  : show the conflicted paths, offer mergetool, hand over
-   │
-   └─ still rejected after rebase -> non-fast-forward persists; report and stop
-```
-
-`--force-with-lease`, never `--force`. The lease is the only thing standing between "my branch moved during the rebase" and silently overwriting someone else's push, and a tool that runs unattended across a fleet is exactly where that matters.
-
-**The second engine dispatch is a different call, not a retry of the first.** It gets a different prompt (`resolve the conflicts in these paths; do not rebase, do not push`) and the same stripped environment. It edits working-tree files and stages them; ro runs `rebase --continue` and then pushes. The engine never touches the remote on this path either — the rule does not relax just because the situation got harder.
-
-Two reasons this ordering is worth the extra branch: a model call costs money and latency on the path that happens most, and an agent that "resolves" a non-conflict has no way to know it was asked to fix something that was never broken.
-
-### Aliases and deprecation — a first-class requirement, not a release-note line
-
-The survey notes there are **zero aliases anywhere in the clap tree today**, so nothing is in the way. `ro add`, `ro list`, `ro remove`, and `ro prune` are the most-used commands in the tool and the regroup breaks all four without warning. **This is a bigger compatibility break than the exit-code redefinition and needs the same treatment, not less.**
-
-- Add clap `alias` / `visible_alias` for `add`, `list`, `remove`, `prune` **on the `ro repos` subcommands** for one release. Note the alias must live on the *new* nested command to keep the old flat spelling working; the top-level `Commands::Add` etc. become hidden `#[command(alias = "…")]` pass-throughs in the same PR.
-- Print a deprecation line on stderr naming the replacement.
-- **State a removal version in the release notes**, and put it in the docs. An alias with no announced removal is an indefinite compatibility tax.
-
-### Notes on the regroup
-
-- **`ro repos` is a namespace over existing, working code — with two exceptions.** `ro_sync::manage::{remove, list}` do not change; only the clap path moves. `add` gains a clone step in front of the existing row insert (see the init/add split above), and `update` is new code in `ro_sync::manage` (`pub fn update(conn, &RepoKey, &RepoPatch) -> Result<Repo>`) — a targeted `UPDATE repos SET … WHERE host = ? AND owner = ? AND name = ?`, never `remove` + `add`. It needs **no schema change**: `alias`, `branch`, `archived` and `disabled` are all columns on `repos` today (`migrate.rs:66-82`), and there is no remotes storage anywhere in the schema, which is why `update` has no `--remote` flag.
-- **`ro repos scan` needs a real extraction, not a "reuse".** `collect_git_dirs` is a **private** `fn` at `ro-sync/src/prune.rs:163` and `ro-sync/src/lib.rs` has no `pub use` for it. The only public entry point is `find_orphans`, which is coupled to the SQLite inventory and returns `Vec<Orphan>` after doing the tracked-path comparison — `scan` must not route through it. Make the walker `pub` (or move it to `ro-git::discover_dirs`) and make its `const MAX_DEPTH: usize = 4` (line 164) a parameter so `scan --depth <N>` is honest. Scan must **not** write: the vision is explicit that being in the SQLite `repos` table is what makes a repo managed, and that is an explicit `ro repos add`.
-- **`ro repos tag` / `untag` / `tags` are new** because `ro checkpoint --tag <T>` is in the target spec and the `repo_tags` table (`migrate.rs:212-218`, added in V2) has **no writer and no reader anywhere in the workspace**. Today `--filter tag:X` is a fake: `main.rs:587-588` does `label.contains(rest)` against the literal string `"owner/name"`, so `--filter tag:orch` silently selects every repo whose owner or name contains "orch". The table is `PRIMARY KEY (repo_id, tag)` with an index on `tag`, so all three verbs are one statement each and `--tag` selection is already indexed — no schema work. Ship all three: with only `tag`, the table can grow but never shrink, and the only way to remove a tag is to hand-edit SQLite. See the CRUD table above.
-- **Archived and disabled repos are never filtered today, and that becomes a fleet-correctness bug.** `manage::list` is `SELECT {REPO_COLUMNS} FROM repos ORDER BY owner, name` (`manage.rs:208-210`) with **no WHERE on `archived` or `disabled`**, and `resolve_multi_repo_targets` (`main.rs:554`) calls `manage::list(conn, None)`. The columns exist in the schema. Without a fix, `ro checkpoint --all` would commit and push repos the user explicitly archived or disabled. Add `WHERE archived = 0 AND disabled = 0` to the lifted target resolver **and** to `sync_all`, plus an explicit `--include-archived` escape hatch. This is the single most consequential gap for the flagship command.
-- All 5 tests in `crates/ro/tests/cli_init.rs` hardcode the flat surface and break on the regroup. The test struct is still named `RfoTest` from the pre-rename era — rename it while you are there.
-
----
+That last line is the entire point of the check: it converts a 403 discovered *after* a fleet run has already pushed to four other repos into a warning discovered *before* any of them were touched.
 
 ## 4. Config model
 
-### Global — `~/.config/ro/config.toml`
+**One global TOML file, one registry table, and one optional per-repo escape-hatch file. The **default** path is config-file-free — the registry holds the per-repo settings and `ro config set` writes them — and `.ro/config.local.toml` is the override for the cases the registry cannot cover.**
 
-On Windows this resolves to `%APPDATA%\ro\config.toml` via `dirs::config_dir()`, **not** `%LOCALAPPDATA%` — `install.ps1:138` claims the latter and is wrong. State (`state.db`) already falls back to `dirs::data_local_dir()` on Windows because `dirs::state_dir()` returns `None` there.
+This section went through several shapes during review, and the sequence is worth keeping because each step was a real correction rather than a preference. A `.ro/` dotfolder holding one file was unjustifiable and is gone. The registry then absorbed the per-repo settings outright, which was right for the common case and wrong for one: a repo you did not register through ro cannot carry a per-repo override at all, and a setting that must travel with the code to a machine that is not yours has nowhere to live. That is what `.ro/config.local.toml` is for — **one bare file at the repo root, gitignored, every key optional, ranking above the registry.**
 
-```toml
-# ro configuration file
-# Edit by hand. `ro config print` shows the effective, merged result.
-# Precedence: CLI flag > <repo>/ro.local.toml > this file > built-in defaults.
-# Per-repo engine + auth go in ro.local.toml at the repo root, NOT here.
+The division of labour that falls out of it:
 
-[core]
-# Parent directory for newly cloned repos (used by `ro repos add`).
-projects_dir = "~/projects"
-# Max repos processed concurrently in ONE fleet run. Owned by -j / --parallel.
-parallel = 8
-# Per-git-command timeout, seconds. Owned by --timeout.
-timeout_secs = 60
+| | `ro config set repos.<name>.<key>` | `.ro/config.local.toml` |
+|---|---|---|
+| where it lives | your `state.db` | next to `.git` |
+| when to use it | almost always — it is queryable and diffable in a backup | a repo you did not register, a colleague's clone, a setting that must not persist in your database |
+| gitignored | n/a | yes, automatically on `ro init` |
+| wins against | the global config | the registry row *and* the global config |
 
-[engine]
-# Built-in engines: claude | codex | git. "git" is the raw backend / fallback,
-# NOT the default: plain git cannot read the diff, split commits, or resolve
-# conflicts, which is the whole reason the agent engines exist.
-default = "claude"
+The failure mode this arrangement has to not have is drift between the two — a key set in both, with no stated winner. There is one: **the file wins**, unconditionally, and a `ro doctor` check reports when a repo has a key in both places and the two disagree. Silent divergence between two sources of truth is worse than either source alone, so the disagreement is made loud rather than resolved by convention.
 
-[auth]
-# CREDENTIAL SOURCE for the push, not a transport binary — see section 5.
-# Same shape as the per-repo table: the key name IS the transport, the value
-# is a *reference* to a secret ro reads at push time. Omit the table and ro
-# uses the machine normal credential (SSH agent, credential manager, gh auth).
-# https = "env:GH_PERSONAL_TOKEN"
-# ssh   = "keychain:ssh-work"
-#
-# HARD RULE: there is NO silent fallback between credentials. If the named
-# credential cannot be obtained or the push is rejected, ro STOPS and errors
-# for that repo. Falling back to the machine default is allowed ONLY when
-# allow_fallback is explicitly true, and then only with a loud warning naming
-# the repo — a silent fallback can push via the wrong SSH key / personal
-# account and leak the wrong commit author or org identity.
-#
-# GLOBAL-ONLY, deliberately. There is no per-repo allow_fallback key. A
-# per-repo fallback posture means one fleet run can hold two different safety
-# policies at once, and the question "which repo did we push as the wrong
-# account?" then has no single answer afterwards. The per-run
-# --allow-fallback flag is the only override, and it is visible in the
-# command line.
-allow_fallback = false
-# Optional identity guard on the PUSHING identity (not the commit author).
-# Compared against the login the credential reports; on mismatch the repo
-# aborts before any push.
-# expected_login = "quangdang46"
+### Precedence — five layers, highest first
 
-[checkpoint]
-# Pre-commit safety net. Runs BEFORE the engine is dispatched.
-secret_scan = "block"   # off | warn | block
-denylist     = true      # block known-secret / build-artifact paths
-# Off by default: runs cargo test / npm test / … over the WHOLE tree, so an
-# unrelated pre-existing failure blocks a one-file checkpoint, and across a
-# 20-repo fleet it is the dominant cost.
-quality_gates = "off"   # off | on
-
-# Engine binaries. Three FIXED slots, not a free-form table: a typo like
-# `engines.cladue.bin` would otherwise parse cleanly, become a "registered"
-# engine, and fail at dispatch. Unknown keys here are a hard error.
-[engine.claude]
-bin = "claude"
-args = ["-p", "--output-format", "stream-json"]
-
-[engine.codex]
-bin = "codex"
-args = ["exec"]
-
-[engine.git]
-bin = "git"
-args = []
+```text
+  CLI flag                        one run, one repo, overrides everything
+    ↓
+  <repo>/.ro/config.local.toml            per repo, gitignored, wins over the registry
+    ↓
+  the repos row (SQLite)          per repo: credential_ref, author_ref, engine, tags
+    ↓
+  ~/.config/ro/config.toml        per machine: identity profiles, default engine, safety
+    ↓
+  built-in defaults               claude, keychain-or-machine credential, off
 ```
 
-**One owner per knob.** `parallel` is owned by `-j`, `timeout_secs` is owned by `--timeout`; the CLI flag overrides the config key and there is no third source. The draft's self-contradiction on `--quiet` is resolved by deletion (1j) — the target tree above carries neither `--quiet` nor `--verbose`.
-
-**Cut from the shipped `DEFAULT_CONFIG_TOML`:** `[mcp]` (no `ro mcp` subcommand exists; the `ro-mcp` crate was deleted in `5fdece9`), `[jobs]` (configures a job runner that does not exist), `[review]` (validated at `validate.rs:50-61`, read by nothing), `[safety].require_plan_for_ai_apply` and `[safety].max_auto_apply_risk` (the deleted ro-review lifecycle), `core.layout` (dead **and** misleading — `manage.rs::resolve_local_path` ignores it and always nests `owner/name`), `git.terminal_prompt` (no TTY/prompt code path exists anywhere).
-
-**Fix the template header at `ro-config/src/paths.rs:127-128`** (not 123-124), which tells every user to run `ro config edit` and to "See `ro config show --json`". `ConfigCommands` is only `Print` and `Set { pair }` (`main.rs:381-389`). Neither `edit` nor `show` exists.
-
-**Back-compat, stated deliberately.** The shipped file's `[providers.claude]` / `[providers.codex]` tables become the fixed `[engine.claude]` / `[engine.codex]` slots. An existing user's `[providers.*]` keys will be **silently ignored**, because `AppConfig` has no `deny_unknown_fields` and unknown tables are dropped by serde. That is acceptable *only* because the values are pure defaults that the engine registry supplies anyway — the user's customized `bin`/`args` are lost. Say so in the release notes. The alternative — adding `deny_unknown_fields` to `AppConfig` — would make every existing config file **unloadable** and turn `ro doctor` into "invalid config" for the entire user base. That omission is deliberate; it does not extend to the new `RepoConfig` (below), which is new-file-only and can afford to be strict.
-
-### Per-repo — `ro.local.toml` at the repo root
-
-Single file, **not** a `.ro/` dotfolder. Holds engine + auth identity/policy **only**. Explicitly not the inventory (that is SQLite), not jobs, not mcp, not safety.
+**`.ro/config.local.toml` is the escape hatch, and it wins.** It exists for the case where a setting has to travel with a repo you did not register through ro — a work laptop, a colleague's clone, a repo you are debugging by hand. Being able to drop one file next to `.git` and have it take precedence is worth more than the tidiness of a single source, and it is why the file is gitignored rather than committed.
 
 ```toml
-# ro per-repo config. Not checked in (ro init adds it to .gitignore).
-# Holds the commit identity, the credential reference, and the engine for
-# THIS repo. Precedence: CLI flag > this file > global config.toml.
+# <repo>/.ro/config.local.toml — only the keys that differ. Everything else inherits.
+[identity]
+# names a profile from the global config, or spells out an override
+profile = "personal"
+# name  = "Quang Dang"
+# email = "me@gmail.com"
+
+[auth]
+https = "env:GH_PERSONAL_TOKEN"      # a REFERENCE. never the value.
+
+[agent]
+engine = "codex"
+# command = 'codex exec "{prompt}"'   # optional: a different binary entirely
+# prompt  = "..."                     # optional: a different instruction
+```
+
+**Every key is optional and the file is a partial overlay, not a replacement.** A file with one key in it changes one setting; the other two hundred come from the registry and the global config. That is what makes it an escape hatch rather than a second configuration system.
+
+**The two hard rules survive the file existing:**
+
+1. **No `token` value, ever.** `https = "env:VAR"` or `"keychain:name"` — a reference. A `ghp_…` in this file is rejected by `deny_unknown_fields` with a message naming the two accepted forms. This file sits in a working directory that gets synced, backed up, and shared with agents; a live credential in it is a credential in every one of those places.
+2. **The file cannot grant management.** A repo with a `.ro/config.local.toml` that was never `ro add`-ed is still untouched. The file configures a repo; only the registry adopts it. Otherwise a file arriving from a clone would silently enrol a repository the user never registered, and `ro sync` would push it.
+
+**`ro config set repos.<name>.<key>` writes the registry layer, and is what most changes should use** — it is queryable, diffable in a backup, and does not litter working trees. The file is for the cases where the registry is not yours to change: someone else's machine, a repo you are debugging, a setting that must not persist in your `state.db`.
+
+### Global — `~/.config/ro/config.toml`
+
+```toml
+# ro global config. Written by `ro init`, edited by hand or by `ro config set`.
+# Precedence: CLI flag  >  repos table  >  this file  >  built-in defaults.
 
 [identity]
-# The commit AUTHOR ro uses for this repo. Applied at commit time as
-#   git -c user.name=<name> -c user.email=<email> commit
-# so nothing is written to .git/config and nothing leaks into your other
-# repos. This is what makes "work repo commits as the company, personal repo
-# commits as me" a one-file change instead of a git config ritual.
-# Both optional — omit and git's own identity applies.
-name  = "Quang Dang"
+# NAMED PROFILES, not one flat identity. The two accounts a developer actually
+# has — a work one and a personal one — are the reason this table exists, and
+# a repo names a profile rather than carrying an email of its own. The row
+# column is author_ref; a row with author_ref = NULL gets "default".
+#
+# Applied per invocation as GIT_CONFIG_* on the child env, so nothing is
+# written to a repo's .git/config and nothing leaks into other repositories.
+default = "personal"
+
+[identity.work]
+name  = "Dang Tran Quang"
+email = "quang@company.com"
+
+[identity.personal]
+name  = "Dang Tran Quang"
 email = "me@gmail.com"
 
 [auth]
-# Named credentials, one key per transport. The key name IS the transport,
-# so there is no separate `provider` setting to keep in sync with it.
+# CREDENTIAL SOURCE for any repo that does not override it. The key name IS
+# the transport; the value is a *reference* to a secret, never the secret.
+# Omit the table and ro uses the machine's own credential — SSH agent, git
+# credential manager, `gh auth` — which is the right answer for a work repo
+# whose SSH key is already correct and needs no configuration at all.
+# https = "env:GH_HOME"
+# ssh   = "keychain:ssh-work"
 #
-# OMIT the whole table and ro pushes with the machine's normal credential —
-# SSH agent, git credential manager, `gh auth` — which is the correct answer
-# for a work repo whose SSH key is already right and needs no config at all.
+# There is no `token` key, anywhere, in any layer. A credential is read at
+# push time, exists in ro's memory and in the argv of the one git
+# invocation that needs it, and is never written anywhere ro controls.
 #
-#   https = "env:GH_PERSONAL_TOKEN"   -> resolve that env var, push with a
-#                                       per-invocation extraheader
-#   https = "keychain:gh-personal"    -> resolve from the OS keychain
-#                                       (Windows Credential Manager /
-#                                        macOS Keychain / Secret Service)
-#   ssh   = "keychain:ssh-personal"   -> use that key explicitly
-#
-# There is no `token` key, ever. The value is a *reference*; the secret is
-# read at push time and exists only in ro's memory and in the argv of the
-# one git invocation that needs it. Switching accounts is editing one
-# string, with no `gh auth login` and nothing to re-authenticate.
-https = "keychain:gh-personal"
+# HARD RULE: no silent fallback between credentials. If the named credential
+# cannot be obtained, or the push is rejected, ro STOPS for that repo.
+# Falling back to the machine default is allowed ONLY when this is true,
+# and then only with a loud warning naming the repo — a silent fallback can
+# push via the wrong SSH key and leak the wrong account.
+allow_fallback = false
 
-# Optional GUARD on the PUSHING identity. This is not the commit author —
-# that is [identity] above, which ro sets and therefore cannot get wrong.
-# This is the account the remote sees, which ro does NOT control, so it is
-# worth checking: compared against the login the credential reports, and on
-# mismatch this repo aborts before any push.
-# expected_login = "quangdang46"
+# Optional identity guard, on the PUSHING account. This is not the commit
+# author above, which ro sets and therefore cannot get wrong; it is the
+# account the remote sees, which ro does NOT control. Compared against the
+# login the credential reports; on mismatch the repo aborts before pushing.
 # expected_login = "quangdang46"
 
 [agent]
-# Which engine commits this repo: "claude" | "codex" | "git".
+# Which engine commits, and how it is invoked. Any repo may override both.
+#   claude | codex | git   — exactly three built-ins, no plugin registry
+# `git` is the raw backend and the explicit fallback. It cannot read the
+# diff, split commits, or resolve conflicts, which is exactly why the
+# agent engines exist. It is NOT the default.
 engine = "claude"
 
-# Optional. Overrides the binary + args, and the instruction, for this repo.
-# This is how Gemini / Amp / Kiro / a nightly build gets used without waiting
-# for a ro release. `{prompt}` is substituted as ONE argv element — never
-# through a shell, because the prompt is built from diff text and file paths.
-# command = 'claude -p "{prompt}" --output-format stream-json'
-# prompt  = "Read the diff, group into logical commits, do not push."
-# NOTE: a custom prompt must not tell the agent to push. ro pushes, with the
-# credential and identity it resolved. An engine that pushes makes every
-# auth guarantee in this tool advisory.
+# {prompt} is substituted as ONE argv element, never through a shell: the
+# prompt is built from diff text and file paths, and passing any of it
+# through a shell is a command-injection path into the user's own account.
+# `command` overrides the binary and its arguments entirely, which is how
+# Gemini / Amp / Kiro / a nightly build gets used without waiting for a
+# ro release. It cannot relax the agent-does-not-push boundary: whatever
+# binary is named, ro still owns the push.
+command = 'claude -p "{prompt}"'
 
-# Default push mode when `ro checkpoint` runs without --wip / --direct:
-#   "wip"    -> new branch + draft PR into the base
-#   "direct" -> commit onto the current branch
-#   "off"    -> commit locally, never push
-# The CLI flag always wins. This exists so a 20-repo fleet run does not need
-# the flag typed 20 times; it is not a third mode.
-mode = "wip"
+prompt = """
+Read the full diff of this repository. Group the changes into a small
+number of logically connected commits, in dependency order, and write
+each one with a specific subject line describing what that commit
+actually does.
+
+Do not edit any source file. Do not reformat. Do not add obviously
+ephemeral files (build output, lockfiles from an unrelated package,
+scratch notes, editor backups).
+
+Do not push, and do not run any command that contacts the remote. Do
+not modify git config — not `git config --local`, not `git config
+--global`. Your author identity is already set for you; the caller
+handles the credential, the remote, and the push.
+"""
+
+[checkpoint]
+# Pre-flight safety, run before the engine is dispatched. The denylist and
+# secret scan are ON by default because they are cheap and they are the
+# last thing standing between a WIP commit and a leaked credential.
+secret_scan = "block"     # off | warn | block
+denylist     = true        # .env, *.pem, *.key, id_rsa, target/, node_modules/
+
+# Off by default, and the reason is cost: this runs the ecosystem's own
+# test suite over the WHOLE tree, so an unrelated pre-existing failure in
+# an untouched crate blocks a one-file commit — and across a 20-repo
+# fleet that check is the dominant cost of the run.
+quality_gates = "off"     # off | on
+
+[core]
+parallel = 4               # bounded worker count for a fleet run
+timeout_secs = 120         # per git command, and per engine
 ```
 
-**No `name`, no `branch`, no `default_branch`, no `remote`, no `owner`/`repo` — and that is the whole point of the file.** This file lives at the root of the repo it describes. The repo's name is `git remote get-url origin`; its branch is `git rev-parse --abbrev-ref HEAD`; its default branch is `git symbolic-ref --short refs/remotes/origin/HEAD`. Every one of those is a question git answers correctly today, and every one duplicated into a config file is a field that goes stale on a rename and disagrees with disk until someone notices. A per-repo config should describe **how this repo behaves** — who commits it, what pushes it, which agent reasons about it — and nothing about **what it is**.
+**`default_branch` is not a setting, and that is deliberate.** The default branch is read live — `git symbolic-ref --short refs/remotes/origin/HEAD` first, then `gh repo view --json defaultBranchRef`. A single global value is wrong the instant one repo is on `master` or `trunk`, and several of the repos this tool exists to manage are; a config value is also a cache of a branch name, and caches of branch names go stale on a rename. The `repos.default_branch` column was dropped in V4 for the same reason.
 
-**No `[github]` block, and specifically no `owner` / `repo` in it.** The inventory row already *is* the `(host, owner, name)` key, and the file lives inside the repo it describes. Declaring the identity twice means a rename has two places to go out of sync, and the loser is silent. A per-repo file should say how this repo behaves, not what this repo is.
+### Per-repo — columns on the `repos` row
 
-**`allow_fallback` is absent from all three tables, by design.** It is a global-only safety posture; see the rule in §4. A per-repo fallback means one fleet run can hold two policies at once, and "which repo did we push as the wrong account?" then has no single answer afterwards.
+There is no file. The registry is the layer, and it gains three columns in V5:
 
-### Precedence rules
+```sql
+ALTER TABLE repos ADD COLUMN credential_ref TEXT;   -- NULL | 'env:VAR' | 'keychain:name'
+ALTER TABLE repos ADD COLUMN author_ref     TEXT;   -- NULL = [identity].default | a named profile
+ALTER TABLE repos ADD COLUMN engine        TEXT;   -- NULL = use [agent] engine
+ALTER TABLE repos ADD COLUMN engine_args   TEXT;   -- NULL = use [agent] command
 
-Highest first: **CLI flag > `ro.local.toml` > global `config.toml` > built-in defaults.**
-
-There is currently **no** precedence instance anywhere in the workspace. Every flag uses a clap `default_value_t` and never consults config in either direction; `AppConfig` is roughly 90% dead config — `core.layout`, `core.parallel`, `core.timeout_secs`, `core.projects_dir`, `github.auth`, `git.*`, `jobs.*`, `mcp.*`, `review.*`, `safety.*` are parsed, validated, printed, and ignored. `core.projects_dir` is actively shadowed: `ro add` passes `paths.state_dir.join("projects")` (`main.rs:640`) and never the config value.
-
-Implementation, in `ro-config/src/resolve.rs`:
-
-```rust
-pub struct CliOverrides {          // None = "not specified on the CLI"
-    pub engine: Option<String>,
-    pub auth: Option<AuthProvider>,          // ro_core  Https | Ssh | Machine
-    pub allow_fallback: Option<bool>,
-    pub timeout_secs: Option<u32>,
-    pub parallel: Option<usize>,
-    pub mode: Option<PushMode>,              // Wip | Direct | Off
-}
-
-pub struct EffectiveConfig {
-    pub engine: String,                       // "claude" | "codex" | "git"
-    pub auth: AuthPolicy,                     // ro_core — see section 5
-    pub identity: CommitIdentity,             // author ro APPLIES, not a guard
-    pub mode: PushMode,                       // Wip | Direct | Off
-    pub checkpoint: SafetySettings,
-    pub timeout_secs: u32,
-    pub parallel: usize,
-    // No `paths` field. Paths are where things live on disk, not what the user
-    // configured; every consumer that wants them already holds a ConfigPaths.
-}
+-- already present and still load-bearing:
+--   branch     the checkout ro assumes for this repo
+--   archived   set by `ro config set repos.<n>.archived = true`
+--   disabled   set likewise; both are filtered by `ro sync` by default
 ```
 
-Because the engine/auth fields are a small fixed set, do **not** attempt a general serde deep-merge. Load global → overlay only the engine/auth/identity fields from the repo file → apply CLI last.
+**`credential_ref` stores a reference and is typed to make a secret storable-but-inert.** The column holds `env:GH_PERSONAL` or `keychain:gh-personal`; it never holds a value. A validation rule rejects anything that does not parse as `<scheme>:<name>`, which means a pasted `ghp_…` is a loud error at `ro add` time rather than a live credential sitting in `state.db` forever. `state.db` is a file people back up, sync, and paste into issues; the same reasoning that rules out plaintext tokens in TOML rules them out in SQLite, with more force.
 
-**Six rules that must not be skipped:**
+```
+ro config set repos.cass.credential = 'keychain:gh-personal'
+ro config set repos.cass.engine    = codex
+ro config set repos.voice-ai-dashboard.credential = 'env:GH_WORK'
+```
 
-1. **`deny_unknown_fields`, not `#[serde(flatten)]`.** The two are mutually exclusive in serde, and flatten would contradict the guarantee below. A typo (`authent = "gh"`) parses cleanly, has zero effect, and `ro doctor` still reports "config valid" — a half-implemented per-repo file fails *silently*, which is the most dangerous property this migration can introduce. `ro-config/src/policy.rs`'s `#[serde(flatten)] extra` is a different semantic (warn, do not fail) and is not the precedent for this.
-2. **No `token` field anywhere — and the credential is a *reference*, not a secret.** `ro-config` does not depend on `ro-github` (the edge runs the other way), which is why `doctor.rs:249`'s hint to "set `[github].token` in config.toml" points at a key that does not exist. Fix that hint string. A per-repo `token = "ghp_…"` is the failure this rule exists to prevent: it is the reason the research flagged `AuthToken`'s derived `Debug` as a leak waiting to happen, because a secret in a config file eventually reaches a `tracing` field or a panic message. `credential` holds `keychain:<name>` or `env:<VAR>` and never the value.
-3. **The same fixed-slot discipline applies to `[engine.*]`.** Three `#[serde(deny_unknown_fields)]` sub-structs, not a free-form map.
-4. **`allow_fallback` is the one auth field a repo may not set.** `RepoConfig` carries `identity.*`, `auth.provider`, `auth.credential`, `auth.expected_login`, `agent.engine`, `agent.mode` — and **not** `allow_fallback`. Resolve it from the global config and the `--allow-fallback` flag only, then inject it into `AuthPolicy` at the end. The reasoning is the audit trail: a fallback is a *safety posture*, and a per-repo posture means one fleet run can be holding two of them at once. The question "which repo did we just push as the wrong account?" has no single answer after that, which is the exact failure the whole auth design exists to prevent. A stale `allow_fallback` in someone's `ro.local.toml` now errors under rule 1 and names the right file.
-5. **`identity.email` and `auth.expected_login` are different things and must not be merged.** `identity.*` is the commit **author**, which ro *sets* — via `git -c user.name=… -c user.email=…` on the commit invocation, writing nothing to `.git/config`. It therefore cannot be wrong, so it needs no guard. `expected_login` is the **pushing** identity, which is whatever the credential turns out to be and which ro *cannot* control — that is what a guard is for. Collapsing them produces a design where setting your author silently starts author-guarding your push, or worse, where a correct author suppresses a wrong-account push. Keep them separate in the struct, in the config, and in the docs.
-4. **Consider typed enums for engine/auth.** Every field being a `String` means `auth = "gt"` survives deserialization and only fails at `validate` time. `AuthProvider` should be a real enum; `engine` can stay a `String` validated against the builtin table.
+**`author_ref` is a reference to a named profile, and that is the whole reason it works.** The obvious alternative — storing `author_name` and `author_email` on each repo row — is what this plan rejected for credentials, applied to a setting that deserves the same treatment. Two rows for the same person would drift, a rename of an email would be a migration, and the row would carry the one piece of personal data in a database that gets backed up and pasted into issues.
 
-### `ro doctor --fix` does not upgrade an existing config — plan for it
+So the global config holds **named profiles** and the row holds a **name**:
 
-`check_and_optionally_fix_config` writes `default_config_toml()` **only when the file is absent**. After Phase 2 rewrites `DEFAULT_CONFIG_TOML`, every existing user keeps their dead `[mcp]`/`[jobs]`/`[review]` config indefinitely, and `validate()` keeps checking keys the schema no longer models. Decide explicitly: either (a) make `--fix` detect a stale schema version stamp and offer an in-place upgrade, or (b) document that `--fix` is create-only and add a `ro config upgrade`-style path in Phase 2. Leaving it undecided means the reconciliation in section 4 silently never reaches anyone who already ran `ro init`.
+```toml
+[identity]
+default = "personal"       # which profile a row with author_ref = NULL gets
 
-Two adjacent doc bugs in the same function: `doctor.rs:200` discards the applied-fix count via `let _ = applied_fix_count;`, and the module doc's claim that every mutation "backs up the prior state to `<state_dir>/doctor/runs/<run-id>/`" is **false** — no backup code exists.
+[identity.work]
+name  = "Dang Tran Quang"
+email = "quang@company.com"
+
+[identity.personal]
+name  = "Dang Tran Quang"
+email = "me@gmail.com"
+```
+
+```
+ro config set repos.voice-ai-dashboard.author_ref work
+ro config set repos.cass.author_ref           personal
+```
+
+`work` and `personal` are not labels the user invented per repo — they are the two identities that actually exist on their machine, and every repo that needs one names the same profile. Adding a third account is one more stanza and one more column value, not a new mechanism.
+
+**This was a real regression for one revision.** Removing the per-repo file removed the only per-repo author override, while test 61 still asserted that two repos in one run commit as two different people. A test that cannot fail is worse than no test, and that one was asserting a capability the schema no longer had. `author_ref` restores it, and test 61 is rewritten to exercise the column rather than a file that does not exist.
+
+**Per-repo engine is worth having; per-repo prompt is not.** A personal OSS repo wanting Codex instead of Claude is a real and common difference, and it is one column. A per-repo *prompt* would be config nobody can read without a CLI, for a setting almost nobody wants to vary — so the prompt stays global, and `[agent] command` covers the "different agent entirely" case in the same place.
+
+### `ro doctor --fix` must be able to upgrade an existing config
+
+`check_and_optionally_fix_config` writes `default_config_toml()` only when the file is **absent**. After this plan rewrites the defaults, every existing user keeps dead `[mcp]` / `[jobs]` / `[review]` config indefinitely, and `validate()` keeps checking keys the schema no longer models. With `toml_edit` available, `--fix` should add the missing `[identity]` / `[auth]` / `[agent]` / `[checkpoint]` sections, **leave unknown legacy tables in place** (deleting a user's file contents is not a repair), and print a note naming the sections it is ignoring. Two related defects to fix while you are there: `doctor.rs:200` discards the applied-fix count via `let _ = applied_fix_count;`, and the module doc's claim that every mutation "backs up the prior state to `<state_dir>/doctor/runs/<run-id>/`" is **false** — no backup code exists. Delete the claim.
 
 ### `ro config set` must stop destroying the file
 
-It currently loads, mutates one of 7 hardcoded keys, re-validates, and `fs::write`s the entire `AppConfig` back via `toml::to_string_pretty` — with **no backup, no merge, and no comment preservation**. On every invocation it silently drops all comments and every key not modelled by `AppConfig`. The first write after cutting `[mcp]`/`[jobs]`/`[review]` would destroy those blocks in every existing user's config.
+Today it loads, mutates one of seven hardcoded keys, re-validates, and `fs::write`s the whole `AppConfig` — silently dropping every comment and every key the schema does not model, on every invocation. **Use `toml_edit` for a surgical in-place edit.** That fixes the loss structurally, which means **do not also write a `.bak` on every call**; a backup accumulated on every key assignment is just noise, and it does not fix the loss anyway. A backup belongs on the one genuinely destructive operation — the V4/V5 migrations — not on every assignment.
 
-**Use `toml_edit` for a surgical in-place edit.** Do not also add a `.bak` — a backup written on every call is noise, and it does not fix comment/key loss anyway. Surgical editing does. Pick the surgical fix, not both.
+### V5 adds the four columns, and has the same trap V4 had
 
-### `.gitignore` auto-add behaviour
+`V4_DROP_PLANS` drops tables; `V5_ADD_REPO_CONFIG` adds four columns. Both are forward-only: `migrate::run` records applied versions in `_meta.version` and applies only migrations with `version > current`, so **editing `V1_INITIAL_SCHEMA` never reaches an already-initialized database.**
 
-`ro init` appends `ro.local.toml` to the repo's `.gitignore`, **idempotently**:
+```sql
+-- V5_ADD_REPO_CONFIG
+ALTER TABLE repos ADD COLUMN credential_ref TEXT;
+ALTER TABLE repos ADD COLUMN author_ref     TEXT;
+ALTER TABLE repos ADD COLUMN engine        TEXT;
+ALTER TABLE repos ADD COLUMN engine_args   TEXT;
+```
 
-- If `.gitignore` does not exist, create it with `ro.local.toml` as the only line.
-- If it exists, append only if no existing line matches (trim trailing whitespace; accept `ro.local.toml` and `/ro.local.toml`, with or without a trailing comment).
-- Never duplicate, never reorder, never rewrite existing lines. Copy the exists-check pattern from `loader.rs::write_default` (create-if-absent, returns `Ok(false)` when present) and add the line-matching logic.
+Two things about V5 that are easy to get wrong. First, `ALTER TABLE … ADD COLUMN` is **not idempotent** in SQLite — re-running it on a migrated database errors with "duplicate column name", so guard it the way the existing migrations guard `CREATE TABLE IF NOT EXISTS`, or the second run of ro on an upgraded machine fails at open. Second, and more subtly: `repo_spec.rs` builds `RepoSpec` and `manage::add` inserts a fixed column list (`migrate.rs:331,337`), so **any code that enumerates `repos` columns has to be updated in the same commit** — a `SELECT` that lists columns explicitly will not see the new ones, and a row will come back with `credential_ref: None` while ro believes it is configured.
 
-`ro init` stays deliberately dumb **about engines**: hardcode `engine = "claude"` + `auth = "gh"`, write the global config, print the path and the one-line override hint. **No PATH scan, no wizard, no questions, no validation of binary availability.** Missing-binary errors surface at `ro checkpoint` time, not at init.
-
-It is *not* dumb about repos. `ro init` is the onboarding verb and has three modes, disambiguated by argv and cwd — the full table is in section 3. What must not regress while adding them: **no mode ever walks the current directory recursively on its own.** Mode selection reads `.git` in cwd and the flag list, nothing more. `ro init --add-dir .` is explicit, and so is `--non-interactive` for it.
-
-The `.gitignore` rules above are the per-repo half and apply to every mode that touches a working copy (onboard-repo, `--add-repo`, `--add-dir`, and `ro repos add` when the clone lands in a directory the user names). Global-only mode touches no repo and therefore writes no `.gitignore`.
 
 ---
 
@@ -746,7 +687,7 @@ The `.gitignore` rules above are the per-repo half and apply to every mode that 
 
 **One new crate: `crates/ro-engine`.** The orchestrator stays in the `ro` binary; `resolve_multi_repo_targets` (`main.rs:554-611`, 57 lines) moves to a `ro-sync::targets` module that `ro` already depends on. The draft's two-crate split mints a hard cross-crate boundary between `EngineOutcome` and `RepoOutcome` for very little — and its own trait sketch already showed the symptom, with `EngineOutcome::Failed { class: FailureClass }` forcing `ro-engine` to depend on `ro-jobs` just to name an error. `ro-engine` must be registered in root `Cargo.toml` `[workspace] members`, in `[workspace.dependencies]`, and as a path dep in `crates/ro/Cargo.toml`; all three are named in the Phase 4 file list. No async runtime, no plugin registry, no dynamic loading.
 
-### The crate layout after this plan: five modules, not twelve crates
+### The crate layout after this plan: four modules, not twelve crates
 
 Twelve crates for a tool with ten commands is the other half of the over-engineering this plan exists to remove. The cuts in PR 1 already delete four of them, and the reshuffle below takes the rest to **five modules** without adding a single new concern:
 
@@ -756,7 +697,7 @@ Twelve crates for a tool with ten commands is the other half of the over-enginee
 | **Git** | every `git` invocation: status, stage, branch, commit, push, fetch, rebase, merge, conflict detect, `RepoLock` | `ro-git`, unchanged in responsibility. This is where `git -c user.name=…` and the credential extraheader go |
 | **Agent** | `enum EngineKind` + `trait Engine` + the claude/codex/git built-ins + discovery + per-engine timeout | `ro-engine` — **the one new crate** |
 | **Auth** | `AuthPolicy`, `CommitIdentity`, the keychain/env credential resolver, the author guard, the fallback policy | `ro-core` for the types; resolution lives with the Git module because a resolved credential is a `git -c` argument |
-| **GitHub** | `gh pr create` / `gh pr list` / `gh api user` — **shelled out, no crate** | `ro-github` survives only for `auth::discover_token`, which `ro doctor` calls; PR creation does not go through octocrab at all (see the async note below) |
+| **GitHub** | *(folds into Auth)* | With pull requests cut, the only thing ro needed the GitHub CLI for was `gh auth token` as a credential-discovery fallback and `gh api user` as an identity check. Both are optional conveniences, and a crate that wraps a REST client in order to call one endpoint is not a module — `discover_token` moves into Auth next to `AuthPolicy`, and `ro-github` goes with it. |
 
 Crates that go away entirely: `ro-review` and `ro-dep-update` (PR 1), `ro-output` (PR 1), `ro-jobs` as a separate crate (folded into Registry), `ro-config`'s `policy` module (PR 1), and `ro-github` reduced to one function. That is **12 → 5**, with `ro-config` becoming a module inside Registry and `ro-sync` becoming the other half of it. Do this as a rename-and-move inside PR 2 and PR 3, not as a separate "reorganise crates" PR: a structural PR that moves code and touches no behaviour is a PR nobody reviews properly, and it would be the one PR where the two-crates-per-concern mistake could slip back in.
 
@@ -773,7 +714,7 @@ pub struct EngineContext<'a> {
     /// in preflight and immutable — an agent engine may switch branches itself,
     /// so this cannot be re-read later. It is the PR `base`.
     pub base_branch: Option<String>,
-    /// Resolved per-repo, after CLI > ro.local.toml > global.
+    /// Resolved per-repo, after CLI > the repos row > global config.
     pub auth: &'a AuthPolicy,                 // ro_core
     /// Merged into the child process env. See "env injection" below: this
     /// makes GH_TOKEN reach `gh`, it does NOT authenticate `git push`.
@@ -896,7 +837,7 @@ command = 'claude -p "{prompt}" --output-format stream-json'   # optional
 prompt  = "Read the diff, group into logical commits, do not push."  # optional
 ```
 
-`command` overrides `bin` + `default_args` for that repo; `prompt` replaces the built-in instruction. Precedence per field: `ro.local.toml` → global `config.toml` → built-in. Because the boundary is "agent commits, ro pushes" and not "agent commits and pushes", a custom `command` is safe in a way a custom *workflow* would not be: whatever binary you name, ro still owns the push, so the credential and the identity guard still apply to it.
+`command` overrides `bin` + `default_args` for that repo; `prompt` replaces the built-in instruction. Precedence per field: `.ro/config.local.toml` → global `config.toml` → built-in. Because the boundary is "agent commits, ro pushes" and not "agent commits and pushes", a custom `command` is safe in a way a custom *workflow* would not be: whatever binary you name, ro still owns the push, so the credential and the identity guard still apply to it.
 
 This is also the honest answer to "how do I add a new agent". It is not a plugin registry — it is two strings, and the fixed three-entry `EngineKind` still exists only to pick the behaviour profile (timeout, output parsing, availability probe). The `[engine_claude]`-style fixed slots in `config.toml` cover the "installed under an unusual name" case; `[agent] command` covers the "different agent entirely" case. Neither is a free-form table, so neither reintroduces the silent-failure class.
 
@@ -921,12 +862,12 @@ This is also the honest answer to "how do I add a new agent". It is not a plugin
 
 - **`ssh = "<ref>"`** names an SSH key explicitly. **Omitting the whole `[auth]` table** uses the repo's existing SSH key or credential manager, unchanged — which is the right answer for a work repo whose SSH key is already correct, precisely because it needs no ro config at all.
 
-**Where the token comes from — `credential`, never `token`.** A per-repo config that holds `token = "ghp_…"` puts a live credential in a plaintext file, which is a leak waiting for the first `tracing` field or panic message (the research found `AuthToken` already derives `Debug`). So `ro.local.toml` holds a **reference**, and the resolver is:
+**Where the token comes from — a reference, never a value.** A per-repo config holding `token = "ghp_…"` puts a live credential in a plaintext file, which is a leak waiting for the first `tracing` field or panic message (the research found `AuthToken` already derives `Debug`). And in the five-command surface there is no per-repo *file* at all: the reference lives in the `repos.credential_ref` column. Either way it is a **reference**, and the resolver is:
 
 ```
 resolve_credential(repo_root) -> Result<SecretString, CredentialError>
 
-  1. auth.credential in <repo>/ro.local.toml
+  1. the repo row's credential_ref column (V5), if non-NULL
        "keychain:<name>"  -> OS keychain via the `keyring` crate
                              (Windows Credential Manager / macOS Keychain / Secret Service)
        "env:<VAR>"        -> std::env::var(VAR)
@@ -1043,7 +984,7 @@ pub fn find_existing_pr(path: &Path, head_ref: &str, env: &[(String, String)]) -
 pub fn create_pr(path: &Path, head: &str, base: &str, title: &str, body: &str, env: &[(String, String)]) -> Result<u64>;
 ```
 
-The duplicate-PR rule is a `gh pr list --head <head_ref> --json number` lookup; a hit means "PR #N already open" and **no second PR is opened** — just report it. The base is `ctx.base_branch`, captured before the WIP branch was created (see the next section).
+**No duplicate detection is needed, because there is no PR to duplicate.** That whole rule — `gh pr list --head`, reuse the open PR, report its number — was the largest piece of `gh` on the push path, and it goes with the feature. What remains of `gh` is optional convenience: `gh auth token` as one credential-discovery fallback when `[auth] https` names nothing, and `gh api user` for the identity check. If neither is present, ro reports what it can and pushes with the credential it resolved.
 
 **Test seam:** a fake `gh` on `PATH` is the seam, not `wiremock`. Note that a shell-script fixture is not directly executable on Windows without a shim — the test fixture helper needs a `.cmd`/`.bat` variant on `cfg(windows)`.
 
@@ -1093,7 +1034,7 @@ Keep the arg-vector discipline exactly as-is: `--` separators, no shell interpol
 
 ---
 
-## 6. The `ro checkpoint` command
+## 6. The `ro sync` command
 
 ### 6.1 Where the code lives
 
@@ -1170,70 +1111,122 @@ default_args = []
 ```
 
 ```
-ro checkpoint --engine claude --engine-bin /opt/bin/claude-nightly
+ro sync --engine claude --engine-bin /opt/bin/claude-nightly
 ```
 
 Adding a fourth engine is one new impl of `Engine`, one `EngineKind` variant, one arm in `dispatch()`, one fixed `[engine_x]` slot. Nothing in the orchestrator, the config resolver, or the CLI changes shape — which satisfies "adding an engine later must not require reworking core" without a registry.
 
 `which_in` currently lives at `crates/ro/src/doctor.rs:392`, inside `mod doctor;` in the **binary** crate, so a library cannot call it. It moves to `ro-git` (a PATH probe for a subprocess belongs with the code that spawns subprocesses) as `ro_git::mutation::which_in`, and both `doctor` and `ro-engine` call it from there. Its hand-rolled Windows `.exe`/`.cmd` handling is already correct and is kept.
 
-### 6.3 End-to-end flow
+### 6.3 One pipeline, three entry points
 
-```
-ro checkpoint --all --execute
+`ro commit` and `ro push` are the same per-repo pipeline with a different stopping point, and keeping them one function is what stops the two from drifting. `ro commit` runs steps **a–g** and returns. `ro push` runs **a–h**. `ro sync` is a different pipeline entirely (§6.3.1), because it must not touch the index or spawn anything.
+
+```text
+ro push --tag work            ro commit --tag work          ro sync
  │
- ├─0. PARSE          per-field resolve_paths; open DB; load + validate config
- ├─1. RUN RECORD     ro_jobs::open_run(conn, "checkpoint", &args) -> run_id
- ├─2. TARGETS        ro_sync::targets::resolve(&conn, &Selector, &opts)
- │                    WHERE archived = 0 AND disabled = 0     <-- unless --include-archived
- │                    real repo_tags lookup for --tag
- │                    invalid glob is an ERROR (no silent "*" fallback)
- │                    has: branch removed (it was a bool expression, not a match)
- │                    0 targets matched an explicit name/--tag     => usage error 64
- ├─3. SCAN           ONE snapshot for the whole run, on the coordinator thread:
- │                    branch, dirty, ahead/behind, worktree-exists, remote,
- │                    base_branch = the branch currently checked out
- │                    <-- this is the ONLY DB-touching phase before workers
- ├─4. DRY RUN        default. Print per-repo "would ..." from the step-3
- │                    snapshot. No engine, no lock, no branch, no push.
- │                    (dry-run and execute read the SAME snapshot shape, so
- │                     the printed plan cannot drift from the real outcome)
- ├─5. WORKERS        std::thread::scope, N = resolve_effective().parallel
- │     one target each, touching ONLY git + the filesystem:
- │       a. lock        RepoLock::acquire_at(state_dir/locks/<hex>.lock, t)
- │       b. preflight   conflict::detect -> Skip
- │                     is_dirty / `status --porcelain=v1 -z -uall` -> Skip(Clean)
- │                     denylist + secret_scan -> Block  (BEFORE the engine runs)
- │       c. config      resolve_effective(repo_root, cli)  [files only, no DB]
- │       d. mode        protected + --direct -> refuse, force WIP
- │       e. base        `git fetch` + `git rebase --autostash origin/<base>`
- │                     -> on conflict: Stop, or --resolve (see below)
- │       f. branch      WIP only: create + checkout ro/wip/<slug>-<run>
- │       g. engine      engine.checkpoint(ctx)
- │       h. push        always `git push`; credential per AuthPolicy
- │       i. PR          WIP + GitHub remote: `gh pr list --head` -> create or reuse
- │       j. unlock
- │       k. return      RepoOutcome  (value; `?` is forbidden, it becomes Failed)
- ├─6. COORDINATOR    drains outcomes IN TARGET ORDER (not completion order),
- │                    writes one ro_jobs::append_event row per repo
- ├─7. SUMMARY        totals + per-repo one-liners; NDJSON if --format ndjson
- └─8. FINALIZE       ro_jobs::finalize_run(conn, run_id, exit_code)
-                      0 all ok | 1 partial | 2 all failed
+ ├─0 PARSE  config, DB, selectors        (same)              (same)
+ ├─1 SCAN   ONE snapshot on the coordinator, before any worker:   clone if missing
+           branch / dirty / ahead / remote / base_branch        fetch
+ │                                   │                          pull --rebase
+ ├─2 DRY RUN  default. prints the plan, touches nothing
+ │                                   │                          │
+ ├─3 WORKERS  std::thread::scope, N = [core] parallel          update registry
+ │    one repo each:                                             exit
+ │      a. lock      RepoLock::acquire_at(state_dir/locks/…)
+ │      b. preflight conflict::detect -> Skip
+ │                   is_dirty -> (commit: Skip if clean)
+ │                   denylist + secret_scan -> Block
+ │      c. config    resolve_effective(.ro/config.local.toml,
+ │                     then the repos row, then global)  [no DB]
+ │      d. identity  GIT_CONFIG_* from author_ref
+ │      e. base      git fetch
+ │                   git rebase --autostash origin/HEAD   <-- BEFORE the engine
+ │                     ├ clean ────────────────────────────┐
+ │                     └ CONFLICT ─ + --resolve ──────────┐│
+ │                              engine, 2nd dispatch,      ││
+ │                              conflict prompt; edits     ││
+ │                              files, stages, NEVER       ││
+ │                              continues, NEVER pushes ───┤│
+ │                             no --resolve ── Stop ──────┤│
+ │                                                      ▼│
+ │      f. engine    engine.checkpoint(ctx)            ┌────┘
+ │                   ── ro commit RETURNS HERE ──     │ a. f. if anything is
+ │      g. push      git push; credential per policy  │    still uncommitted,
+ │                   --force-with-lease ONLY when     │    run f now — the
+ │                   local commits predate the fetch  │    rebase already put
+ │      h. unlock                                      │    us on the new base
+ │      i. RepoOutcome  (value; ? becomes Failed)    │
+ │                                                      ── ro push RETURNS HERE ──
+ ├─4 SUMMARY  one line per repo: branch, engine, account, commits, result
+ └─5 EXIT     0 all ok | 1 partial | 2 all failed | 64 usage
 ```
 
-**Step (e) rebases *before* the engine, and that ordering is the reason the happy path never force-pushes.** An earlier revision of this flow ran `commit → push → on rejection rebase → force-push`, which is the conventional order and it has a structural cost: the branch is rewritten, so the push needs `--force-with-lease`, and a force-push across a fleet is the one operation in this tool that can destroy someone else's work.
+#### What each entry point actually does
 
-Rebasing first inverts that. The worktree is dirty, so `git rebase --autostash origin/<base>` stashes, rebases, and pops — the tree comes back dirty and already on top of the remote's version of the base. The engine then commits *once*, on top of an up-to-date base, and the push is an ordinary fast-forward. No lease, no force, no window where the branch is temporarily unwritable by anyone else.
+| | `ro sync` | `ro commit` | `ro push` |
+|---|---|---|---|
+| clone a missing working copy | yes | no | no |
+| fetch / pull | yes — `pull --rebase` | no | yes — fetch + rebase only |
+| spawn an engine | no | yes | yes, only if work is uncommitted |
+| denylist + secret scan | no | yes | yes |
+| contact the remote | read only | **never** | yes |
+| open a PR | — | — | **no — V1 does not do pull requests** |
 
-`--autostash` is the load-bearing flag and it is a real risk surface of its own: if the pop conflicts, git leaves the stash in the stash list and the worktree needs manual attention. So `(e)` treats a failed pop as a **per-repo failure with a named recovery instruction** (`git stash list`, `git stash pop`) rather than proceeding to the engine on a half-popped tree. The alternative — `git stash` / `rebase` / `git stash pop` as three separate steps ro drives itself — is the same thing with three places to forget the cleanup, which is exactly the failure class the credential design avoids by never rewriting a remote in the first place.
+**`ro commit` never contacts the remote, and that is a property with a test.** A commit you discover you did not want is a local `git reset`; a commit that is already on someone else's branch is a revert and an apology. The test asserts the fake remote's reflog is unchanged after a full `ro commit --execute`.
 
-After the rebase, the engine's own rebase-solve work is usually gone: the conflicts it would have resolved are conflicts ro already resolved mechanically before it was ever called. That is the point — a model call is expensive, and the most common reason a push fails is arithmetic, not judgement.
+#### The AI resolves conflicts — the second engine dispatch
 
-**The scan moves before the split, not after.** Today `main.rs:1216-1300` plans every repo in loop 1, prints, then applies in loop 2. Once an engine can mutate a worktree, a plan computed in loop 1 is stale by loop 2. Doing the full status scan once, up front, on the coordinator, removes the staleness without persisting a plan artifact — and it is what makes `base_branch` trustworthy. Step (e) reads the base from that snapshot rather than re-deriving it, so the branch the rebase targets is the branch the plan said it would. Today `main.rs:1216-1300` plans every repo in loop 1, prints, then applies in loop 2. Once an engine can mutate a worktree, a plan computed in loop 1 is stale by loop 2. Doing the full status scan once, up front, on the coordinator, removes the staleness without persisting a plan artifact — and it is what makes `base_branch` trustworthy.
+The user-facing flow for `ro push` is: fetch → rebase → conflict? → **Claude/Codex resolve** → continue → push. That is exactly what the diagram does, and the split of labour inside it is worth being precise about, because the alternative is an agent that does the whole thing and an identity design that stops being a control:
 
-**Per-repo independence is a value return, not a `Result`.** `ro_sync::sync::sync_repo` already models this correctly; `ro_sync::status::status_all` does **not** (it uses `?` on `status_repo` and aborts the whole fleet on one corrupt working copy at `crates/ro-sync/src/status.rs:90+`). Do not copy the second one.
+- **The engine resolves the conflict.** It reads the conflicted files, decides what the resolution should be, edits the working tree, and `git add`s what it resolved.
+- **The engine does not run `rebase --continue`, and does not push.** ro does both, and only after verifying the index is free of unmerged entries. Running `rebase --continue` with conflicts still present produces a second, more confusing failure, and the user learns to avoid the command.
+- **The second dispatch is a different call, not a retry.** Different prompt (*"resolve the conflicts in these paths; do not rebase, do not push"*), the same **stripped** environment, the same `RepoLock`.
 
-**Roll forward, never auto-rollback.** `apply_repo` (`ro-sweep/src/commit_sweep.rs:444`) increments `failed` mid-loop and never rolls back, and there is no `reset_hard` call anywhere in the sweep path. Keep that shape, but make it explicit: a half-applied commit series is left in place and reported loudly, because `reset --hard` destroys work an agent may have done deliberately. An automated rollback across an agent-modified worktree is scarier than a partial commit.
+`--resolve` is off by default, and it is the only step in the tool where a model edits files mid-rebase. Default-off is not timidity: a model that resolves a conflict nobody had is worse than a stop, and the mechanical non-fast-forward case — a stale branch, the overwhelmingly common cause — is three git commands that need no model at all.
+
+#### Why rebase comes before the engine, and what that buys
+
+Rebasing a dirty worktree with `--autostash` stashes, rebases, and pops. The tree comes back dirty and already sitting on top of the remote's version of the base. The engine then commits **once**, and the push is an ordinary fast-forward.
+
+The old ordering — commit, push, get rejected, rebase, force-push — rewrites the branch, so the push needs `--force-with-lease`, and a force-push across a fleet is the one operation here that can destroy someone else's work.
+
+**The honest limit, now that `ro commit` is a separate verb.** If you ran `ro commit` at 10h and `ro push` at 12h and the remote moved in between, those commits already exist, and rebasing them rewrites history. `--force-with-lease` is then **required**. So:
+
+| Situation | Rebase position | Push |
+|---|---|---|
+| `ro push` alone, nothing committed yet | before the engine | **fast-forward, no force** |
+| `ro push` after `ro commit`, remote unmoved | nothing to rebase | **fast-forward, no force** |
+| `ro push` after `ro commit`, remote moved | after the commits | **`--force-with-lease`** |
+
+`--force` — bare — is never used, in any row.
+
+A failed `--autostash` pop is a **per-repo failure naming `git stash list` and `git stash pop`**, never a proceed on a half-popped tree. Driving `stash` / `rebase` / `stash pop` as three steps ro controls itself would be the same thing with three places to forget the cleanup — exactly the failure class the credential design avoids by never rewriting a remote in the first place.
+
+#### The base comes from the repo, not from a configuration
+
+`git symbolic-ref --short refs/remotes/origin/HEAD` → `origin/main`. One git command, no configuration, no GitHub API, and it is the same answer for every clone. `--onto <BRANCH>` overrides it for the case where the work belongs somewhere other than the default branch.
+
+This is what the PR base used to be needed for, and it survives the cut intact: the rebase needs a base either way. What goes away is the second consumer — a PR opened *into* that base — and with it `gh repo view --json defaultBranchRef`, the `--base` flag, and the reason `ro` needed the GitHub CLI on the push path at all.
+
+#### 6.3.1 `ro sync` is a different pipeline
+
+```text
+ro sync --tag work
+ │
+ ├─ targets   WHERE archived=0 AND disabled=0, filtered by --tag
+ │
+ └─ per repo, in parallel:
+      working copy missing?  -> clone (no engine, no branch, no commit)
+      else                   -> git fetch
+                               -> git pull --rebase (or --strategy merge|ff-only)
+                                  --autostash only if the flag was passed
+      update the registry's last_synced_at
+```
+
+**A dirty worktree is skipped by default, not clobbered.** This is where the old `--force` proposal was most dangerous. The correct answer is to say what happened and move on: `skipped: 3 uncommitted changes (use --autostash)`. A fleet tool that discards uncommitted work because someone typed a flag while rushing is a tool that gets uninstalled after the first accident.
+
+**Cloning inside a sync is safe; cloning mid-transaction is not.** Cloning is idempotent and the target is a known-empty path, so it belongs here. What does not belong is discovering a *typo'd* local path partway through a commit-and-push loop and pulling a repository over the network to fill it — which is why `ro commit` and `ro push` skip an un-cloned row with reason `NotCloned` and print `ro add <url>` as the fix.
 
 ### 6.4 The per-repo transaction, detail by detail
 
@@ -1304,7 +1297,7 @@ provider == Git:
 
 The fallback warning names the repo, the requested provider, and the cause, e.g. `warning: repo_orchestrator: gh-credentialed push failed (403); retrying with the git credential — this may publish under a different identity`.
 
-**PRs and identity shell out to `gh`.** `gh pr list --head <branch> --json number,state`, `gh pr create --draft --base <base_branch> --head <head_branch>`, `gh api user --jq .login`. In one move this removes: octocrab's async requirement (which contradicted the plan's own "no async runtime" bullet, and whose sync sketch signatures would not have compiled), the GHE `base_uri` bug at `auth.rs:100` (it builds `https://{host}` with no `/api/v3`, so Enterprise hits the web UI), and the `list_pulls` pagination gap (`issues.rs:116` is a single page with `per_page` defaulting to 50, so head_ref matching can miss a PR on a busy repo). It is also the smaller and more faithful design: the vision names `gh` as the preferred transport precisely because it works without `gh auth login` and takes `GH_TOKEN` per-process.
+**`gh` is not on the push path at all.** It appears in exactly two optional places: `gh auth token` as a credential-discovery fallback when `[auth] https` is unset, and `gh api user` for the `expected_login` identity check. A tool that pushes a branch does not need to be able to open a pull request, and dropping PR handling is what removed the last hard dependency on the GitHub CLI.
 
 Consequence: **`ro-github` drops out of the checkpoint path entirely.** It stays in `crates/ro/Cargo.toml` because `ro doctor` still calls `ro_github::auth::discover_token` (`doctor.rs:25`, `:239`) — cutting `ro import` does **not** make the dependency removable, and an implementer who "tidies" it away breaks the build. Token discovery itself stays in `ro-github::auth` (the `gh auth token` shell-out already lives there and the binary already depends on it); only the *policy types* move (§6.7).
 
@@ -1368,10 +1361,10 @@ let cli = match Cli::from_arg_matches(&matches) { Ok(c) => c, Err(e) => e.exit()
 **Per-command codes are unchanged and documented as such**, so the 0/1/2 table is not misread as global:
 
 - `ro doctor` → 0 all required checks pass, 1 at least one Fail, 2 internal. `report.exit_code()` at `main.rs:1324` stays. Its `Severity::Optional` provider probes can never change this code, and the docs should say so.
-- `ro repos prune` → 0, plus the confirmation gate. The undocumented `std::process::exit(3)` at `main.rs:812` goes away.
+- `ro prune` → 0, plus the confirmation gate. The undocumented `std::process::exit(3)` at `main.rs:812` goes away.
 - `ro schema`, `ro config` → 0, or 78 on a config error.
 
-`--all` on an empty inventory is a legitimate 0. `ro checkpoint nonexistent` or a `--tag` that matches nothing is a **64** — a typo is a usage error, not an empty run.
+`--all` on an empty inventory is a legitimate 0. `ro sync nonexistent` or a `--tag` that matches nothing is a **64** — a typo is a usage error, not an empty run.
 
 ### 6.9 Flags
 
@@ -1380,9 +1373,9 @@ The twelve the vision names:
 | Flag | Notes |
 |---|---|
 | `--all` | every managed repo; the default when nothing else is given |
-| *(positional)* | `ro checkpoint cass voice-ai-agent`; no args means the cwd repo. Each accepts `owner/name`, a bare name, or an alias. `--all` is the explicit fleet escape |
+| *(positional)* | `ro sync cass voice-ai-agent`. **No argument means the whole registry** — that is the daily invocation. Each name accepts `owner/name`, a bare name, or an alias. `--all` says the same thing explicitly, for scripts |
 | `--tag <T>` | a real `repo_tags` row lookup, not `label.contains()` |
-| `--engine <NAME>` | `claude\|codex\|git`; overrides `ro.local.toml` then `[engine] default` |
+| `--engine <NAME>` | `claude\|codex\|git`; overrides the repo row's `engine`, then `[agent] engine` |
 | `--message <MSG>` | presence means one commit with this subject (§9 decision 8) |
 | `--direct` | commit onto the current branch |
 | `--wip` | new branch + draft PR into the snapshot base |
@@ -1406,7 +1399,7 @@ Additions, each with a reason:
 | `--timeout <SECS>` | Per-git-command and per-engine timeout. Overrides `[core].timeout_secs`, which becomes live. |
 | `--engine-bin <PATH>` | Per-run engine binary override. Replaces the free-form `[engines.*]` table; valid only together with `--engine`. |
 
-**One owner per knob.** `--timeout` and `-j` are not a second and third source of truth — they are the top tier of the single 3-tier resolver (`resolve_effective`) whose middle and bottom tiers are `ro.local.toml` and `config.toml`. Today the situation is the opposite: `ro sync --timeout` is a **hardcoded `30`** at the use site (`main.rs:739`, `timeout.unwrap_or(30)`), and `SyncOptions::timeout_secs` is then **never read anywhere** in `ro-sync/src/sync.rs` — it is a field and a `Default` impl and nothing else. `--timeout` is a no-op flag today, and `[core].parallel` (default 8) is never read by anything. Phase 3 makes both real; the resolver is the single place that decides.
+**One owner per knob.** `--timeout` and `-j` are not a second and third source of truth — they are the top tier of the single 3-tier resolver (`resolve_effective`) whose middle and bottom tiers are `.ro/config.local.toml` and `config.toml`. Today the situation is the opposite: `ro sync --timeout` is a **hardcoded `30`** at the use site (`main.rs:739`, `timeout.unwrap_or(30)`), and `SyncOptions::timeout_secs` is then **never read anywhere** in `ro-sync/src/sync.rs` — it is a field and a `Default` impl and nothing else. `--timeout` is a no-op flag today, and `[core].parallel` (default 8) is never read by anything. Phase 3 makes both real; the resolver is the single place that decides.
 
 **`--quiet` and `--verbose` are both deleted.** `cli.verbose` is never read anywhere in `main.rs`; `cli.quiet` has a dead `let _quiet = cli.quiet;` at `main.rs:623` and exactly one real read at `main.rs:704`, which is inside the `ro import` branch that Phase 1 removes. After Phase 1 both flags have zero readers. Note this is a **deprecation**, not a silent removal: keep them for one release printing a warning, then drop them.
 
@@ -1421,8 +1414,8 @@ Additions, each with a reason:
 | Clean repo | skip, counted as ok, no engine dispatched |
 | Untracked files | **included** — `porcelain -z -uall` expands untracked directories into individual files |
 | Untracked directory | its files are committed individually; the `commit.rs:91` bug is not reproduced |
-| Tracked but not cloned (legacy rows only) | skip with reason `NotCloned`; print `ro repos add <spec>` or `ro repos remove <key>` as the two exits. Checkpoint never clones. |
-| Inventory row whose directory was deleted | same as not-cloned, plus a `ro repos prune` hint |
+| Tracked but not cloned (legacy rows only) | skip with reason `NotCloned`; print `ro add <spec>` or `ro remove <name>` as the two exits. A sync never clones. |
+| Inventory row whose directory was deleted | same as not-cloned, plus a `ro remove <name>` hint |
 | Protected branch + `--direct` | refuse, force WIP, say so on stderr |
 | Protected branch + `--wip` | proceed |
 | Neither `--direct` nor `--wip` | WIP on a protected branch, direct otherwise (and report which was chosen) |
@@ -1437,7 +1430,7 @@ Additions, each with a reason:
 | push fails, `allow_fallback = false` | fail the repo, no retry |
 | push fails, `allow_fallback = true` | loud warning, retry over the machine default |
 | Identity mismatch | abort before push; local commits intact, remote unmoved |
-| Duplicate PR | `gh pr list --head <branch>` finds it; do not open a second; report `PR #N already open` |
+|| *(gone with PRs)* | there is no pull request to duplicate |
 | Engine binary missing | `EngineOutcome::Unavailable` naming the binary; per-repo failure; the rest of the fleet continues |
 | Engine exceeds its timeout | `EngineOutcome::TimedOut`, child tree killed; distinct from `Failed` in the summary |
 | Engine reports nothing to commit | `NothingToCommit`, counted as ok, no push attempted |
@@ -1458,10 +1451,10 @@ Every line carries a real timestamp because the emitter owns it. The old bug —
 
 Kinds, redrawn for the fleet vocabulary: `run_start`, `repo_scanned`, `repo_skipped`, `lock_acquired`, `safety_blocked`, `branch_created`, `engine_dispatch`, `engine_timeout`, `committed`, `pushed`, `pr_opened`, `pr_reused`, `repo_failed`, `run_done`. The `v` field is a schema version — without one, a consumer cannot tell a renamed field from a removed one.
 
-**Text output is hand-rolled `println!` per command.** That is what happens today (`ro status`, `ro sync`, and `ro list` all format inline), and it is the honest answer: no shared renderer is being introduced, because the only candidate (`ro_output::text`) is being deleted along with everything else. For the fleet summary specifically, which is the one place a real layout matters, specify it concretely so it does not drift:
+**Text output is hand-rolled `println!` per command.** That is what happens today (`ro list` and `ro sync` all format inline), and it is the honest answer: no shared renderer is being introduced, because the only candidate (`ro_output::text`) is being deleted along with everything else. For the fleet summary specifically, which is the one place a real layout matters, specify it concretely so it does not drift:
 
 ```
-ro/wip/feat-checkpoint-9f2  repo_orchestrator   claude   3 commits   pushed   PR #412 (reused)
+feat/retry-extraction   repo_orchestrator   claude   3 commits   pushed   fast-forward
                              ru                  git      1 commit    pushed   -
                              notes-app           codex   TIMEOUT     local
   3 repos · 2 committed · 1 failed · 1 skipped (clean) · 0 blocked
@@ -1500,49 +1493,30 @@ Five phases, each independently shippable and revertable. Ordering is driven by 
 
 **Depends on:** nothing.
 **Verified by:** `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --workspace --no-fail-fast` all green on Windows, macOS, and Linux. `ro remove` and `ro prune` still work against a **v3** database, proving the V4 migration path. `ro sweep commit-sweep --all` still works, proving nothing it depends on was cut.
-**Done looks like:** five modules, ten top-level commands, **four** migrations (V1/V2/V3 plus the new V4), `ro schema` live, no agent-facing surface missing.
+**Done looks like:** four modules, the ten commands in three tiers, **five** migrations (V1–V4 plus the new V5), `ro schema` live, no agent-facing surface missing.
 
-### Phase 2 — Config foundation
+### Phase 2 — Registry and global config
 
-**Goal:** per-repo config exists, precedence is real and enforced, `ro init` is the onboarding verb and stays fast, `ro repos` has a working update verb, and the config file stops lying — in both directions.
+**Goal:** the registry verbs exist and work, per-repo settings live in the registry, and `ro doctor` can tell you which repos it will not be able to push to.
 
-**The `resolve_paths` bug goes first.** `crates/ro/src/main.rs:466-478` matches on `(&config_dir, &state_dir)` as a **tuple** and honours overrides only in the `(Some, Some)` arm, so `ro --config-dir /tmp/c status` silently uses the real `~/.config`. Every E2E test happens to pass both, which is why it is untested. Make it per-field. The entire 3-tier precedence design is meaningless until this is fixed.
+**V5 adds three columns and that is the whole per-repo config layer.** `ALTER TABLE repos ADD COLUMN` for `credential_ref`, `engine`, `engine_args`. Two things about this that are easy to get wrong, and both are in §4: `ADD COLUMN` is **not idempotent** in SQLite, so the migration must be guarded the way the existing `CREATE TABLE IF NOT EXISTS` migrations are, or the second run of ro on an upgraded machine fails at open; and `manage::add` inserts a fixed column list (`migrate.rs:331,337`) while `manage::list` selects a `REPO_COLUMNS` constant, so **both must be updated in the same commit** — a stale enumeration returns rows whose new columns are `None` while ro believes the repo is configured.
 
-**New:** `RepoConfig` as **three nested tables** — `identity: { name, email }`, `auth: { provider, credential, expected_login }`, `agent: { engine, mode }` — each with `#[serde(deny_unknown_fields)]`, and **no** `token` and **no** `allow_fallback` (see the six rules in §4). `load_repo_config(repo_root)` where an absent file yields defaults, not an error; `pub const REPO_LOCAL_FILE: &str = "ro.local.toml"`; `resolve_effective(repo_root, &CliOverrides) -> EffectiveConfig`. `EffectiveConfig` carries only engine/auth/identity/mode/checkpoint settings — **not** `ConfigPaths`. Conflating "what the user configured" with "where things live on disk" forces every consumer to destructure a field it ignores; pass `ConfigPaths` separately to the two functions that need it.
+**`ro add` takes a local path as well as a remote spec, and the disambiguation is structural.** A value carrying a recognised host prefix (`github.com/…`, `https://…`, `git@…`) is a remote spec; anything else resolving to a directory containing `.git` is a local path; anything else is refused with a message naming both forms. The `RepoSpec` drive-letter bug is fixed here, in `ro-core` rather than in the handler: `ro add C:/work/backend` currently parses as `owner = "C:"` and inserts a row for an owner that does not exist, with a clone URL of `https://github.com/C:/work/backend.git`, failing much later as a clone error against a nonsense URL. Reject a drive-letter owner and reject any backslash inside `RepoSpec::parse` so every caller inherits the fix. Cloning is all-or-nothing per repo — a failed clone writes no row.
 
-**`deny_unknown_fields`, not `#[serde(flatten)]`.** They are mutually exclusive in serde, and the plan's own test requires the strict behaviour. The `#[serde(flatten)] extra` precedent at `ro-config/src/policy.rs:38-39` is a *different* semantic (tolerate and warn, do not fail) and was cited for the wrong thing. No struct in `ro-config` carries `deny_unknown_fields` today, so `authent = "gh"` parses cleanly, does nothing, and `ro doctor` still reports "config valid" — a half-implemented `ro.local.toml` fails **silently**. Strictness goes on `RepoConfig` and on the three fixed engine slots.
+**`ro config set` gains the registry tier and stops destroying the file.** Two additions and one repair. The repair: today `ro config set` loads, mutates one of seven hardcoded keys, re-validates, and `fs::write`s the whole `AppConfig`, silently dropping every comment and every unmodelled key on every invocation — use `toml_edit` for a surgical in-place edit, and do **not** also write a `.bak` per call, because a backup accumulated on every assignment is noise that does not fix the loss anyway. The additions: `ro config set repos.<name>.<key> = <value>` writes to the registry, and the resolver reads it. A credential value is validated to parse as `<scheme>:<name>`, so a pasted `ghp_…` is a loud error at write time rather than a live credential in `state.db` forever — that file is backed up, synced, and pasted into issues.
 
-**Do not add `deny_unknown_fields` to `AppConfig`.** Unknown tables are currently ignored, which is the only reason an existing user's `[mcp]`/`[jobs]`/`[review]` config still loads. Adding it would make every existing config unloadable and flip `ro doctor` to "invalid config". That omission is deliberate and belongs in a comment on the struct, because the next person will otherwise "fix" it.
+**`ro doctor` gains the write-access probe, and it is the most valuable line in the whole phase.** Today it verifies that *a* GitHub token exists; that is the check that lets a wrong-account situation through. What prevents a failed run is whether *this repo's credential* can write to *this repo's remote*, reported per remote with the account it resolved to. A token with `repo` scope and no write access on one repository is an entirely ordinary state — it is the state this very repository was in when this plan was written, discovered only at the push step as a 403, after four other repos had already been pushed. The probe must **read** the permission, never exercise it: a doctor that writes to prove it can write is a doctor that mutates state.
 
-**Config back-compat, explicitly.** Renaming `[providers]` to three fixed `[engine_*]` slots is the plan introducing a fresh instance of the very silent-config-failure risk it flags two sections earlier. Unknown tables are ignored, so an existing `config.toml` would parse and **silently lose its engine configuration**. Ship a small compat shim: on load, read `[providers.claude]` and `[providers.codex]` and map them into the new slots when the new keys are absent; write the new form on the next `ro init`/`config set`. Loudly, not silently.
+**`ro init` stays an order of magnitude simpler than it was going to be.** It creates the config directory, writes the default `config.toml`, creates the database, and prints two lines. There are no three modes, no `--add-dir` scan, no `.gitignore` write, and no per-repo file to create — because there is no per-repo file. The onboarding verb is `ro add`, and it is a separate command that a user runs when they mean it.
 
-**`ro doctor --fix` must be able to upgrade an existing config, or it never will.** `check_and_optionally_fix_config` writes `default_config_toml()` only when the file is **absent**, so after this phase every existing user keeps dead `[mcp]`/`[jobs]`/`[review]` config indefinitely and `validate()` keeps checking keys the schema no longer models. With `toml_edit` available, `--fix` should add the missing `[engine]`/`[auth]`/`[checkpoint]` sections, leave unknown legacy tables in place (no deletion), and print a note naming the ignored sections. Two related defects: `doctor.rs:200` discards the applied-fix count via `let _ = applied_fix_count;`, and the module doc's claim that every mutation "backs up the prior state to `<state_dir>/doctor/runs/<run-id>/`" is **false** — no backup code exists in `doctor.rs`. Delete the claim. And `doctor.rs:249` tells users to "set `[github].token` in config.toml" — there is no `token` field on `GitHubConfig`; fix the string.
-
-**`ro config set` uses `toml_edit`, not `toml::to_string_pretty`.** Today it loads, mutates one of seven hardcoded keys, re-validates, and `fs::write`s the whole `AppConfig` — silently dropping every comment and every key the schema does not model, on every invocation. A surgical in-place edit fixes the loss structurally, which means **do not also add a `.bak` written on every call**; that is just accumulating noise. The `.bak` belongs on the one genuinely destructive operation (the V4 table drop, and the `config.toml` rewrite during upgrade), not on every key assignment.
-
-**`ro init` rewrite — one verb, three modes.** Full semantics in §3; the implementation shape:
-
-- Extract mode selection into a small pure function so it is testable without touching a filesystem: `fn init_mode(args: &InitArgs, cwd: &Path) -> InitMode` returning `Global | OnboardRepo | Workspace(PathBuf)`. The rule is `args.add_dir` → `Workspace`, else `cwd.join(".git").exists()` → `OnboardRepo`, else `Global`. **No directory walk happens inside this function**, which is what keeps the "no implicit scan" guarantee checkable in a unit test.
-- `Global`: write the default config if absent, print the path and the override hint.
-- `OnboardRepo`: `Global`, plus write `ro.local.toml`, append it to `.gitignore` idempotently, and `manage::add` the repo. The inventory key comes from the `origin` remote; if there is no remote, fall back to a directory-name key and say so — a repo with no remote is a real case (a fresh `git init`).
-- `Workspace`: reuse the `collect_git_dirs` walker that Phase 1 already made `pub`. Print the found set, confirm in a TTY, then per repo run the `OnboardRepo` body. `--non-interactive` skips the prompt and registers all. Report a per-repo outcome line so a partial failure is visible.
-- No PATH scan, no wizard, no binary validation in **any** mode — missing-engine errors surface at `ro checkpoint` time. Dumb about engines, competent about repos.
-
-**`ro repos update` — new verb.** `pub fn update(conn: &Connection, key: &RepoKey, patch: &RepoPatch) -> Result<Repo>` in `ro_sync::manage`, a targeted `UPDATE repos SET … WHERE host = ? AND owner = ? AND name = ?`. No schema change. The handler enforces exactly one of `--name`/`--owner`/`--alias`/`--branch`/`--archive`/`--unarchive` per invocation, and refuses a rename that would collide with an existing `(host, owner, name)`. **No `--remote`**: there is no remote column and no remotes table anywhere in the schema, and adding one would duplicate git's own state. **No `--default-branch`** either — that column is dropped in V4, because `git symbolic-ref` and `gh repo view` both answer the question live.
-
-**`ro repos add` becomes clone-then-register, and remote-only.** Clone into the resolved local path first; insert the row only on success, so a failed clone leaves no inventory row. This removes the "tracked but not cloned" state from the data model rather than making the rest of the system tolerate it. The argument is a **remote spec only** — no local paths. `RepoSpec::parse` already rejects `.` and `C:\path`, but it silently accepts `C:/work/backend` as `owner="C:"`, so add the drive-letter and backslash rejections in `ro-core/src/repo_spec.rs` (with tests) and make the handler's error for a path-shaped argument name `ro init` as the right verb.
-
-**`ro repos doctor`, `tag`/`untag`/`tags`, and `ro run prune` — the remaining CRUD holes, same phase.** All four are single-statement queries against tables that already exist, so none of them needs a schema change:
-
-- `pub fn doctor(conn, &Repo) -> Vec<Drift>` in `ro_sync::manage`, four checks (missing / not-a-repo / remote-mismatch / not-cloned), read-only, no `--fix`. It **consolidates** three ad-hoc partial answers that already exist — `status_repo`'s `<local_path>/.git` guard, the checkpoint `NotCloned` reason, and `prune --missing` — into one command. Nothing it computes is new; having it in three places is the problem.
-- `tag` / `untag` / `tags` against `repo_tags` (`PRIMARY KEY (repo_id, tag)`, indexed on `tag`): `INSERT OR IGNORE`, `DELETE … WHERE repo_id = ? AND tag = ?`, `SELECT tag … ORDER BY tag`. All three take multiple tags where it makes sense; `untag` on a missing tag is a no-op at exit 0.
-- `pub fn prune_runs(conn, keep: usize)` in `ro-jobs`: one `DELETE … WHERE run_id IN (SELECT id FROM runs ORDER BY started_at DESC LIMIT -1 OFFSET ?)` fanned across `runs`, `run_events`, `sync_results`, `failures`. `--keep` is **required** — no default, no time-based expiry, no size cap. Report `{deleted, kept, oldest_kept}` in `--format json` so a script can log what it destroyed. This deletes rows, not tables, and is unrelated to `V4_DROP_PLANS`.
-
-**`allow_fallback` moves to global-only.** Remove it from `RepoConfig` entirely. It is a safety posture, and a per-repo posture means one fleet run can hold two of them — which is exactly the state where you push one repo as the wrong account and cannot afterwards say which. One run, one policy. The per-run `--allow-fallback` flag stays as the visible override. `deny_unknown_fields` then turns a stale `allow_fallback` in someone's `ro.local.toml` into a loud error naming the right file, which is the correct outcome.
+**The `[providers]` compat shim.** Renaming `[providers.claude]` to `[agent] engine` would silently lose every existing user's engine configuration, because unknown tables are ignored and `AppConfig` has no `deny_unknown_fields`. On load, read `[providers.claude]` and map it into `[agent] engine` when the new key is absent; write the new form on the next `ro config set`. Loudly, not silently.
 
 **Depends on:** Phase 1.
-**Verified by:** `resolve_effective` unit tests covering all three tiers and a conflict; a `deny_unknown_fields` test proving `authent = "gh"` errors; a `resolve_paths` test proving `--config-dir` alone is honoured; `init_mode` table tests for all four argument shapes including "no args inside a git repo → `OnboardRepo`" and "no args outside one → `Global`"; an `ro init` idempotency test proving two runs add exactly one `.gitignore` line and that a pre-existing `/ro.local.toml` entry is not duplicated; a `--add-dir` test over a fixture tree with a nested non-repo directory proving the nested dir is skipped; a `ro repos update` test proving a colliding rename is refused and that `--archive` flips only the `archived` column; an `ro repos add` test proving a failed clone writes no row; a compat test proving a legacy `[providers.claude]` config still resolves `engine = claude`; a `toml_edit` test proving a hand-written comment survives `ro config set`.
-**Done looks like:** three tiers resolve correctly, no user-visible setting is silently ignored, a legacy config keeps working, and a brand-new user can go from nothing to a registered repo with a per-repo config in two commands (`ro init`, then `cd repo && ro init`) or one (`ro init --add-dir .`).
+**Verified by:** `RepoSpec` rejecting `C:/work/backend` and `C:\\work\\backend`; a failed clone writing no row; `ro config set repos.cass.engine` visible in `ro list` and not affecting any other row; a `ghp_…` refused with a message naming the two accepted forms; V5 applied twice in a row without error; V5 applied to a pre-V5 database leaving every existing row on the global credential; `ro doctor` reporting `write: NO` for a read-only credential and `write: yes` for a writable one, with the fake remote recording **zero** writes; and `ro doctor` exiting non-zero on a broken row while still printing the healthy ones.
+**Done looks like:** `ro add`, `ro list`, `ro remove` and `ro doctor` do what they say, a per-repo engine and credential can be set without a text editor, and doctor tells you before a run which repos are going to fail.
+
+---
+
 
 ### Phase 3 — Git, credential and safety substrate
 
@@ -1590,17 +1564,17 @@ Same commit: delete `SweepCommands` (`main.rs:307-378`), the three handler arms 
 **Verified by:** unit tests per engine against a temp repo — `GitEngine` on a dirty repo with a brand-new directory produces one commit containing that directory's files; a missing `claude` returns `Unavailable` without a non-zero process exit; a registry-free dispatch table test proves a fourth engine is one `impl` plus one match arm. **CLI smoke test: `ro sweep` is gone, `ro --help` lists the intended surface.** A `--filter has:x` no longer matches every repo. An invalid `--repos` glob errors instead of silently selecting the fleet.
 **Done looks like:** conventional-commit bucketing is gone from the tree, three engines implement one trait, a missing `claude` surfaces as a per-repo error at dispatch, and there is exactly one fleet-commit path left in the codebase — the one about to be registered.
 
-### Phase 5 — `ro checkpoint`, `ro pr`, `ro conflict`, the regroup, docs, tests
+### Phase 5 — `ro sync` and the surface
 
 **Goal:** the three verbs that replace the daily Git workflow ship, and the surface matches the vision.
 
-**The three verbs and why they are all v1.** The daily loop is `ro status` → `ro checkpoint` → occasionally `ro pr` → occasionally `ro conflict`. Each replaces a specific multi-terminal sequence, and cutting any one of them leaves a hole the user falls back to a terminal for — which is the outcome this whole plan exists to prevent. `ro pr` matters most often (most PRs are for branches that are already committed) and `ro conflict` matters most painfully (a wedged repo mid-rebase blocks everything else). Neither is a nice-to-have.
+**One verb, and every step of it used to be a command.** `ro sync` is scan → rebase → engine commits → ro pushes → PR. An earlier revision split that into `ro checkpoint`, `ro pr`, and `ro conflict`, and the split was wrong in a specific way: the first verb always had to know whether the others were coming, and *"I have work and I want it somewhere safe"* is all of it at once. PR creation is step four, not a separate invocation. Conflict handling is a stage inside a sync, not a mode you enter separately. The whole daily loop is one word, and the demo is `ro sync`.
 
-**`ro pr` — thin, and sharing its internals.** New: `crates/ro/src/pr.rs`. It calls the same three helpers `checkpoint --wip` uses — `ensure_branch_pushed`, `find_open_pr_for_head`, `create_or_update_pr` — and adds only argument parsing, the dirty-tree precondition check, and output. If those helpers are not shared, `ro pr` and `checkpoint --wip` will drift within a month and one of them will push a branch the other cannot find. The dirty-tree check is mandatory: `ro pr` refuses when the worktree is dirty, because a PR is a statement about a specific commit and silently sweeping uncommitted work into a branch you did not just push is how WIP ends up in a reviewed diff.
+**The PR step lives inside `ro push`, in `crates/ro/src/pr.rs`.** It calls the three helpers the push path shares — `ensure_branch_pushed`, `find_open_pr_for_head`, `create_or_update_pr` — and adds only argument handling, the dirty-tree precondition, and output. If those helpers are ever duplicated rather than shared, the push path and the PR step drift within a month and one of them ends up pushing a branch the other cannot find. The dirty-tree check is mandatory: `ro push` refuses to open a PR for a dirty worktree, because a PR is a statement about a specific commit and silently sweeping uncommitted work into a branch you did not just push is how WIP ends up in a reviewed diff.
 
 **`ro conflict` — detection plus the assistant.** `conflict list` is what the plan already had. The new part is `ro conflict <REPO>` (fetch → rebase/merge → on conflict show paths and offer mergetool / abort) and `ro conflict <REPO> --continue`, per §3. Two invariants in the implementation: `--continue` **verifies the index is free of unmerged entries before** running `rebase --continue` (running it with conflicts still present produces a second, more confusing failure and the user learns to avoid the command), and `abort` **records the pre-operation HEAD in the run row first**, then aborts, then verifies the ref matches — a tool that aborts a rebase has already thrown away commits unless the ref was captured first. It is one repo at a time, never a fleet loop: the same rule as checkpoint, because an interactive command over 20 repos is not a command.
 
-**Repo selection is positional, and the resolver is shared.** `ro checkpoint cass voice-ai-agent`, `ro sync cass`, `ro status backend`. One `resolve_targets(&[String]) -> Result<Vec<Repo>>` in `ro-sync::targets` accepts a bare name, an alias, or `owner/name`, and is used by all three verbs so they cannot disagree about what a name means. `--all` stays as the explicit fleet escape.
+**Repo selection is positional, and one resolver owns it.** `ro sync cass voice-ai-agent` for a subset, bare `ro sync` for everything. One `resolve_targets(&[String]) -> Result<Vec<Repo>>` in `ro-sync::targets` accepts a bare name, an alias, or `owner/name`. An empty list means *every row in the registry* — resolved from the database, never from a filesystem scan, because the set of repos ro will push with the user's credential must never depend on where they happen to be standing.
 
 **New:** `crates/ro/src/checkpoint/{mod,orchestrator,emit,summary}.rs` per §6. `crates/ro-sync/src/targets.rs` — `resolve_multi_repo_targets` lifted from `main.rs:554-611` with the `health:<N>` branch deleted, the `has:` bool-expression bug fixed, the invalid-glob-becomes-`*` bug fixed, `archived = 0 AND disabled = 0` added, and a real `repo_tags` reader.
 
@@ -1610,7 +1584,7 @@ Same commit: delete `SweepCommands` (`main.rs:307-378`), the three handler arms 
 
 **Exit codes:** the `FatalError` type, the 64 remap, the per-command table (§6.8).
 
-**Run history:** wire `open_run` at command entry, `append_event` per per-repo outcome, `finalize_run` with the aggregate code. All three have **zero production callers** today — `ro_jobs::open_run` (`run.rs:54`), `finalize_run`, and `append_event` are called only from their own `#[cfg(test)]` modules — which is why `ro run list` always prints nothing against a fresh database and why `FEATURES.md:212`'s "every mutating operation records a run" is false.
+**Run history is cut, and the summary is what replaces it.** `ro_jobs::open_run` / `append_event` / `finalize_run` have **zero production callers** today — they exist, they are tested, and nothing calls them, which is exactly the kind of thing that looks like a feature and is not one. With no `ro run` verb there is nothing to read the rows with, and a database nobody queries is not an audit trail. So: do not wire them. What replaces the audit trail is the **per-repo summary on stdout** (§6.11) — one line per repo naming branch, engine, the account the credential resolved to, commit count, and result — plus the NDJSON form under `--format ndjson` for anyone who wants to pipe it somewhere. That is enough to answer "what did ro do to this repo"; it is not enough to answer "what did ro do last Tuesday", and that gap is named in §1 rather than hidden behind a table nobody queries.
 
 **Fix the sync FK bug while there.** `sync_all` mints `run_id = Uuid::new_v4()` at `ro-sync/src/sync.rs:306` and never inserts a `runs` row, but `sync_results.run_id` is `NOT NULL REFERENCES runs(id)` and `ro_state::open_db` sets `PRAGMA foreign_keys=ON`. The insert fails and is swallowed by `let _ = conn.execute(…)` at `sync.rs:326`. So `sync_results` is **permanently empty**, `ro status`'s `last_synced_at` is permanently NULL, and the health score's failed-sync penalty is permanently zero. Thread a real `open_run` id through. Alongside it: a **failed pull is recorded as success** — the pull branch never checks `outcome.result.ok()` (the clone branch immediately above it does), and `PullOutcome.conflict` is computed and then discarded, so a conflicted `--rebase` pull lands in `sync_results` as `updated` / `success` / `error: None`. Add the `archived`/`disabled` filter to `sync_all` too, wire `-j` and `--timeout` to real executors, and delete `--resume` (there is no daemon to resume into).
 
@@ -1621,7 +1595,7 @@ Same commit: delete `SweepCommands` (`main.rs:307-378`), the three handler arms 
 **Beads:** file the five phases as issues with the Phase 2 → 3 → 4 → 5 dependencies recorded, now that `issue_prefix` is set to `ro`.
 
 **Depends on:** Phase 4.
-**Verified by:** the §8 suite; `ro run list` returning a real row after a `ro checkpoint --dry-run`; a live 3-repo fleet run with one deliberately failing repo producing exit 1.
+**Verified by:** the §8 suite; `ro run list` returning a real row after a `ro sync --dry-run`; a live 3-repo fleet run with one deliberately failing repo producing exit 1.
 **Done looks like:** `init`, `repos`, `status`, `sync`, `checkpoint`, `conflict`, `run`, `doctor`, `config`, `schema` — ten commands, no review, no `ro health` command, no fork, no sweep, no import, no self-update, no robot-docs, no toon, and every documented claim true. The health *scorer* survives and stays filterable; only the command and the display are gone.
 
 ---
@@ -1638,7 +1612,7 @@ struct FixRepo { id, owner, name, path: PathBuf, remote: Option<PathBuf>,
                  branch: String, remote_git: bool }
 ```
 
-Each repo is configurable: branch (default `main`), clean or dirty, dirty files tracked / untracked / inside a brand-new directory, with or without a remote, with or without an `ro.local.toml`, with a chosen engine.
+Each repo is configurable: branch (default `main`), clean or dirty, dirty files tracked / untracked / inside a brand-new directory, with or without a remote, with or without an `.ro/config.local.toml`, with a chosen engine.
 
 **Faking `gh` (and the agent engines) — cross-platform, no new crate.** A shell script is not directly executable on Windows. Write a **`gh.cmd` shim** on Windows and a `gh` shell script elsewhere, prepend the directory to `PATH`, and have the shim append its argv to a log file the test asserts on. Windows resolves `.cmd` through `PATHEXT` for `Command::new("gh")`, so `gh pr list --head X` reaches the shim with no shim-compilation step and no `required-features` bin to accidentally ship. The same mechanism fakes `claude` and `codex` with a script that runs `git add -A && git commit -m shim` — deterministic, cross-platform, and it never spawns a real agent in CI. This is the test seam; it is why the `ro-github` octocrab path does not need a `base_uri` override or `wiremock` at all.
 
@@ -1653,8 +1627,8 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 
 **Direct vs WIP**
 4. Feature branch + `--direct --execute`: commit lands on the feature branch, no new branch, no PR.
-5. `main` + `--direct --execute`: **refuses**, creates `ro/wip/*`, commits there, and says why on stderr. The polarity inversion is the point; test both directions.
-6. Feature branch + `--wip --execute`: `ro/wip/*` created and checked out, pushed with `--set-upstream`, PR opened with `--head ro/wip/*` and **`--base` equal to the branch that was checked out before the WIP branch was created**. An engine that switches branches mid-run must not move the base.
+5. **`main` + `ro push --execute`: refuses**, and the error names the fix: `main` is protected — `git checkout -b feat/x` first. ro does not invent a branch name. That decision has consequences (it is what the PR will be built from, what the teammate will fetch, what shows up in `git branch` next month) and the user is standing right there. The old answer — silently create `ro/wip/<slug>-<run>` — existed only to give a pull request something to point at.
+6. A feature branch pushes normally: `git push --set-upstream origin <branch>`, the upstream is recorded, and the second `ro push` needs no `--set-upstream`.
 7. Duplicate PR: run `--wip --execute` twice against the fake `gh`; the second run's shim log shows a `pr list` hit and **no** `pr create`. Assert the outcome reports `pr_reused`.
 
 **Per-repo isolation and exit codes**
@@ -1665,11 +1639,11 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 12. Fleet of 3, all ok: exit **0**.
 13. Fleet of 3, all clean: exit 0, no engine dispatched, no commit.
 14. **Every commit succeeds and every push fails → not 0.** This is the current bug at `main.rs:1301`.
-15. Bad usage → exit **64**, not 2. `ro checkpoint --nonexistent-flag`.
-16. `ro checkpoint nonexistent` → exit **64**; `ro checkpoint --all` on an empty inventory → exit **0**.
+15. Bad usage → exit **64**, not 2. `ro sync --nonexistent-flag`.
+16. `ro sync nonexistent` → exit **64**; `ro sync` on an empty registry → exit **0**.
 
 **Target resolution**
-17. `ro checkpoint a/b` selects exactly one repo; an unarchived, enabled filter applies by default.
+17. `ro sync a/b` selects exactly one repo; an unarchived, enabled filter applies by default.
 18. A repo marked `archived = 1` is **not** selected by `--all`; it **is** selected with `--include-archived`. Same for `disabled = 1`. This is the fleet-correctness regression.
 19. A tracked-but-not-cloned repo is skipped with `NotCloned`, no network access, and the outcome names the `ro sync --clone-only` command.
 20. `--tag foo` selects by real `repo_tags` rows. Today `--filter tag:orch` matches any repo whose owner or name contains "orch".
@@ -1690,15 +1664,15 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 31. `expected_login` mismatch under a named `ssh` credential: same shape — the repo aborts before any push even though the commit author is correct.
 
 **Config precedence**
-32. CLI `--engine git` beats `ro.local.toml` `engine = "claude"`.
-33. `ro.local.toml` beats global `[engine] default`; global beats the built-in default.
+32. CLI `--engine git` beats `.ro/config.local.toml`'s `engine = "claude"`.
+33. `.ro/config.local.toml` beats the registry row, which beats global `[agent] engine`; that beats the built-in default.
 34. A legacy config with only `[providers.claude]` still resolves `engine = claude` (the back-compat shim).
-35. A typo in `ro.local.toml` (`authent = "gh"`) **errors** — the `deny_unknown_fields` guarantee.
-36. `ro init` twice appends exactly one `ro.local.toml` line to `.gitignore`; a pre-existing `/ro.local.toml` entry is not duplicated.
+35. A typo in `.ro/config.local.toml` (`authent = "gh"`) **errors** — the `deny_unknown_fields` guarantee.
+36. `ro init` twice appends exactly one `.ro/` line to `.gitignore`, and the entry is a **directory** pattern, not a filename. Re-running does not duplicate it, and a pre-existing `.ro/` entry is recognised with or without a leading slash.
 
 **`ro init` modes and the `repos` CRUD**
 37. `init_mode` is a pure function and is tested as one: `{}` outside a git repo → `Global`; `{}` inside one → `OnboardRepo`; `{--add-dir X}` → `Workspace(X)`; `{--add-repo X}` → `OnboardRepo(X)`. Four cases, no filesystem, no subprocess.
-38. `ro init` in a fixture repo creates `ro.local.toml`, registers the row, and **does not create a `Global`-only marker** — i.e. the onboard path really did more than bootstrap.
+38. `ro init` in a fixture repo creates `.ro/config.local.toml` plus the `.ro/` gitignore entry, registers the row, and **does not create a `Global`-only marker** — i.e. the onboard path really did more than bootstrap.
 39. `ro init` in a repo with **no `origin` remote** still registers, keyed by directory name, and prints a line saying the key was inferred. A fresh `git init` is a real case, not an error.
 40. `ro init --add-dir <fixture>` over a tree containing a nested plain directory registers only the git repos, and the per-repo outcome is one line each. With `--non-interactive` it registers all without prompting; in a TTY it prompts first.
 41. **The no-implicit-scan guarantee:** `ro init` with no args in a directory containing 5 git repos registers **none** of them. This is the test that keeps the feature honest — onboarding is never inferred.
@@ -1708,8 +1682,8 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 45. `ro repos update` preserves `repo_tags` and `repo_health_snapshots` rows for that repo, whereas `ro remove` + `add` drops them. This is the whole reason the verb exists; assert it explicitly.
 
 **Health filter (compute kept, display gone)**
-46. `ro checkpoint --filter health:critical` selects a subset and `--filter health:99` selects none, using real `repo_health_snapshots` rows — not a substring match.
-47. `ro status --format text` and `ro status --format json` contain **no** `Health`/`health` key anywhere in their output, while `--filter health:` still works. The display/compute split is the contract; assert both halves.
+46. `ro sync --filter health:critical` selects a subset and `--filter health:99` selects none, using real `repo_health_snapshots` rows — not a substring match.
+47. `ro list --format text` and `ro list --format json` contain **no** `Health`/`health` key anywhere in their output, while `--filter health:` still works. The display/compute split is the contract; assert both halves.
 
 **`repos add` spec hygiene (the Windows-path bug)**
 48. `RepoSpec::parse("C:/work/backend")` is an **error**. Today it returns `Ok` with `owner = "C:"` and `name = "work/backend"` and would insert a row for a nonexistent owner. Reject a drive-letter owner.
@@ -1726,8 +1700,8 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 55. `ro repos tags` lists the union of tags with counts; `ro repos tags a` lists one repo's tags. `idx_repo_tags_tag` makes the aggregate query indexed.
 
 **Global-only `allow_fallback`**
-56. A `ro.local.toml` containing `allow_fallback = false` **errors** via `deny_unknown_fields`, with a message that says where the key moved. This is the enforcement of "one run, one fallback policy" — a per-repo key that silently parsed would be worse than not having the rule.
-57. `ro checkpoint --allow-fallback` still overrides the global default for one run, and the summary records that the override was used.
+56. A `.ro/config.local.toml` containing `allow_fallback = false` **errors** via `deny_unknown_fields`, with a message that says where the key moved. This is the enforcement of "one run, one fallback policy" — a per-repo key that silently parsed would be worse than not having the rule.
+57. `ro sync --allow-fallback` still overrides the global default for one run, and the summary records that the override was used.
 
 **`ro run prune`**
 58. After 20 seeded runs, `ro run prune --keep 5` leaves exactly the 5 newest, and every `run_events` / `sync_results` / `failures` row pointing at a deleted run is gone too. Assert no orphans by `run_id`.
@@ -1735,26 +1709,26 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 60. `ro run prune --keep 1000` on a 20-run database is a no-op that reports `{deleted: 0, kept: 20}` and still exits 0.
 
 **Per-repo identity — the thing that makes two accounts possible**
-61. **Two repos, two authors, one command.** A fleet run over repo A (`identity.email = work@corp.com`) and repo B (`identity.email = me@gmail.com`) produces two commits with two different `git log -1 --format=%ae` values. This is the regression test for the whole feature: if it ever collapses to one author, the reason the tool exists is gone.
+61. **Two repos, two authors, one command.** A fleet run over repo A (`author_ref = work`) and repo B (`author_ref = personal`) produces two commits whose `git log -1 --format=%ae` values are `work@corp.com` and `me@gmail.com`. This is the regression test for the whole feature: if it ever collapses to one author, the reason the tool exists is gone. **It failed silently for one revision** — `.ro/config.local.toml` was removed, the per-repo override went with it, and the column that replaced it was not added, leaving a test asserting a capability the schema no longer had.
 62. `identity` applied via `git -c user.name=… -c user.email=…` — assert the repo's **`.git/config` is byte-identical before and after**. Per-invocation `-c` is the whole mechanism; writing to the repo's config is the bug this prevents.
-63. A repo with no `[identity]` table falls back to git's own configured user, unchanged.
+63. A repo with `author_ref = NULL` and no `[identity]` block at all falls back to git's own configured user, unchanged. A repo with `author_ref = NULL` **and** a `[identity] default` gets the default profile — so adding a global identity upgrades every existing repo without touching a single row.
 64. `identity.email` and `auth.expected_login` are independent: setting `expected_login` to a value that does **not** match the credential still aborts the push, even though the commit author is correct. This is rule 5 in §4 — the author is controlled, the pushing account is not.
 
 **Credential resolution — never a secret in a file**
 65. `credential = "env:CI_GH_TOKEN"` resolves from the environment and the resolved value reaches the push as the `extraheader` credential. This is the CI path and must work with no OS keychain present.
 66. `credential = "keychain:test-key"` with a `keyring` test backend returns the stored secret; with the `keychain` feature disabled the build still compiles and the error names the missing feature rather than failing to link.
 67. **`SecretString` does not leak.** A `tracing` field, a `dbg!`, and a `{:?}` on an error containing the resolved credential all render `***`. This is the regression test for the `AuthToken: Debug` finding.
-68. `ro.local.toml` containing `token = "ghp_…"` **errors** under `deny_unknown_fields` with a message pointing at `credential = "keychain:…"` or `credential = "env:…"`. A stale plaintext token must be a loud failure, not a silently-ignored key.
+68. `.ro/config.local.toml` containing `token = "ghp_…"` **errors** under `deny_unknown_fields` with a message pointing at `credential = "keychain:…"` or `credential = "env:…"`. A stale plaintext token must be a loud failure, not a silently-ignored key.
 69. Repo A with `credential = "env:WORK_TOKEN"` and repo B with `credential = "env:PERSONAL_TOKEN"` push with **different** accounts in the same fleet run. This is what a global `GH_TOKEN` cannot express.
 
 **Positional repo selection**
-70. `ro checkpoint cass voice-ai-agent` and `ro checkpoint --all` select the same repos via the same resolver; a bare name, an `alias`, and an `owner/name` all resolve, and an unknown name is a **64** with the available names listed.
-71. The resolver is *shared*: `ro status cass`, `ro sync cass`, and `ro checkpoint cass` all agree on what `cass` means. A name that matches two repos is an ambiguity error, not a coin flip.
+70. `ro sync cass voice-ai-agent` and `ro sync --all` select the same repos via the same resolver; a bare name, an `alias`, and an `owner/name` all resolve, and an unknown name is a **64** with the available names listed.
+71. The resolver is *shared*: `ro list` and `ro sync` agree on what `cass` means, and a name that matches two repos is an ambiguity error listing both, not a coin flip.
 
-**`ro pr`**
-72. `ro pr` on a clean tree pushes the current branch and creates a draft PR, printing the URL. It does **not** create a commit — assert the commit count is unchanged.
-73. `ro pr` on a **dirty** tree refuses and names the dirty paths. A PR is a statement about a specific commit.
-74. `ro pr` twice does not open two PRs: the second run finds the open PR for the head, reports the same URL, and the fake `gh` recorded one `pr create` call.
+**The PR step inside `ro push`**
+72. `ro push` on a clean tree pushes the current branch and creates a draft PR, printing the URL. Assert the commit count is unchanged when there was nothing to commit — the PR step does not commit.
+73. `ro push` on a **dirty** tree commits first (that is what push is for) and then pushes. There is no PR and therefore no "the PR is about a different commit" hazard to guard against — the two features went together.
+74. `ro push` twice does not open two PRs: the second run finds the open PR for the head, reports the same URL, and the fake `gh` recorded **one** `pr create` call. Duplicate detection is the single most valuable behaviour here — a second PR for the same branch is what everyone hits when they re-run a script.
 75. `--base` resolves through the three live sources in order: `git symbolic-ref refs/remotes/origin/HEAD`, then `gh repo view --json defaultBranchRef`, then a usage error naming all three. There is no database fallback.
 
 **`ro conflict`**
@@ -1770,75 +1744,87 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 83. The built-in prompt contains no "push" instruction. Assert on the literal prompt string, so the regression is caught at the source rather than in a behavioural test that a sufficiently literal agent could route around.
 84. `EngineOutcome` has no `Pushed` variant. Adding one breaks a `match` in the orchestrator — which is the cheapest possible guard against someone "helpfully" extending it later.
 
-**Bare `ro`**
-85. `ro` inside a git repo with changes prints a checkpoint plan and changes nothing: no commit, no push, **no agent process spawned**. Assert the fake engine's invocation log is empty.
-86. `ro cass backend` previews both named repos and nothing else.
-87. `ro` outside any git repo and outside the inventory is a clear error, not a silent no-op.
-88. `ro --format json` (bare) emits the preview as JSON, so a script can preview without parsing prose.
-89. **Bare `ro` outside any git repo previews the managed inventory** — and only the managed inventory. Put four `.git` directories under a temp parent, register two, cd to the parent, run bare `ro`, assert exactly the two registered repos appear.
-90. **The no-scan guarantee.** A `.git` directory sitting next to a managed one, never registered, is absent from that preview — and from `--all`. This is the test that keeps auto-discovery from creeping back in; it is the single most important safety test in the bare-`ro` block, because "ro pushed a repo I did not mean to" is not a bug report, it is a disclosure.
-91. Bare `ro` outside a repo on an empty inventory is a clear "nothing managed" message, not a filesystem scan and not a silent success.
+**No argument means the whole registry**
+85. `ro sync` with no arguments targets every row in the registry, and with no `--execute` it prints the plan and changes nothing: no commit, no push, **no engine process spawned**. Assert the fake engine's invocation log is empty.
+86. `ro sync cass backend` previews exactly those two and nothing else.
+87. `ro sync` on an empty registry says so plainly rather than reporting a vacuous success.
+88. `ro sync --format json` emits the preview as JSON, so a script can preview without parsing prose.
+89. **The no-scan guarantee.** Put four `.git` directories under a temp parent, register two, and run `ro sync --execute`. Assert exactly the two registered repos appear, that the fake engine was invoked twice, and that neither unregistered directory was touched. This is the single most important safety test in the file, because "ro pushed a repo I did not mean to" is not a bug report, it is a disclosure.
+90. A repo with a `.ro/config.local.toml` sitting in it but never registered is still **not** touched. Registration is the only thing that grants management, and nothing about a repo's contents can grant it.
 
-**PR base resolution**
-92. A remote whose HEAD points at `origin/trunk` resolves `--base` to `trunk` — **not** `main`. A fixture that previously seeded `repos.default_branch = 'main'` can no longer do so, because the column does not exist; the test asserts against git's own answer.
-93. With `refs/remotes/origin/HEAD` unset, resolution falls through to `gh repo view --json defaultBranchRef`.
-94. With no remote and no `gh`, it is a usage error naming all three sources tried.
-95. **The upgraded-database test.** Open a `state.db` created by the *pre-V4* binary, apply `V4_DROP_PLANS`, then run `ro pr` against it. This is the only test that catches a `SELECT` left pointing at a dropped column, because a freshly-built test database has the column absent and the stale reader compiles fine. Assert `ALTER TABLE` is idempotent on re-run (`migrate` must not try to drop it twice).
+91. With `refs/remotes/origin/HEAD` unset, resolution falls through to `gh repo view --json defaultBranchRef`.
+92. With no remote and no `gh`, it is a usage error naming all three sources tried.
+93. **The upgraded-database test.** Open a `state.db` created by the *pre-V4* binary, apply `V4_DROP_PLANS`, then run `ro pr` against it. This is the only test that catches a `SELECT` left pointing at a dropped column, because a freshly-built test database has the column absent and the stale reader compiles fine. Assert `ALTER TABLE` is idempotent on re-run (`migrate` must not try to drop it twice).
 
 **`[agent] command` / `prompt` override**
-96. `[agent] command = 'my-agent --flag'` runs `my-agent` with `--flag` and the built-in prompt.
-97. `[agent] prompt` replaces the built-in instruction and is passed as a single argument.
-98. **No shell interpolation.** A prompt containing `; rm -rf /`, `$(whoami)`, or a backtick reaches the agent as that literal string and nothing executes. The fake agent echoes its argv back and the test asserts the metacharacters survived verbatim. This is a command-injection test, not a formatting test.
-99. A custom `command` naming a binary that does not exist yields `EngineOutcome::Unavailable` for that repo — a per-repo failure, not a fleet abort, and not a silent skip.
+94. `[agent] command = 'my-agent --flag'` runs `my-agent` with `--flag` and the built-in prompt.
+95. `[agent] prompt` replaces the built-in instruction and is passed as a single argument.
+96. **No shell interpolation.** A prompt containing `; rm -rf /`, `$(whoami)`, or a backtick reaches the agent as that literal string and nothing executes. The fake agent echoes its argv back and the test asserts the metacharacters survived verbatim. This is a command-injection test, not a formatting test.
+97. A custom `command` naming a binary that does not exist yields `EngineOutcome::Unavailable` for that repo — a per-repo failure, not a fleet abort, and not a silent skip.
 
 **The agent's environment is built by subtraction — the leak-chain tests**
-100. **The parent token does not survive into the child.** Export `GH_TOKEN=ghp_test_value` in the test harness, dispatch the fake engine, and assert the value appears in **neither** the engine's environment, its argv, nor its captured stdout/stderr. This is the test for the whole leak chain, and it fails against the earlier design that injected the token.
-101. The fake engine runs `printenv` and echoes everything back; the test asserts no value matches a PAT-shaped regex (`ghp_[A-Za-z0-9]{20,}` or `github_pat_…`). Belt and braces on #97, because the point is that nothing *reaches* the model, not merely that the model did not echo it.
-102. A repo with **no** `[auth] credential` still gets a child environment with no `GH_TOKEN` — stripping is unconditional, not conditional on there being a credential to protect.
-103. **The author does reach the agent, deliberately.** A repo with `[identity]` produces a child env carrying `GIT_AUTHOR_EMAIL`, and the fake engine asserts it is present — because `git commit` needs it and the value is public in the commit anyway.
-104. **An agent cannot change the author by writing config.** The fake engine runs `git config --local user.email hijack@example.com` and commits. Assert: the commit's author is still the `[identity]` value, because ro re-asserts `-c` on every commit it performs; and the `.git/config` mutation is reported as a per-repo **warning** rather than silently accepted.
-105. A parent `GITHUB_TOKEN` (rather than `GH_TOKEN`) is stripped by the same rule.
+98. **The parent token does not survive into the child.** Export `GH_TOKEN=ghp_test_value` in the test harness, dispatch the fake engine, and assert the value appears in **neither** the engine's environment, its argv, nor its captured stdout/stderr. This is the test for the whole leak chain, and it fails against the earlier design that injected the token.
+99. The fake engine runs `printenv` and echoes everything back; the test asserts no value matches a PAT-shaped regex (`ghp_[A-Za-z0-9]{20,}` or `github_pat_…`). Belt and braces on #97, because the point is that nothing *reaches* the model, not merely that the model did not echo it.
+100. A repo with **no** `[auth] credential` still gets a child environment with no `GH_TOKEN` — stripping is unconditional, not conditional on there being a credential to protect.
+101. **The author does reach the agent, deliberately.** A repo with `[identity]` produces a child env carrying `GIT_AUTHOR_EMAIL`, and the fake engine asserts it is present — because `git commit` needs it and the value is public in the commit anyway.
+102. **An agent cannot change the author by writing config.** The fake engine runs `git config --local user.email hijack@example.com` and commits. Assert: the commit's author is still the `[identity]` value, because ro re-asserts `-c` on every commit it performs; and the `.git/config` mutation is reported as a per-repo **warning** rather than silently accepted.
+103. A parent `GITHUB_TOKEN` (rather than `GH_TOKEN`) is stripped by the same rule.
 
 **Rebase before agent**
-106. A push rejected as non-fast-forward is rebase-and-retry **without dispatching an engine**. Assert the fake engine's invocation count did not increase.
-107. `--yes` makes the rebase-and-retry non-interactive, and does **not** enable `--resolve` — `--yes` alone on a real conflict still hands over to the user.
-108. A real conflict with `--resolve` dispatches the engine exactly once more, with a different prompt, and the engine's captured output contains no `rebase --continue` and no `push`. ro runs both afterwards.
-109. The rebase retry uses `--force-with-lease` and never `--force`. Assert the recorded invocation's argv.
-110. A branch that is still non-fast-forward after a successful rebase is reported and the repo is marked failed — no second blind retry.
+104. A push rejected as non-fast-forward is rebase-and-retry **without dispatching an engine**. Assert the fake engine's invocation count did not increase.
+105. `--yes` makes the rebase-and-retry non-interactive, and does **not** enable `--resolve` — `--yes` alone on a real conflict still hands over to the user.
+106. A real conflict with `--resolve` dispatches the engine exactly once more, with a different prompt, and the engine's captured output contains no `rebase --continue` and no `push`. ro runs both afterwards.
+107. The rebase retry uses `--force-with-lease` and never `--force`. Assert the recorded invocation's argv.
+108. A branch that is still non-fast-forward after a successful rebase is reported and the repo is marked failed — no second blind retry.
 
 **Rebase happens before the engine — the ordering test**
-111. **The happy path never force-pushes.** A repo that is behind `origin/main` by two commits, with local changes: assert the recorded `git push` argv contains **no** `--force` and **no** `--force-with-lease`, because the rebase at step (e) already made the push a fast-forward. This is the test that makes the ordering matter — against the old `commit → push → rebase → force-push` flow it fails immediately.
-112. The recorded argv order is `fetch` → `rebase --autostash origin/<base>` → …engine… → `push`. Assert the rebase timestamp precedes the engine's invocation.
-113. A **failed autostash pop** is a per-repo failure naming `git stash list` / `git stash pop`, and the engine is **not** dispatched on the half-popped tree. Assert the fake engine's invocation count is still zero.
-114. `--resolve` on a real conflict during step (e) dispatches the engine once, with the conflict prompt, and the engine's output contains no `rebase --continue` and no `push`; ro runs both.
-115. The base used for the rebase is the one snapshotted in the coordinator scan, not one re-derived after the engine ran.
+109. **The happy path never force-pushes.** A repo that is behind `origin/main` by two commits, with local changes: assert the recorded `git push` argv contains **no** `--force` and **no** `--force-with-lease`, because the rebase at step (e) already made the push a fast-forward. This is the test that makes the ordering matter — against the old `commit → push → rebase → force-push` flow it fails immediately.
+110. The recorded argv order is `fetch` → `rebase --autostash origin/<base>` → …engine… → `push`. Assert the rebase timestamp precedes the engine's invocation.
+111. A **failed autostash pop** is a per-repo failure naming `git stash list` / `git stash pop`, and the engine is **not** dispatched on the half-popped tree. Assert the fake engine's invocation count is still zero.
+112. `--resolve` on a real conflict during step (e) dispatches the engine once, with the conflict prompt, and the engine's output contains no `rebase --continue` and no `push`; ro runs both.
+113. The base used for the rebase is the one snapshotted in the coordinator scan, not one re-derived after the engine ran.
 
 **`GIT_CONFIG_*`, not `GIT_AUTHOR_*`**
-116. The child environment carries `GIT_CONFIG_COUNT=2`, `GIT_CONFIG_KEY_0=user.name`, `GIT_CONFIG_KEY_1=user.email` — and carries **no** `GIT_AUTHOR_*` or `GIT_COMMITTER_*` variable. Assert absence as well as presence; a leftover `GIT_AUTHOR_*` would silently win over the config in some git versions.
-117. A repo with no `[identity]` exports **no** `GIT_CONFIG_*` at all, and the commit falls back to git's own configured user.
-118. `user.name`/`user.email` via `GIT_CONFIG_*` apply to `commit --amend` and to a tag created by the agent — assert the amending commit carries the identity, which is the concrete advantage over `GIT_AUTHOR_*`.
+114. The child environment carries `GIT_CONFIG_COUNT=2`, `GIT_CONFIG_KEY_0=user.name`, `GIT_CONFIG_KEY_1=user.email` — and carries **no** `GIT_AUTHOR_*` or `GIT_COMMITTER_*` variable. Assert absence as well as presence; a leftover `GIT_AUTHOR_*` would silently win over the config in some git versions.
+115. A repo with no `[identity]` exports **no** `GIT_CONFIG_*` at all, and the commit falls back to git's own configured user.
+116. `user.name`/`user.email` via `GIT_CONFIG_*` apply to `commit --amend` and to a tag created by the agent — assert the amending commit carries the identity, which is the concrete advantage over `GIT_AUTHOR_*`.
 
 **Named credentials, no `provider`**
-119. A repo with **no** `[auth]` table takes the `Machine` path: plain `git push`, no extraheader, and `GH_TOKEN`/`GITHUB_TOKEN`/`gh auth token` consulted in that order if git needs help.
-120. `[auth] https = "env:CI_GH_TOKEN"]` resolves **only** that variable. Setting `GH_TOKEN` to a *different* value must not change which credential is used — the reference is precise, and that is the property a per-repo fleet run depends on.
-121. A `token = "ghp_…"` key in `[auth]` is a `deny_unknown_fields` error, as is a `provider` key — the old name is not silently accepted, because a config that parses and is ignored is the failure this plan has been eliminating all along.
-122. `https` and `ssh` both present is a validation error, not a precedence rule. Two credentials is an unstated choice, and ro should ask rather than pick.
-123. An `env:` reference naming a variable that is **not set** fails that repo with a message naming the variable. It does not fall through to `GH_TOKEN`.
+117. A repo with **no** `[auth]` table takes the `Machine` path: plain `git push`, no extraheader, and `GH_TOKEN`/`GITHUB_TOKEN`/`gh auth token` consulted in that order if git needs help.
+118. `[auth] https = "env:CI_GH_TOKEN"]` resolves **only** that variable. Setting `GH_TOKEN` to a *different* value must not change which credential is used — the reference is precise, and that is the property a per-repo fleet run depends on.
+119. A `token = "ghp_…"` key in `[auth]` is a `deny_unknown_fields` error, as is a `provider` key — the old name is not silently accepted, because a config that parses and is ignored is the failure this plan has been eliminating all along.
+120. `https` and `ssh` both present is a validation error, not a precedence rule. Two credentials is an unstated choice, and ro should ask rather than pick.
+121. An `env:` reference naming a variable that is **not set** fails that repo with a message naming the variable. It does not fall through to `GH_TOKEN`.
 **Config edits — `toml_edit` and path resolution**
-124. `ro config set` on a config with a hand-written comment: the comment and the unmodelled key both survive (the `toml_edit` guarantee).
-125. `ro --config-dir <D>` **alone** is honoured — the `resolve_paths` tuple-match regression.
+122. `ro config set` on a config with a hand-written comment: the comment and the unmodelled key both survive (the `toml_edit` guarantee).
+123. `ro --config-dir <D>` **alone** is honoured — the `resolve_paths` tuple-match regression.
 
 **Run history and output**
-126. After a checkpoint, `ro run list` shows a row, `ro run show <id>` shows the exit code, and `ro run timeline <id>` has one event per repo outcome. All three tables are populated by zero production code paths today.
-127. After a `ro sync`, `ro status`'s `last_synced_at` is no longer NULL — the FK regression.
-128. Every line of `--format ndjson` has a non-null `ts` — the old production path emitted `"ts": null` on every line.
-129. `--format ndjson` and `-j 4` produce the same **event ordering** as `-j 1` for the same fleet (determinism).
-130. No `.ro.lock` appears in `git status --porcelain` after a run, and every repo reads as clean afterwards.
+124. After a checkpoint, `ro run list` shows a row, `ro run show <id>` shows the exit code, and `ro run timeline <id>` has one event per repo outcome. All three tables are populated by zero production code paths today.
+125. After a `ro sync`, `ro list`'s `last_synced_at` is no longer NULL — the FK regression.
+126. Every line of `--format ndjson` has a non-null `ts` — the old production path emitted `"ts": null` on every line.
+127. `--format ndjson` and `-j 4` produce the same **event ordering** as `-j 1` for the same fleet (determinism).
+128. No `.ro.lock` appears in `git status --porcelain` after a run, and every repo reads as clean afterwards.
 
 **Engine and timeout**
-131. A missing engine binary yields a per-repo `Unavailable` naming the binary; the other repos still commit; exit 1.
-132. An engine that hangs is killed at the timeout and reported as `TimedOut`, not `Failed`, and the fleet completes.
-133. A non-zero exit from the agent is classified into the shared `FailureClass` (one taxonomy, not two).
+129. A missing engine binary yields a per-repo `Unavailable` naming the binary; the other repos still commit; exit 1.
+130. An engine that hangs is killed at the timeout and reported as `TimedOut`, not `Failed`, and the fleet completes.
+131. A non-zero exit from the agent is classified into the shared `FailureClass` (one taxonomy, not two).
+
+**The registry is the only per-repo config layer**
+132. `ro add .` with no overrides writes a row with `credential_ref IS NULL` and `engine IS NULL`, and that row pushes with the global credential and the global engine. Assert both.
+133. `ro config set repos.cass.engine = codex` then `ro list` shows `codex` for cass and `claude` for every other repo. Per-repo engine overrides global, nothing else is affected.
+134. **A pasted token is rejected at write time.** `ro add . --credential ghp_realtoken` fails with a message naming the accepted forms (`env:VAR`, `keychain:name`). The value must never reach `state.db`, because `state.db` is backed up, synced, and pasted into issues.
+135. `credential_ref = 'keychain:gh-personal'` and `credential_ref = 'env:GH_PERSONAL'` side by side in one registry resolve to two different accounts in one `ro sync --execute` run. This is the whole per-repo-credential feature in one test.
+136. **V5 is idempotent.** Open a database, apply V4 then V5, then run `ro` again. `ALTER TABLE … ADD COLUMN` is not idempotent in SQLite, so a second run must not fail with "duplicate column name". Assert the second open succeeds.
+137. **V5 applied to a pre-V5 database that already has rows** leaves every existing row with `credential_ref IS NULL` — i.e. every existing repo keeps the global credential, which is the correct back-compat behaviour and not merely the absence of a migration.
+138. A `SELECT` that enumerated `repos` columns before V5 does not silently return nulls for the new columns. `manage::add` inserts a fixed column list (`migrate.rs:331,337`) and `manage::list` selects a `REPO_COLUMNS` constant; both are updated in the same commit, and this test fails if one is missed.
+
+**`ro doctor` write access**
+139. A registry row whose credential authenticates but has **no write permission** on that remote is reported as `write: NO` with the account name, and `ro sync --execute` on that row fails with the same information *before* any push is attempted. This is the exact state this repository was in when the plan was written, and it is the check that turns a 403 discovered after four repos were pushed into a warning discovered before any were.
+140. A valid credential reports `write: yes` and the probe does **not** push anything — it reads the remote's permission, it does not mutate it. Assert the fake remote saw zero writes.
+141. An unresolvable credential is reported distinctly from a resolved-but-forbidden one. They look identical to a user — the push does not work — and they have completely different fixes.
+142. `ro doctor` on a registry with one broken remote exits non-zero and still prints the healthy rows. A doctor that stops at the first failure tells the user one thing when there are three.
 
 ### Platform-specific
 
@@ -1870,7 +1856,7 @@ CI runs a 3-OS matrix and the two red tests today are Windows-only, so the Windo
 
 **Identity and transport leakage is today's unguarded default, not a future risk.** `mutation::push` is a bare `git push` using whatever SSH key or credential manager the repo already has — no token injection, no login check, no email check, no `gh` path. Worse, `AuthToken` derives `Debug`, so `{:?}` prints the raw token and `redact()` is opt-in and manual. Fix the manual `Debug` **before** tokens start flowing into child processes and argv.
 
-**Silent config failure, and the plan's own back-compat hazard.** No struct in `ro-config` carries `deny_unknown_fields`, so a typo'd or half-implemented `ro.local.toml` parses cleanly, does nothing, and `ro doctor` reports "config valid". Adding `deny_unknown_fields` to `AppConfig` would make every existing config unloadable — that omission is deliberate and must be commented, or the next person will "fix" it. And renaming `[providers]` to the fixed `[engine_*]` slots is the plan introducing a fresh instance of the risk it flags; the compat shim in Phase 2 is not optional polish, it is the difference between "your engine config silently vanished" and "nothing happened".
+**Silent config failure, and the plan's own back-compat hazard.** No struct in `ro-config` carries `deny_unknown_fields`, so a typo'd or half-implemented `.ro/config.local.toml` parses cleanly, does nothing, and `ro doctor` reports "config valid". Adding `deny_unknown_fields` to `AppConfig` would make every existing config unloadable — that omission is deliberate and must be commented, or the next person will "fix" it. And renaming `[providers]` to the fixed `[engine_*]` slots is the plan introducing a fresh instance of the risk it flags; the compat shim in Phase 2 is not optional polish, it is the difference between "your engine config silently vanished" and "nothing happened".
 
 **The SQLite concurrency shape is load-bearing, not a detail.** `rusqlite::Connection` is `!Sync`. A design that shares one connection across `std::thread::scope` workers does not compile. The coordinator-owns-the-connection shape in §6.5 is what makes `-j` possible at all; anyone who "cleans up" by moving `append_event` into the worker loop reintroduces E0277 or, worse, a second writer.
 
@@ -1880,11 +1866,11 @@ CI runs a 3-OS matrix and the two red tests today are Windows-only, so the Windo
 
 **Agent subprocesses are untrusted and unbounded.** `claude` and `codex` are long-running children with arbitrary write access to the worktree. No sandbox, no cancellation, and today no timeout anywhere. A hung or runaway engine stalls or corrupts a fleet run. Mitigation is a hard per-engine timeout that kills the child tree, the fixed `RepoLock`, and a dry-run that never dispatches an engine at all.
 
-**Archived and disabled repos would be checkpointed.** `manage::list` is `SELECT {REPO_COLUMNS} FROM repos ORDER BY owner, name` (`manage.rs:208`) with no `WHERE` on `archived` or `disabled` — both columns exist in the schema — and `resolve_multi_repo_targets` calls `manage::list(conn, None)`. Without the filter, `ro checkpoint --all` would commit and push repos the user explicitly disabled. The single most consequential fleet-correctness gap, and the easiest to ship broken because the happy path looks fine.
+**Archived and disabled repos would be checkpointed.** `manage::list` is `SELECT {REPO_COLUMNS} FROM repos ORDER BY owner, name` (`manage.rs:208`) with no `WHERE` on `archived` or `disabled` — both columns exist in the schema — and `resolve_multi_repo_targets` calls `manage::list(conn, None)`. Without the filter, `ro sync --all` would commit and push repos the user explicitly disabled. The single most consequential fleet-correctness gap, and the easiest to ship broken because the happy path looks fine.
 
-**PR spam.** Twenty dirty repos, twenty draft PRs, re-run every few hours, is how you get a PR tab nobody reads. Mitigations: the duplicate-PR rule reuses rather than re-opens, WIP PRs are always draft, and `ro repos prune` should grow a WIP-branch sweep. Consider a deterministic branch name that encodes the run id so a stale PR is traceable to the run that made it.
+**The real spam risk is force-push, not pull requests.** With PRs cut, the thing that can annoy other people at 2am is `ro push` rewriting a shared branch. The mitigations are the ones the design already has: `--force-with-lease` rather than `--force`, never both, and the rebase running *before* the commit so the common case is a plain fast-forward that rewrites nothing. What remains worth watching is a fleet run that force-pushes twenty branches in one invocation — which is why `--yes` (auto-answer the rebase prompt) is documented as mechanical-only and does not imply `--resolve`.
 
-**Engine availability is now a runtime dependency.** If neither `claude` nor `codex` is installed, `ro checkpoint` degrades to something strictly worse than `git commit -a` — it cannot split commits, and the vision is explicit that the agent engines are the whole reason it exists. Make the degradation loud and visible in the summary, not a silent per-repo skip.
+**Engine availability is now a runtime dependency.** If neither `claude` nor `codex` is installed, `ro sync` degrades to something strictly worse than `git commit -a` — it cannot split commits, and the vision is explicit that the agent engines are the whole reason it exists. Make the degradation loud and visible in the summary, not a silent per-repo skip.
 
 **Exit-code redefinition breaks scripts, and so does the alias removal.** `2` currently means "clap usage error"; after this change it means "all repos failed". And `ro add` / `ro list` / `ro remove` / `ro prune` are the most-used commands in the tool and all break at the regroup. Both need release notes; the regroup is the larger break and is currently the quieter one.
 
@@ -1893,10 +1879,10 @@ CI runs a 3-OS matrix and the two red tests today are Windows-only, so the Windo
 1. **TUI — now or never?** The vision says flags are the source of truth and any TUI is a frontend over them. **Recommendation: never.** The pain point is a fire drill under time pressure; a TUI is slower than a command. Revisit only past ~50 repos.
 2. **`ro repos prune` — how much survives?** The keep-set does not include prune. `--archived` and `--missing` are pure database bookkeeping with no disk deletion and earn their place. The orphan half — `OrphanAction::{Report,Archive,Delete}`, `find_orphans`, `handle_orphans`, the archive-to-`<state_dir>/archived/<name>_<timestamp>` writer — is ~300 of `prune.rs`'s 508 lines and is the code with the data-loss bug. **Recommendation: keep `--archived`/`--missing`, gate `--orphans` behind its own flag, and drop `--delete` permanently.** If you disagree, the minimum is that `--delete` stays last, behind its own flag and an explicit confirmation.
 3. **How strict should the identity guard be?** (a) never check unless `expected_login` is set — zero friction, zero protection; (b) check when set, warn loudly on every push when unset; (c) require an identity for every push. **Recommendation: (b).** Silent is the one option that must not ship.
-4. **WIP branch naming and PR metadata.** `ro/wip/<slug>`? `ro/wip/<owner>-<branch>-<run-id-prefix>`? The run id makes a stale PR traceable to the run that made it, which is worth something in a 20-repo fleet. Pick a convention before the first WIP branch exists; retrofitting across existing branches is unpleasant. *(The "configurable template" question is closed: fixed naming + the run id, no template.)*
+4. ~~**WIP branch naming and PR metadata.**~~ **Moot — removed with pull requests.** ro does not create branches at all: `ro push` pushes the branch you are on, and a protected branch is a refusal with a one-line fix. Nothing to name, nothing to template, and no `run id` to thread into a PR body.
 5. **Should checkpoint ever clone a missing repo?** **Recommendation: never in v1.** `ro sync --clone-only` over an explicit repo list is the deliberate tool, with its own confirmation. Pulling a full repository over the network mid-transaction because of a path typo is not a failure mode a commit tool should have.
 6. **Where does `ro run` history live?** SQLite is already there, already migrated, and `delete_repo_cascade` already assumes one writer. **Recommendation: keep SQLite.** A per-run JSONL under `<state_dir>/runs/` is simpler and matches "no daemon", but it forks the audit surface for no gain.
-7. **Should `ro status` and `ro checkpoint` share a scan?** Both walk the fleet reading branch/dirty/ahead-behind. A `ro_sync::targets::scan` shared by both — and later by `ro sync` — removes real duplication. The section-3/5 half of the plan should decide this once `targets.rs` exists; doing it in Phase 5 is cheap, doing it later is not.
+7. **Should `ro list` and `ro sync` share a scan?** Both walk the fleet reading branch/dirty/ahead-behind. A `ro_sync::targets::scan` shared by both — and later by `ro sync` — removes real duplication. The section-3/5 half of the plan should decide this once `targets.rs` exists; doing it in Phase 5 is cheap, doing it later is not.
 8. **`--message` semantics with an agent engine.** Replace the engine's message entirely (single commit) or treat it as a hint? **Recommendation: replace.** A supplied message means the developer already knows what they want; otherwise omit the flag and let the engine read the diff. This also makes `--message` the only thing that forces a single commit, which is easy to document.
 9. **The `ms` mandate in `AGENTS.md` is unsatisfiable on this machine.** `which ms` returns not-found. The mandatory `ms route` / `ms load` / `ms feedback` protocol cannot be executed, and the `ms feedback` step is silently skipped by every agent that works here. Either install `ms` or drop the mandate; meanwhile the file is training agents to ignore a mandatory instruction.
 10. **`ffs grep --limit 0` does not mean unlimited** — it returns zero results and reports no matches. Any reference sweep run with `--limit 0` produces a confidently wrong "zero callers" report. Always pass an explicit large `--limit`.
@@ -1914,7 +1900,7 @@ The git mutation layer stays synchronous; no runtime is introduced for it, and o
 
 **Settled in the second review round (2026-09-25), added here so they do not come back:**
 
-- **`ro.local.toml` sits at the repo root as one bare file. No `.ro/` dotfolder.** This reverses an earlier suggestion in the same conversation; the original reasoning still holds — ro has exactly one per-repo config file, and a dotfolder holding one file is a dotfolder that exists to be justified. `.gitignore` gains a single `ro.local.toml` line.
+- **The per-repo override file is `.ro/config.local.toml`, and the directory is `.ro/`.** It was argued in three directions during review — `.ro/ro.local.toml`, then a bare `ro.local.toml` at the root, then none at all — and the settled answer is the middle shape with the directory. A dotfolder for one file is justified by the gitignore, not by tidiness: a bare filename entry is correct until ro adds a second thing to that directory, and `.ro/` is correct from the first commit. The file holds **no** `name`, `branch`, `default_branch`, `remote`, or `owner`/`repo`: git answers all of those, and each duplicate is a field that goes stale on a rename.
 - **The health score is a filter, not a display.** The scorer, the `repo_health_snapshots` table, and `--filter health:<N>` all survive; `ro health`, the 0-100 render, and the class table all die. This reverses the earlier "cut health entirely" position in this document. The only V4 table drop is `plans`.
 - **`ro init` has three modes** — global bootstrap / onboard-the-current-repo / onboard-a-workspace — disambiguated by argv and cwd, never by an implicit directory walk. It stays dumb about engines (no PATH scan, no questions, ~1s) and is competent about repos.
 - **`ro init` and `ro repos add` do not overlap.** `init` = a repo you already have, on disk, in front of you. `add` = a repo you want, cloned and registered, all-or-nothing. This removes "tracked but not cloned" as a state the rest of the system has to tolerate.
@@ -1926,35 +1912,35 @@ The git mutation layer stays synchronous; no runtime is introduced for it, and o
 - **The Windows forward-slash path is a live bug in `RepoSpec::parse`, and it is fixed in `ro-core`, not in the handler.** `ro repos add C:/work/backend` currently parses as `owner="C:"`, `name="work/backend"`, and inserts a row for an owner that does not exist, with a clone URL of `https://github.com/C:/work/backend.git`. Reject drive-letter owners and any backslash, so every caller inherits the fix.
 - **`ro repos doctor` exists and is read-only, with no `--fix`.** It consolidates three ad-hoc partial answers (the `status_repo` `.git` guard, the checkpoint `NotCloned` reason, `prune --missing`) into one command. Every remedy it could apply is destructive or opinionated, so it reports and the user acts. It is **not** folded into `ro status`: different question, different cadence.
 - **`tag` ships as `tag` / `untag` / `tags`.** A table with a writer and no remover forces hand-editing SQLite, which is how people abandon tools. `INSERT OR IGNORE` and a no-op `untag` both exit 0 — "make it so" is idempotent and errors would make shell loops awkward. This was the only writer in the plan missing its remover; the audit that produced that conclusion is: for every table the plan writes, name the verb that shrinks it.
-- **`allow_fallback` is global-only.** `provider`, `expected_login`, and `author_email` stay per-repo; the fallback posture does not, because one fleet run holding two safety policies is the state in which an identity leak cannot be reconstructed afterwards. The per-run `--allow-fallback` flag is the only override. A stale key in someone's `ro.local.toml` errors under `deny_unknown_fields` and names the right file.
+- **`allow_fallback` is global-only.** `provider`, `expected_login`, and `author_email` stay per-repo; the fallback posture does not, because one fleet run holding two safety policies is the state in which an identity leak cannot be reconstructed afterwards. The per-run `--allow-fallback` flag is the only override. A stale key in someone's `.ro/config.local.toml` errors under `deny_unknown_fields` and names the right file.
 - **`ro run prune --keep <N>` exists, retention is never automatic, and `--keep` is required.** No default, no time-based expiry, no size cap. An automatic policy eventually deletes the run that explains a bad push, and that failure is silent. Deleting rows is unrelated to `V4_DROP_PLANS`.
 - **The five phases are the five PRs.** §2's `1`, `1a`…`1j` are checklist items inside PR 1, not separate units. PR 4 and PR 5 must not be merged: PR 4 leaves the tool without a fleet-commit command, which is unusable but honest, and merging them buries the atomic sweep cut — the riskiest deletion in the series — inside a large diff.
 
 **Settled in the fourth review round (2026-09-25):**
 
-- **`ro sync` pulls, `ro checkpoint` pushes. They do not merge.** This was asked twice and answered twice, including once after a message that proposed the opposite — so it is recorded here to stop it coming back a third time. `ro sync` reconciling the working copy with the remote is an established, safe, reversible meaning. Overloading that verb with commit+push means a user who types it out of pull habit **pushes**. `ro checkpoint` is the push verb; the name is longer and the safety is worth the keystrokes.
+- **`ro sync` pulls, `ro sync` pushes. They do not merge.** This was asked twice and answered twice, including once after a message that proposed the opposite — so it is recorded here to stop it coming back a third time. `ro sync` reconciling the working copy with the remote is an established, safe, reversible meaning. Overloading that verb with commit+push means a user who types it out of pull habit **pushes**. `ro sync` is the push verb; the name is longer and the safety is worth the keystrokes.
 - **No daemon, no watch, no `watch:` config block.** Cut twice, stays cut. See the "What we are NOT doing" entry for why the ordering matters as much as the decision.
 - **No workspace entity and no group concept.** Selection is a flat set of positionals plus `--all`; `repo_tags` is the one filtering mechanism. A "group" is a tag with a different word in front of it, and two mechanisms for one selection means two answers to "which repos does this run touch?".
 - **No `ro clone`.** `ro repos add` clones and registers. One act, one verb.
 - **Per-repo identity is real and applied, not just guarded.** `[identity] name/email` is set on the commit invocation via `git -c user.name=… -c user.email=…`, so nothing is written to `.git/config` and two repos can commit as two different people in one run. This is the single largest scope addition of this round: before it, the tool managed many repos but could not give them different identities, which is most of why the daily loop still needed a terminal.
 - **`identity` and `expected_login` are different fields for different jobs.** The first is the commit author, which ro controls and therefore cannot get wrong. The second is the pushing account, which ro does not control and therefore must guard. Merging them produces a design where fixing your author silently starts author-guarding your push.
 - **Credentials are references, never secrets.** `credential = "keychain:<name>"` or `credential = "env:<VAR>"`, resolved into a `SecretString` whose `Debug` renders `***`. A plaintext `token =` in a per-repo config is an **error**, not a convenience. `keyring` is the one new runtime dependency, behind a default-on feature with an `env`-only fallback so CI and minimal builds still work.
-- **`ro pr` and `ro conflict` are both in v1, and `ro conflict` is the resolve assistant rather than a detector.** The daily loop is status → checkpoint → occasionally pr → occasionally conflict; cutting either of the last two leaves a hole the user falls back to a terminal for. `ro conflict` gains `<REPO>` and `--continue`; it does not become a separate `ro resolve` verb, and it never loops over a fleet.
-- **Repo selection is positional everywhere, through one shared resolver.** `ro checkpoint cass voice-ai-agent`, not `--repo cass --repo voice-ai-agent`. One resolver, so `ro status`, `ro sync`, and `ro checkpoint` cannot disagree about what a name means.
+- **PRs are a step inside `ro push`; `ro pr` is not a verb.** It was proposed three times and dropped three times. The capability is not cut — duplicate detection, base-branch resolution, draft by default, per-repo credential — all of it lives in `ro push` and the helpers it calls. What is gone is the second entry point, for the reason the rest of the surface uses: one verb that pushes, one code path that talks to GitHub, no drift.
+- **Repo selection is positional everywhere, through one shared resolver.** `ro sync cass voice-ai-agent`, not `--repo cass --repo voice-ai-agent`. One resolver, so `ro status`, `ro sync`, and `ro sync` cannot disagree about what a name means.
 - **The crate layout ends at five modules.** Registry, Git, Agent, Auth, GitHub — from twelve. `ro-jobs` folds into Registry, `ro-config` becomes a Registry module, `ro-github` reduces to the one function `ro doctor` calls, and PR creation shells out to `gh` instead of octocrab. Done as renames-and-moves inside PR 2 and PR 3, never as a standalone structural PR that touches no behaviour.
 - **"No AI commit-message writing" was a misleading bullet and is rewritten.** The engines *do* write the commit messages — that is the flagship behaviour. What is deleted is ro's own deterministic bucketing, which existed to split commits *without* a model. The boundary is ro transacts and configures, the engine reasons.
 
 **Settled in the fifth review round (2026-09-25):**
 
 - **The engine commits; `ro` pushes. The engine must never push.** Asked three times across the review and answered the same way each time, because it is the load-bearing boundary of the entire auth design. An engine that pushes makes `extraheader`, `expected_login`, `SecretString`, per-repo identity, and the no-fallback rule all advisory — advice given to a subprocess that is free to ignore it. The built-in prompt therefore ends at "write the commits" and explicitly says *do not push*. The earlier draft of this document left the boundary unstated, which is how a prompt ending in "and then push" looked reasonable; that ambiguity is now closed and has a dedicated test.
-- **The verb stays `ro checkpoint`.** `ship` (twice) and `commit` (once) were both proposed. `commit` is wrong for the default engine, which produces *several* commits; `ship` reads closer to deploy than to "save WIP". Settled, and recorded so it stops being re-proposed.
-- **Bare `ro` is `ro checkpoint` on the current repo, and it is safe because it inherits `--dry-run`.** The most common action in the tool's life should not require remembering a subcommand, and the default it picks is read-only. No commit, no push, no agent process. A magic default is worth exactly one invocation, and this one cannot write anything.
+- **The verb stays `ro sync`.** `ship` (twice) and `commit` (once) were both proposed. `commit` is wrong for the default engine, which produces *several* commits; `ship` reads closer to deploy than to "save WIP". Settled, and recorded so it stops being re-proposed.
+- **Bare `ro` is `ro sync` on the current repo, and it is safe because it inherits `--dry-run`.** The most common action in the tool's life should not require remembering a subcommand, and the default it picks is read-only. No commit, no push, no agent process. A magic default is worth exactly one invocation, and this one cannot write anything.
 - **cwd is the no-argument case, not the interface — and neither is a parent-folder scan.** A proposal to make `ro sync` mean "scan parent folders for `.git`, commit, push" was declined twice. The verb was already settled (`sync` pulls, `checkpoint` pushes), and more importantly the scan makes the set of repos ro will **push with your credential** depend on where you happen to be standing. A directory scan that reaches one repo too far is a disclosure, not a bug. Bare `ro` outside a repo gives the same one-word multi-repo ergonomics scoped to the inventory, which is opt-in by construction.
-- **`ro pr` resolves the default branch from `git symbolic-ref` and `gh repo view` only — the `repos.default_branch` column is dropped in V4 and `--default-branch` is gone.** Two earlier revisions had this wrong twice: first preferring the column over git, then keeping it as a fallback. A cache of a branch name is a field that goes stale on a rename, and two live sources answer the question better than any cache can. This also removes the last reason `ro.local.toml` would ever need a `default_branch` key.
-- **Dropping `default_branch` carries a failure mode the table drops do not.** It is a column with live readers in hand-written SQL, and a fresh test database has it absent, so a stale `SELECT` compiles, the suite passes, and every existing user's `ro pr` breaks at runtime. The V4 checklist therefore requires grepping the name before migrating, and test #95 runs `ro pr` against a **pre-V4 database** — the only test that can catch it.
-- **`ro.local.toml` contains no `name`, no `branch`, no `default_branch`, no `remote`, no `owner`/`repo`.** Not a simplification for its own sake: the file lives at the root of the repo it describes, and each of those fields duplicates something git already knows and would eventually disagree with disk on. The file describes *how this repo behaves*, never *what it is*.
+- **The PR base is resolved from `git symbolic-ref` and `gh repo view` only — the `repos.default_branch` column is dropped in V4 and there is no `--default-branch` flag.** Two earlier revisions had this wrong twice: first preferring the column over git, then keeping it as a fallback. A cache of a branch name is a field that goes stale on a rename, and two live sources answer the question better than any cache can.
+- **Dropping `default_branch` carries a failure mode the table drops do not.** It is a column with live readers in hand-written SQL, and a fresh test database has it absent, so a stale `SELECT` compiles, the suite passes, and every existing user's `ro pr` breaks at runtime. The V4 checklist therefore requires grepping the name before migrating, and test #93 runs `ro pr` against a **pre-V4 database** — the only test that can catch it.
+- **`.ro/config.local.toml` contains no `name`, no `branch`, no `default_branch`, no `remote`, no `owner`/`repo`.** Not a simplification for its own sake: the file lives at the root of the repo it describes, and each of those fields duplicates something git already knows and would eventually disagree with disk on. The file describes *how this repo behaves*, never *what it is*.
 - **`[agent] command` and `[agent] prompt` are configurable, and that is the answer to "how do I add Gemini".** Two strings, not a plugin registry. The fixed three-entry `EngineKind` remains only to pick the behaviour profile — timeout, output parsing, availability probe. `{prompt}` is substituted as a single argv element and never through a shell, because the prompt is built from diff text.
-- **`ro pr` prints a result; it does not open a browser.** Portability (three different launch commands, three different failure modes) and the fact that a URL on screen is already clickable.
+- **The PR step prints a result; it does not open a browser.** Portability (three different launch commands, three different failure modes) and the fact that a URL on screen is already clickable.
 
 **Settled in the sixth review round (2026-09-25):**
 
@@ -1964,5 +1950,22 @@ The git mutation layer stays synchronous; no runtime is introduced for it, and o
 - **No remote rewrite, therefore nothing to restore.** `git remote set-url` to a credential-bearing URL, push, then restore is a design with a second thing that can fail, needs a `finally`, can be killed between its halves, and puts a credential in an on-disk file for the duration. `git -c http.https://github.com/.extraheader=…` is per-invocation and writes nothing: there is no window in which a token exists on disk, and therefore no restore to forget. A run killed between commit and push leaves a clean local state and a token that only ever existed in memory.
 - **Rebase mechanically first; call the agent only on a real conflict.** A rejected push is overwhelmingly a stale branch, not a semantic conflict, and `fetch → rebase → push --force-with-lease` is three git commands that need no model. `--resolve` is off by default and is the only step where a model edits files mid-rebase. The second dispatch gets a different prompt and the same stripped environment, and the engine still does not run `rebase --continue` or push — the rule does not relax because the situation got harder.
 - **The rebase happens BEFORE the engine, not after a rejected push.** This is a better ordering than the plan originally had, and it is worth stating why: rebasing a dirty worktree with `--autostash` puts the tree on top of the remote's base *before* anything is committed, so the single commit the engine makes is a fast-forward and **the happy path never force-pushes at all**. The old order (commit → push → rejected → rebase → force-push) rewrites the branch and needs a lease, and a force-push across a fleet is the one operation here that can destroy someone else's work. A failed `--autostash` pop is a per-repo failure with a named recovery command, never a proceed-on-a-half-popped-tree.
-- **`[pr] enabled` is not added.** `[agent] mode = "wip" | "direct" | "off"` already answers "does a checkpoint open a PR", and `ro pr` already has `--draft` / `--ready`. A third place to look for the same decision is how `ro` ends up with two answers to it.
+- **No pull requests in V1.** Proposed and cut three times. A PR is a request for someone else's attention on a branch meant to last; this tool's premise is *I am in a hurry across twenty repos and need this off my machine*. It took four things with it — `gh pr create`/`gh pr list`, the `ro/wip/*` branch, six PR flags, and `gh` as a push-path dependency — and the surviving code is smaller and has one fewer external tool in its critical path. The rebase base survives, because the rebase needs one.
 - **`--force-with-lease`, never `--force`.** A tool that runs unattended across a fleet is exactly where a bare force-push turns "my branch moved while I rebased" into someone else's lost work.
+- **`--force-with-lease`, never `--force`.** A tool that runs unattended across a fleet is exactly where a bare force-push turns "my branch moved while I rebased" into someone else's lost work.
+
+---
+
+**Settled in the final round — this supersedes several entries above, which are kept because the reasoning is still worth reading.**
+
+- **Eleven commands in three tiers, and three of them are the daily loop.** `add` · `sync` · `commit` · `push`, then `list` · `status` · `remove` · `doctor`, then `init` · `config` · `schema`. The core/mangement split is the real structure and the count was never the point — an earlier revision said "five" beside a tree that listed eight.
+- **`ro sync` / `ro commit` / `ro push` are three verbs, and the names finally match their meaning.** `ro sync` pulling was a genuine migration hazard: it is the verb people type expecting a pull, and the tool was using it to commit and push. Splitting them also makes the three stages independently scriptable, which is what a CI job or a `ru` user expects. The cost is real and recorded: a commit made at 10h and pushed at 12h, after the remote moved, necessarily rewrites history, so **`--force-with-lease` is the ceiling and `--force` never happens**.
+- **`ro sync` takes the whole registry with no argument.** This is the daily invocation and it is what removes the `cd && ro ship` loop outright. `--all` exists for scripts, not for humans.
+- **`.ro/config.local.toml` is back, under a `.ro/` directory, and it outranks the registry.** This supersedes the entry above, which was correct when written and is not correct now. A `.ro/` dotfolder holding one file is still unjustifiable and stays gone. What changed is the argument: the registry is the right *default* — it already stores the repo path, remote, engine and identity — but it cannot cover a repo you did not register through ro, a colleague’s clone, or a setting that must travel with the code to a machine that is not yours. That is what the file is for. One bare file, gitignored, every key optional, a partial overlay, and **the file wins** when both sources set the same key — with `ro doctor` reporting the disagreement rather than letting it be silent.
+- **Per-repo config is columns on `repos`, added in V5** — `credential_ref`, `engine`, `engine_args`. `credential_ref` is validated to parse as `<scheme>:<name>`, so a pasted `ghp_…` is a loud error at `ro add` time rather than a live credential sitting in `state.db` forever. `state.db` is backed up, synced, and pasted into issues; the reasoning that rules out plaintext tokens in TOML rules them out in SQLite with more force.
+- **The registry is SQLite, not `repos.json`.** The obvious objection to a five-command tool is that it does not need a database. It does: `runs`, `run_events`, `repo_health_snapshots` and `repo_tags` are relational, and a JSON array cannot hold them or cascade a delete across them without reimplementing a database in a config file.
+- **No `ro repos` namespace (reverted — see §3).** The regroup broke the four most-used verbs in the tool to disambiguate a set that, across eleven commands in three tiers, it contains nothing ambiguous.
+- **No audit trail, and that is a real cost.** No `ro run`, no database history. *"What did ro push last Tuesday, with which account"* is unanswerable from the tool. The V1 mitigation is a per-repo summary line on stdout naming repo, branch, engine, and the account the credential resolved to — because a database nobody queries is not an audit trail. **This is the first thing to add back**, and the tables are already there.
+- **`ro doctor` checks write access per remote, not token presence.** Checking that *a* token exists is the check that lets a wrong-account situation through. The check that prevents a failed run is whether *this repo's credential* can write to *this repo's remote* — a token with `repo` scope and no write access on one repository is an ordinary state. It is the state this repository was in when this plan was written: `qdang46` authenticated, `quangdang46/repo_orchestrator` remote, `push: false`, discovered only at the push step as a 403.
+- **Cut entirely: `tag`/`untag`/`tags`, `ro repos scan`, `ro repos prune`, `ro run prune`, `ro repos update` as a verb, standalone `ro pr`, standalone `ro conflict`.** The tag cut is the one that costs something: `repo_tags` has no writer and no reader today, and shipping a writer without a remover would have produced a table that could grow but never shrink. A feature with no consumer is the right thing to cut; if filtering by a saved set is wanted it returns as one column and one flag.
+- **Kept, and still load-bearing: the engine-does-not-push boundary.** Every identity guarantee depends on it. The engine reads the diff, groups the work, writes the commits, and resolves conflicts; ro fetches, rebases, pushes, and opens the PR with the credential it resolved. The engine's environment is assembled **by subtraction** — `GH_TOKEN` / `GITHUB_TOKEN` removed from the parent env — and the removal is unconditional, so a user who exports `GH_TOKEN` for `gh` does not silently hand it to every engine ro spawns.
