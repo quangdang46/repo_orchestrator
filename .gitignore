@@ -22,3 +22,5 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+# br doctor per-run artifacts
+.doctor/
