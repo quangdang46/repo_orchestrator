@@ -283,15 +283,23 @@ pub fn find_repo(conn: &Connection, key: &str) -> Result<TrackedRepo> {
     bail!("repo '{key}' not found")
 }
 
+/// Build the on-disk path a repo will occupy.
+///
+/// Uses `PathBuf::join` rather than `format!("{}/{}/{}")` so the stored
+/// string carries the platform's own separator. The old `format!` wrote
+/// forward slashes on Windows while `collect_git_dirs` produced
+/// backslashes, and the two were compared as raw strings — so on Windows
+/// *every* tracked repo was reported as an orphan.
+///
+/// Note this only fixes rows written from now on. `find_orphans`
+/// canonicalizes before comparing, which is what rescues the forward-slash
+/// rows already sitting in existing `state.db` files. Both halves are
+/// required; either alone leaves users with a wrong orphan list.
 fn resolve_local_path(projects_dir: &Path, spec: &RepoSpec) -> String {
-    ro_config::paths::expand_tilde(&format!(
-        "{}/{}/{}",
-        projects_dir.display(),
-        spec.owner,
-        spec.name
-    ))
-    .to_string_lossy()
-    .into_owned()
+    let joined = projects_dir.join(&spec.owner).join(&spec.name);
+    ro_config::paths::expand_tilde(&joined.to_string_lossy())
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn now_secs() -> i64 {

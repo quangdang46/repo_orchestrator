@@ -24,12 +24,25 @@ pub fn fetch_import_specs(
     user: Option<&str>,
     limit: Option<usize>,
 ) -> Result<Vec<String>> {
+    // Validate the arguments *before* doing anything expensive. The old code
+    // built the Octocrab client and only then discovered, inside the async
+    // block, that no source had been named at all.
+    if !stars && org.is_none() && user.is_none() {
+        anyhow::bail!("no import source specified");
+    }
+
     let token = crate::auth::discover_token("auto", None)
         .context("GitHub token required for import — set GITHUB_TOKEN or run `gh auth login`")?;
-    let client = crate::auth::build_client(&token, None)?;
 
     let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+
+    // The client MUST be constructed inside the runtime. `Octocrab::builder()
+    // .build()` panics with "there is no reactor running" when called
+    // outside one, which made `ro import --stars` crash on any machine where
+    // a token was discoverable. It passed CI only because `gh` is absent
+    // there, so the test never entered this path with a live token.
     rt.block_on(async {
+        let client = crate::auth::build_client(&token, None)?;
         if stars {
             fetch_stars(&client, limit).await
         } else if let Some(o) = org {
@@ -37,6 +50,7 @@ pub fn fetch_import_specs(
         } else if let Some(u) = user {
             fetch_user(&client, u, limit).await
         } else {
+            // Unreachable: guarded above. Kept so the chain stays total.
             anyhow::bail!("no import source specified")
         }
     })
@@ -154,5 +168,35 @@ mod tests {
     fn fetch_without_source_errors() {
         let result = fetch_import_specs(false, None, None, None);
         assert!(result.is_err());
+    }
+
+    /// The regression that mattered.
+    ///
+    /// `fetch_import_specs` used to build the Octocrab client *before*
+    /// constructing the tokio runtime, so `Octocrab::builder().build()`
+    /// panicked with "there is no reactor running". The existing test could
+    /// not catch it because it only asserted `is_err()` — a panic is not an
+    /// `Err`, and the test never reached the client because no source was
+    /// given.
+    ///
+    /// This asserts the *specific* error, which pins the argument guard in
+    /// front of the credential lookup and the client construction: naming no
+    /// source must fail for that reason, not for want of a token and not by
+    /// panicking. That is the property that keeps `ro import` from reaching
+    /// the runtime-less `build_client` at all.
+    ///
+    /// It passes on CI for the same reason the old code did: `gh` is absent
+    /// there, so `discover_token` would fail with a token message. That is
+    /// fine — the assertion distinguishes the two failure modes, and if the
+    /// guard is ever moved back below `discover_token` the message changes
+    /// and this test goes red on CI too.
+    #[test]
+    fn fetch_without_source_fails_before_touching_credentials() {
+        let result = fetch_import_specs(false, None, None, None);
+        let err = format!("{:#}", result.expect_err("no source must be an error"));
+        assert!(
+            err.contains("no import source specified"),
+            "expected the argument guard to fire first, got: {err}"
+        );
     }
 }

@@ -122,6 +122,47 @@ pub struct Orphan {
 /// Mirrors ru's `prune`: scan the projects directory for `.git` directories
 /// and report any whose path the tracker does not know about. Search depth is
 /// bounded to 4 levels, matching ru's `full` layout.
+/// Whether two path strings refer to the same location.
+///
+/// Exists because a stored `local_path` and a freshly-walked directory can
+/// spell the same path differently: `/` vs `\` on Windows, a trailing
+/// separator, a `.` segment. Comparing them as raw strings reported every
+/// tracked repo as an orphan on Windows.
+///
+/// Two tiers, because neither alone is sufficient:
+///
+/// 1. **Canonicalize both** and compare. This is what makes a stored
+///    forward-slash row (written by the pre-fix `resolve_local_path`, still
+///    sitting in existing `state.db` files) match a backslash candidate.
+///    It only works when the directory still exists.
+/// 2. **Fall back to a separator-insensitive comparison** when either side
+///    cannot be canonicalized — a tracked repo whose directory was deleted,
+///    which is the case a strict `canonicalize` would silently miss.
+fn paths_equivalent(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (pa, pb) = (Path::new(a), Path::new(b));
+    if let (Ok(ca), Ok(cb)) = (pa.canonicalize(), pb.canonicalize()) {
+        if ca == cb {
+            return true;
+        }
+    }
+    normalize_separators(a) == normalize_separators(b)
+}
+
+/// Lowercase-free, separator-normalized, trailing-separator-free form.
+///
+/// Deliberately does not resolve `..` or symlinks: this is a last-resort
+/// equality check, not a path algebra, and pretending otherwise would
+/// reintroduce a filesystem dependency into what should stay a string
+/// comparison.
+fn normalize_separators(p: &str) -> String {
+    let unified = p.replace('\\', "/");
+    let trimmed = unified.trim_end_matches('/');
+    if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+}
+
 pub fn find_orphans(conn: &Connection, root: &Path) -> Result<Vec<Orphan>> {
     if !root.is_dir() {
         return Ok(Vec::new());
@@ -131,11 +172,9 @@ pub fn find_orphans(conn: &Connection, root: &Path) -> Result<Vec<Orphan>> {
     {
         let mut stmt = conn.prepare("SELECT local_path FROM repos")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        for r in rows {
-            if let Ok(p) = r {
-                if !p.is_empty() {
-                    tracked.push(p);
-                }
+        for p in rows.flatten() {
+            if !p.is_empty() {
+                tracked.push(p);
             }
         }
     }
@@ -146,7 +185,7 @@ pub fn find_orphans(conn: &Connection, root: &Path) -> Result<Vec<Orphan>> {
     let mut orphans = Vec::new();
     for path in candidates {
         let s = path.to_string_lossy().to_string();
-        if tracked.iter().any(|t| t == &s) {
+        if tracked.iter().any(|t| paths_equivalent(t, &s)) {
             continue;
         }
         let name = path
@@ -427,6 +466,96 @@ mod tests {
         make_repo_at(&p);
 
         assert!(find_orphans(&conn, &root).unwrap().is_empty());
+    }
+
+    /// The half of the fix that protects existing databases.
+    ///
+    /// `resolve_local_path` now writes platform-native separators, which
+    /// fixes rows created from here on. But every `state.db` already on disk
+    /// holds rows written by the old `format!("{}/{}/{}", …)`, which on
+    /// Windows produced forward slashes while `collect_git_dirs` produces
+    /// backslashes. Without the canonicalizing comparison those rows are
+    /// still reported as orphans — the fix would convert a wrong list into
+    /// *every* existing user's repos becoming orphans.
+    ///
+    /// Gated to Windows on purpose. On POSIX `.replace('\\', "/")` is a
+    /// no-op, so the stored path would equal the walked path, the very first
+    /// `a == b` branch would match, and the test would pass without ever
+    /// reaching the canonicalize tier — proving nothing, and staying green if
+    /// the fix were reverted. Better an honest Windows-only test than a
+    /// cross-platform one that quietly tests the wrong thing.
+    #[cfg(windows)]
+    #[test]
+    fn forward_slash_stored_path_is_not_reported_as_orphan() {
+        let (tmp, conn) = setup();
+        let root = projects_dir(&tmp);
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.join("alice").join("legacy");
+        make_repo_at(&p);
+        crate::manage::add(&conn, "alice/legacy", &root).unwrap();
+
+        // Rewrite the stored path into the pre-fix spelling.
+        let legacy = p.to_string_lossy().replace('\\', "/");
+        let n = conn
+            .execute(
+                "UPDATE repos SET local_path = ?1 WHERE owner = 'alice' AND name = 'legacy'",
+                [&legacy],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "row must exist to rewrite it");
+        assert_ne!(
+            legacy,
+            p.to_string_lossy(),
+            "on Windows the two spellings must differ or this test proves nothing"
+        );
+
+        assert!(
+            find_orphans(&conn, &root).unwrap().is_empty(),
+            "a forward-slash stored path must still match its directory, \
+             otherwise every pre-fix database reports all its repos as orphans"
+        );
+    }
+
+    /// The fallback tier, on every platform.
+    ///
+    /// A tracked repo whose directory has been deleted cannot be canonicalized
+    /// on either side, so the string comparison is the only thing that can
+    /// match them. The two spellings are made to differ by a *trailing
+    /// separator* rather than by a separator swap, because a `\`→`/` replace
+    /// is a no-op on POSIX — building the mismatch that way would make this
+    /// test vacuous on Linux and macOS while appearing to pass.
+    #[test]
+    fn separator_mismatch_still_matches_when_path_is_gone() {
+        let (tmp, conn) = setup();
+        let root = projects_dir(&tmp);
+        std::fs::create_dir_all(&root).unwrap();
+        let p = root.join("alice").join("vanished");
+        make_repo_at(&p);
+        crate::manage::add(&conn, "alice/vanished", &root).unwrap();
+
+        let stored = p.to_string_lossy();
+        let with_trailing = format!("{stored}/");
+        conn.execute(
+            "UPDATE repos SET local_path = ?1 WHERE owner = 'alice' AND name = 'vanished'",
+            [&with_trailing],
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&p).unwrap();
+
+        assert_ne!(
+            with_trailing, stored,
+            "the raw spellings must differ, otherwise this test proves nothing"
+        );
+        assert!(
+            paths_equivalent(&with_trailing, &stored),
+            "with the directory gone neither side can be canonicalized, so the \
+             string fallback is the only thing that can match them — that is \
+             exactly the case the fallback exists for"
+        );
+        assert!(
+            !paths_equivalent(&with_trailing, &root.join("bob").join("other").to_string_lossy()),
+            "the fallback must still distinguish genuinely different paths"
+        );
     }
 
     #[test]
