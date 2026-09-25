@@ -1,6 +1,9 @@
 # bv (beads viewer) local config and caches
 .bv/
 
+# ffs (file search) local index cache
+.ffs/
+
 # Rust build artifacts
 /target/
 **/*.rs.bk
