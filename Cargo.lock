@@ -165,12 +165,6 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "base64"
-version = "0.21.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d297deb1925b89f2ccc13d7635fa0714f12c87adce1c75356b39ca9b7178567"
-
-[[package]]
-name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
@@ -541,12 +535,6 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
-name = "dyn-clone"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "either"
@@ -1985,7 +1973,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2255,7 +2243,7 @@ version = "9.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "js-sys",
  "pem",
  "ring",
@@ -2495,7 +2483,7 @@ checksum = "86996964f8b721067b6ed238aa0ccee56ecad6ee5e714468aa567992d05d2b91"
 dependencies = [
  "arc-swap",
  "async-trait",
- "base64 0.22.1",
+ "base64",
  "bytes",
  "cfg-if",
  "chrono",
@@ -2581,18 +2569,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "paste"
-version = "1.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "serde_core",
 ]
 
@@ -2894,7 +2876,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-core",
  "http",
@@ -2927,321 +2909,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rfo"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "clap",
- "globset",
- "predicates",
- "rfo-config",
- "rfo-context",
- "rfo-core",
- "rfo-git",
- "rfo-github",
- "rfo-jobs",
- "rfo-output",
- "rfo-provider",
- "rfo-review",
- "rfo-state",
- "rfo-sweep",
- "rfo-sync",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "rfo-ai-sync"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-git",
- "rfo-jobs",
- "rfo-ntm",
- "rfo-sync",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-config"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "dirs",
- "rfo-core",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "rfo-context"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-github",
- "rfo-output",
- "rfo-state",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-core"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "dirs",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "time",
- "uuid",
-]
-
-[[package]]
-name = "rfo-dep-update"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-ntm",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-git"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "fs4",
- "gix",
- "regex",
- "rfo-core",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-github"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "octocrab",
- "reqwest",
- "rfo-core",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "rfo-jobs"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-core",
- "rfo-state",
- "rusqlite",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-mcp"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-config",
- "rfo-context",
- "rfo-core",
- "rfo-jobs",
- "rfo-output",
- "rfo-review",
- "rfo-state",
- "rfo-sweep",
- "rfo-sync",
- "rmcp",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-ntm"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-output"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "console",
- "owo-colors",
- "rfo-core",
- "serde",
- "serde_json",
- "time",
-]
-
-[[package]]
-name = "rfo-provider"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "rfo-config",
- "rfo-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-review"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-output",
- "rfo-state",
- "rusqlite",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-state"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "time",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-sweep"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "comfy-table",
- "globset",
- "regex",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-output",
- "rfo-provider",
- "rfo-state",
- "rfo-sync",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "rfo-sync"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "console",
- "indicatif",
- "rfo-config",
- "rfo-core",
- "rfo-git",
- "rfo-jobs",
- "rfo-output",
- "rfo-state",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "rfo-testkit"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "rfo-core",
- "rfo-state",
- "rusqlite",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "ring"
 version = "0.17.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3256,35 +2923,222 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmcp"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33a0110d28bd076f39e14bfd5b0340216dd18effeb5d02b43215944cc3e5c751"
+name = "ro"
+version = "0.2.0"
 dependencies = [
- "base64 0.21.7",
- "chrono",
- "futures",
- "paste",
- "pin-project-lite",
- "rmcp-macros",
- "schemars",
+ "anyhow",
+ "assert_cmd",
+ "clap",
+ "globset",
+ "predicates",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-github",
+ "ro-jobs",
+ "ro-output",
+ "ro-review",
+ "ro-state",
+ "ro-sweep",
+ "ro-sync",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
+ "tempfile",
  "tokio",
- "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "ro-config"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "toml",
  "tracing",
 ]
 
 [[package]]
-name = "rmcp-macros"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6e2b2fd7497540489fa2db285edd43b7ed14c49157157438664278da6e42a7a"
+name = "ro-core"
+version = "0.2.0"
 dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "anyhow",
+ "dirs",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "ro-dep-update"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-git"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "fs4",
+ "gix",
+ "regex",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-github"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "octocrab",
+ "reqwest",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "ro-jobs"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-core",
+ "ro-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ro-output"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "comfy-table",
+ "console",
+ "owo-colors",
+ "ro-core",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
+name = "ro-review"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "comfy-table",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "ro-output",
+ "ro-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ro-state"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ro-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ro-sweep"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "comfy-table",
+ "globset",
+ "regex",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "ro-output",
+ "ro-state",
+ "ro-sync",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "ro-sync"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "console",
+ "indicatif",
+ "ro-config",
+ "ro-core",
+ "ro-git",
+ "ro-jobs",
+ "ro-output",
+ "ro-state",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3412,30 +3266,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "schemars"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fbf2ae1b8bc8e02df939598064d22402220cd5bbcca1c76f7d6a310974d5615"
-dependencies = [
- "dyn-clone",
- "schemars_derive",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "schemars_derive"
-version = "0.8.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e265784ad618884abaea0600a9adf15393368d840e0222d101a072f3f7534d"
-dependencies = [
- "proc-macro2",
- "quote",
- "serde_derive_internals",
- "syn",
-]
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3503,17 +3333,6 @@ name = "serde_derive"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "serde_derive_internals"
-version = "0.29.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4735,7 +4554,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08db1edfb05d9b3c1542e521aea074442088292f00b5f28e435c714a98f85031"
 dependencies = [
  "assert-json-diff",
- "base64 0.22.1",
+ "base64",
  "deadpool",
  "futures",
  "http",
@@ -4850,29 +4669,6 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
-
-[[package]]
-name = "xshell"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e7290c623014758632efe00737145b6867b66292c42167f2ec381eb566a373d"
-dependencies = [
- "xshell-macros",
-]
-
-[[package]]
-name = "xshell-macros"
-version = "0.2.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32ac00cd3f8ec9c1d33fb3e7958a82df6989c42d747bd326c822b1d625283547"
-
-[[package]]
-name = "xtask"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "xshell",
-]
 
 [[package]]
 name = "yoke"

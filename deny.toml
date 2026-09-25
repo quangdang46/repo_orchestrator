@@ -1,4 +1,4 @@
-# cargo-deny configuration for repo_forge.
+# cargo-deny configuration for repo_orchestrator.
 #
 # Run via:
 #   cargo deny check         # all
@@ -81,7 +81,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Path-based workspace members do not declare an external version (they use
 # `path = "..."`); cargo-deny would otherwise flag them as wildcard deps.
-# Anything starting with `rfo-` is internal to this workspace.
+# Anything starting with `ro-` is internal to this workspace.
 allow-wildcard-paths = true
 highlight = "all"
 # We will not depend on these directly; if a transitive dep pulls them in,

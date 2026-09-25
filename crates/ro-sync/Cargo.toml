@@ -1,0 +1,31 @@
+[package]
+name = "ro-sync"
+description = "Sync, status, prune, import, add, remove, list commands"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ro-core.workspace = true
+ro-config.workspace = true
+ro-output.workspace = true
+ro-state.workspace = true
+ro-git.workspace = true
+ro-jobs.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+indicatif.workspace = true
+console.workspace = true
+clap.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

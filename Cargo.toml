@@ -1,26 +1,20 @@
 [workspace]
 members = [
-    "crates/rfo",
-    "crates/rfo-core",
-    "crates/rfo-config",
-    "crates/rfo-output",
-    "crates/rfo-state",
-    "crates/rfo-git",
-    "crates/rfo-github",
-    "crates/rfo-jobs",
-    "crates/rfo-sync",
-    "crates/rfo-context",
-    "crates/rfo-review",
-    "crates/rfo-sweep",
-    "crates/rfo-provider",
-    "crates/rfo-mcp",
-    "crates/rfo-ntm",
-    "crates/rfo-ai-sync",
-    "crates/rfo-dep-update",
-    "crates/rfo-testkit",
+    "crates/ro",
+    "crates/ro-core",
+    "crates/ro-config",
+    "crates/ro-output",
+    "crates/ro-state",
+    "crates/ro-git",
+    "crates/ro-github",
+    "crates/ro-jobs",
+    "crates/ro-sync",
+    "crates/ro-review",
+    "crates/ro-sweep",
+    "crates/ro-dep-update",
 ]
 resolver = "3"
-default-members = ["crates/rfo"]
+default-members = ["crates/ro"]
 
 [workspace.package]
 version = "0.2.0"
@@ -28,29 +22,23 @@ authors = ["quangdang46 <quangdang46@github.com>"]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/quangdang46/repo_forge_orchestrator"
+repository = "https://github.com/quangdang46/repo_orchestrator"
 keywords = ["repo", "github", "orchestration", "cli", "devops"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 # Core crates (local)
-rfo-core        = { path = "crates/rfo-core" }
-rfo-config      = { path = "crates/rfo-config" }
-rfo-output      = { path = "crates/rfo-output" }
-rfo-state       = { path = "crates/rfo-state" }
-rfo-git         = { path = "crates/rfo-git" }
-rfo-github      = { path = "crates/rfo-github" }
-rfo-jobs        = { path = "crates/rfo-jobs" }
-rfo-sync        = { path = "crates/rfo-sync" }
-rfo-context     = { path = "crates/rfo-context" }
-rfo-review      = { path = "crates/rfo-review" }
-rfo-sweep       = { path = "crates/rfo-sweep" }
-rfo-provider    = { path = "crates/rfo-provider" }
-rfo-mcp         = { path = "crates/rfo-mcp" }
-rfo-ntm         = { path = "crates/rfo-ntm" }
-rfo-ai-sync     = { path = "crates/rfo-ai-sync" }
-rfo-dep-update  = { path = "crates/rfo-dep-update" }
-rfo-testkit     = { path = "crates/rfo-testkit" }
+ro-core        = { path = "crates/ro-core" }
+ro-config      = { path = "crates/ro-config" }
+ro-output      = { path = "crates/ro-output" }
+ro-state       = { path = "crates/ro-state" }
+ro-git         = { path = "crates/ro-git" }
+ro-github      = { path = "crates/ro-github" }
+ro-jobs        = { path = "crates/ro-jobs" }
+ro-sync        = { path = "crates/ro-sync" }
+ro-review      = { path = "crates/ro-review" }
+ro-sweep       = { path = "crates/ro-sweep" }
+ro-dep-update  = { path = "crates/ro-dep-update" }
 
 # External — shared across multiple crates
 anyhow          = "1.0"
@@ -113,7 +101,7 @@ windows-archive = ".zip"
 checksum = "sha256"
 # Auto-generate release notes from the changelog / commits.
 pr-run-mode = "plan"
-# Publish only the `rfo` binary crate; ignore xtask + library crates.
+# Publish only the `ro` binary crate; ignore xtask + library crates.
 precise-builds = true
 allow-dirty = ["ci"]
 

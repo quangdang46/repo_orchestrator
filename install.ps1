@@ -1,11 +1,11 @@
-# install.ps1 — One-liner installer for rfo (Repo Forge Orchestrator) on Windows.
+# install.ps1 — One-liner installer for ro (Repo Forge Orchestrator) on Windows.
 #
 # Usage (pipe-safe — no [CmdletBinding]/param so iex works):
-#   irm "https://raw.githubusercontent.com/quangdang46/repo_forge_orchestrator/main/install.ps1" | iex
+#   irm "https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main/install.ps1" | iex
 #
 # Environment knobs:
-#   $env:RFO_VERSION   Specific version tag (e.g. "v0.1.0").  Default: latest release
-#   $env:RFO_PREFIX    Install directory for rfo.exe.          Default: $env:LOCALAPPDATA\Programs\rfo
+#   $env:RO_VERSION   Specific version tag (e.g. "v0.1.0").  Default: latest release
+#   $env:RO_PREFIX    Install directory for ro.exe.          Default: $env:LOCALAPPDATA\Programs\ro
 #
 # Downloads the pre-built binary from GitHub Releases — no Rust toolchain
 # required.  Only needs PowerShell 5+ and internet access.
@@ -14,7 +14,7 @@
     $ErrorActionPreference = 'Stop'
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-    $GH_REPO = 'quangdang46/repo_forge_orchestrator'
+    $GH_REPO = 'quangdang46/repo_orchestrator'
 
     function Write-Step([string]$Message) {
         Write-Host "==> $Message" -ForegroundColor Green
@@ -30,7 +30,7 @@
     }
 
     # ── Resolve version tag ──────────────────────────────────────────────
-    $tag = $env:RFO_VERSION
+    $tag = $env:RO_VERSION
     if (-not $tag) {
         Write-Step 'resolving latest release ...'
         try {
@@ -43,7 +43,7 @@
     Write-Step "version: $tag"
 
     # ── Resolve install prefix ───────────────────────────────────────────
-    $prefix = if ($env:RFO_PREFIX) { $env:RFO_PREFIX } else { Join-Path $env:LOCALAPPDATA 'Programs\rfo' }
+    $prefix = if ($env:RO_PREFIX) { $env:RO_PREFIX } else { Join-Path $env:LOCALAPPDATA 'Programs\ro' }
     if (-not (Test-Path $prefix)) {
         New-Item -ItemType Directory -Path $prefix -Force | Out-Null
     }
@@ -52,13 +52,13 @@
     $arch = $env:PROCESSOR_ARCHITECTURE
     switch ($arch) {
         'AMD64' { $target = 'x86_64-pc-windows-msvc' }
-        'ARM64' { Fail "Windows ARM64 is not yet a published target for rfo. Build from source: cargo build --release" }
+        'ARM64' { Fail "Windows ARM64 is not yet a published target for ro. Build from source: cargo build --release" }
         default { Fail "Unsupported Windows architecture: $arch (expected AMD64)." }
     }
     Write-Step "target: $target"
 
     # ── Build download URL ───────────────────────────────────────────────
-    $archiveName = "rfo-$target.zip"
+    $archiveName = "ro-$target.zip"
     $downloadUrl = "https://github.com/$GH_REPO/releases/download/$tag/$archiveName"
 
     Write-Step "downloading $downloadUrl ..."
@@ -90,29 +90,29 @@
         Write-Warn 'SHA-256 checksum file not available — skipping verification'
     }
 
-    # ── Extract rfo.exe ──────────────────────────────────────────────────
+    # ── Extract ro.exe ──────────────────────────────────────────────────
     Write-Step "extracting to $prefix ..."
-    $extractDir = Join-Path $env:TEMP "rfo-extract-$([guid]::NewGuid().ToString('N'))"
+    $extractDir = Join-Path $env:TEMP "ro-extract-$([guid]::NewGuid().ToString('N'))"
     try {
         Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
-        $exe = Get-ChildItem -Path $extractDir -Filter 'rfo.exe' -Recurse | Select-Object -First 1
-        if (-not $exe) { Fail 'rfo.exe not found inside the downloaded archive' }
+        $exe = Get-ChildItem -Path $extractDir -Filter 'ro.exe' -Recurse | Select-Object -First 1
+        if (-not $exe) { Fail 'ro.exe not found inside the downloaded archive' }
 
-        Copy-Item -Path $exe.FullName -Destination (Join-Path $prefix 'rfo.exe') -Force
+        Copy-Item -Path $exe.FullName -Destination (Join-Path $prefix 'ro.exe') -Force
     } finally {
         Remove-Item $zipPath      -Force -ErrorAction SilentlyContinue
         Remove-Item $extractDir   -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    $bin = Join-Path $prefix 'rfo.exe'
+    $bin = Join-Path $prefix 'ro.exe'
     if (-not (Test-Path $bin)) {
         Fail "extraction finished but $bin is missing"
     }
     Write-Step "installed: $bin"
 
     # ── Ensure PREFIX is on PATH ─────────────────────────────────────────
-    if (-not (Get-Command rfo -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command ro -ErrorAction SilentlyContinue)) {
         # Add to current session.
         $env:Path = "$prefix;$env:Path"
 
@@ -124,17 +124,17 @@
         }
     }
 
-    Write-Step 'running rfo version'
+    Write-Step 'running ro version'
     & $bin --version
 
     Write-Host @'
 
 Next steps:
-  1. rfo init                 # initialize config & state
-  2. rfo doctor               # verify the install
-  3. rfo add owner/repo       # track a repository
-  4. rfo sync                 # sync all tracked repos
+  1. ro init                 # initialize config & state
+  2. ro doctor               # verify the install
+  3. ro add owner/repo       # track a repository
+  4. ro sync                 # sync all tracked repos
 
-Configuration lives at %LOCALAPPDATA%\rfo\config.toml (run `rfo init` first).
+Configuration lives at %LOCALAPPDATA%\ro\config.toml (run `ro init` first).
 '@
 }

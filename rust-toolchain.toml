@@ -1,4 +1,4 @@
-# Pinned toolchain for repo_forge.
+# Pinned toolchain for repo_orchestrator.
 #
 # Edition: Rust 2024 (stabilized in 1.85).
 # We track the latest stable channel for CI; MSRV is 1.85 (enforced via

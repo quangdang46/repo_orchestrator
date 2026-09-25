@@ -1,0 +1,33 @@
+[package]
+name = "ro-sweep"
+description = "Sweep commit and sweep agent for AI-driven automation"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ro-core.workspace = true
+ro-config.workspace = true
+ro-sync.workspace = true
+ro-state.workspace = true
+ro-git.workspace = true
+ro-jobs.workspace = true
+ro-output.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+comfy-table.workspace = true
+tempfile.workspace = true
+rusqlite.workspace = true
+serde_yaml.workspace = true
+globset.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
