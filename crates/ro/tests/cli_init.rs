@@ -89,26 +89,3 @@ fn remove_repo() {
         .success()
         .stderr(predicate::str::contains("Removed"));
 }
-
-#[test]
-fn import_from_file() {
-    let test = RfoTest::new();
-
-    let mut cmd = test.cmd();
-    cmd.arg("init");
-    cmd.assert().success();
-
-    let list_file = test.config_dir.path().join("repos.list");
-    std::fs::write(&list_file, b"quangdang46/repo_orchestrator\nalice/other-repo\n").unwrap();
-
-    let mut cmd2 = test.cmd();
-    cmd2.args(["import", list_file.to_str().unwrap()]);
-    cmd2.assert().success();
-
-    let mut cmd3 = test.cmd();
-    cmd3.args(["list"]);
-    cmd3.assert()
-        .success()
-        .stdout(predicate::str::contains("quangdang46/repo_orchestrator"))
-        .stdout(predicate::str::contains("alice/other-repo"));
-}

@@ -8,7 +8,6 @@
 pub mod auth;
 pub mod checks;
 pub mod client;
-pub mod import;
 pub mod issues;
 
 pub use auth::{AuthToken, build_client, discover_token};

@@ -97,24 +97,6 @@ enum Commands {
         format: OutputFormat,
     },
 
-    /// Bulk import repos from a file, GitHub stars, org, or user
-    Import {
-        /// Path to repos.list file
-        file: Option<PathBuf>,
-        /// Import from your GitHub stars
-        #[arg(long)]
-        stars: bool,
-        /// Import from an organization
-        #[arg(long)]
-        org: Option<String>,
-        /// Import from a user's repos
-        #[arg(long)]
-        user: Option<String>,
-        /// Maximum repos to import
-        #[arg(long)]
-        limit: Option<usize>,
-    },
-
     // ── Sync / Status ────────────────────────────────────────────────
     /// Sync all tracked repos
     Sync {
@@ -663,57 +645,6 @@ fn run() -> Result<()> {
                         OutputFormat::Toon => print_toon(&serde_json::to_value(&repo)?)?,
                     }
                 }
-            }
-        }
-
-        Commands::Import {
-            file,
-            stars,
-            org,
-            user,
-            limit,
-        } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
-            let projects_dir = paths.state_dir.join("projects");
-            if let Some(file) = file {
-                let (added, skipped, errors) =
-                    manage::import(&conn, &file, &projects_dir).context("importing repos")?;
-                if !added.is_empty() {
-                    eprintln!("Added {} repos", added.len());
-                }
-                if !skipped.is_empty() {
-                    eprintln!("Skipped {} duplicates", skipped.len());
-                }
-                if !errors.is_empty() {
-                    for (line, err) in &errors {
-                        eprintln!("Error: {line}: {err}");
-                    }
-                }
-            } else if stars || org.is_some() || user.is_some() {
-                let specs = ro_github::import::fetch_import_specs(
-                    stars,
-                    org.as_deref(),
-                    user.as_deref(),
-                    limit,
-                )?;
-                let mut added_count = 0u32;
-                let mut skip_count = 0u32;
-                for spec in &specs {
-                    match manage::add(&conn, spec, &projects_dir) {
-                        Ok(repo) => {
-                            if !cli.quiet {
-                                eprintln!("Added: {}/{}", repo.owner, repo.name);
-                            }
-                            added_count += 1;
-                        }
-                        Err(_) => {
-                            skip_count += 1;
-                        }
-                    }
-                }
-                eprintln!("Imported {added_count} repos, skipped {skip_count} duplicates");
-            } else {
-                anyhow::bail!("provide a file path, --stars, --org, or --user");
             }
         }
 

@@ -1,10 +1,9 @@
-//! Repo management: add, remove, list, import, init.
+//! Repo management: add, remove, list, init.
 //!
 //! `ro init`: initialize config + SQLite state directory.
 //! `ro add`: parse spec, insert into state DB (offline-first; GitHub enrichment optional).
 //! `ro remove`: delete repo from state DB.
 //! `ro list`: enumerate tracked repos.
-//! `ro import`: bulk-import from a repos.list file (one `owner/repo` per line).
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
@@ -215,39 +214,6 @@ pub fn list(conn: &Connection, owner_filter: Option<&str>) -> Result<Vec<Tracked
     }
 
     Ok(repos)
-}
-
-/// Result of a bulk import operation.
-pub type ImportResult = (Vec<TrackedRepo>, Vec<String>, Vec<(String, String)>);
-
-/// Bulk-import repos from a file with one spec per line.
-/// Empty lines and lines starting with `#` are skipped.
-/// Returns (added, skipped_already_tracked, errors).
-pub fn import(conn: &Connection, file_path: &Path, projects_dir: &Path) -> Result<ImportResult> {
-    let content = std::fs::read_to_string(file_path)
-        .with_context(|| format!("reading {}", file_path.display()))?;
-    let mut added = Vec::new();
-    let mut skipped = Vec::new();
-    let mut errors = Vec::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        match add(conn, line, projects_dir) {
-            Ok(repo) => added.push(repo),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("already tracked") {
-                    skipped.push(line.to_string());
-                } else {
-                    errors.push((line.to_string(), msg));
-                }
-            }
-        }
-    }
-    Ok((added, skipped, errors))
 }
 
 /// Find a repo by `owner/name`, alias, or raw id.
@@ -466,48 +432,6 @@ mod tests {
         let repos = list(&conn, Some("alice")).unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].owner, "alice");
-    }
-
-    #[test]
-    fn import_from_file() {
-        let (tmp, conn) = setup();
-        let import_file = tmp.path().join("repos.list");
-        std::fs::write(
-            &import_file,
-            "# My repos\nalice/proj1\nbob/proj2\n\n# done\n",
-        )
-        .unwrap();
-
-        let (added, skipped, errors) = import(&conn, &import_file, &projects_dir(&tmp)).unwrap();
-        assert_eq!(added.len(), 2);
-        assert!(skipped.is_empty());
-        assert!(errors.is_empty());
-    }
-
-    #[test]
-    fn import_skips_duplicates() {
-        let (tmp, conn) = setup();
-        add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
-
-        let import_file = tmp.path().join("repos.list");
-        std::fs::write(&import_file, "alice/proj1\nbob/proj2\n").unwrap();
-
-        let (added, skipped, errors) = import(&conn, &import_file, &projects_dir(&tmp)).unwrap();
-        assert_eq!(added.len(), 1);
-        assert_eq!(skipped.len(), 1);
-        assert!(errors.is_empty());
-    }
-
-    #[test]
-    fn import_reports_bad_lines() {
-        let (tmp, conn) = setup();
-        let import_file = tmp.path().join("repos.list");
-        std::fs::write(&import_file, "good/repo\nbadline\n").unwrap();
-
-        let (added, _skipped, errors) = import(&conn, &import_file, &projects_dir(&tmp)).unwrap();
-        assert_eq!(added.len(), 1);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].0.contains("badline"));
     }
 
     #[test]
