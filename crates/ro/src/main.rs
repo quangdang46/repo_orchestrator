@@ -213,14 +213,6 @@ enum Commands {
         sub: Option<ConfigCommands>,
     },
 
-    // ── Self-update ──────────────────────────────────────────────────
-    /// Update ro to the latest version
-    SelfUpdate {
-        /// Only check for updates, don't install
-        #[arg(long)]
-        check: bool,
-    },
-
     // ── Robot docs ───────────────────────────────────────────────────
     /// Machine-readable CLI documentation (JSON)
     RobotDocs {
@@ -484,7 +476,6 @@ fn generate_robot_docs(topic: Option<&str>) -> serde_json::Value {
                 {"name": "sweep", "description": "Sweep commands", "subcommands": ["commit", "agent"]},
                 {"name": "doctor", "description": "Diagnose installation health", "flags": ["--fix"]},
                 {"name": "config", "description": "Show or set config", "subcommands": ["print", "set"]},
-                {"name": "self-update", "description": "Update ro to latest version", "flags": ["--check"]},
                 {"name": "robot-docs", "description": "Machine-readable CLI documentation"},
                 {"name": "fork", "description": "Fork management", "subcommands": ["status", "sync", "clean"]},
             ]
@@ -1291,27 +1282,6 @@ fn run() -> Result<()> {
         }
 
         // ── Self-update ──
-        Commands::SelfUpdate { check } => {
-            let current = env!("CARGO_PKG_VERSION");
-            if check {
-                eprintln!("Current version: {current}");
-                eprintln!("Check https://github.com/quangdang46/repo_orchestrator/releases for updates.");
-            } else {
-                eprintln!("Current version: {current}");
-                eprintln!("To update, re-run the install script:");
-                #[cfg(unix)]
-                eprintln!(
-                    "  curl -fsSL https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main/install.sh | bash"
-                );
-                #[cfg(windows)]
-                eprintln!(
-                    "  irm https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main/install.ps1 | iex"
-                );
-                #[cfg(not(any(unix, windows)))]
-                eprintln!("  See https://github.com/quangdang46/repo_orchestrator#install");
-            }
-        }
-
         // ── Robot docs ──
         Commands::RobotDocs { topic } => {
             let docs = generate_robot_docs(topic.as_deref());

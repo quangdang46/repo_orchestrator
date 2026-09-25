@@ -218,10 +218,6 @@ state directory health. `--fix` applies the repairs it knows about.
 ### `ro config`
 `ro config` prints every setting; `ro config set KEY=VALUE` changes one.
 
-### `ro self-update`
-Replace the installed binary with the latest release. `--check` reports whether
-an update exists without installing.
-
 ### `ro robot-docs <TOPIC>`
 Machine-readable documentation as JSON, for driving `ro` from an agent instead of
 parsing human-readable text. Topics include `quickstart`, `commands`,

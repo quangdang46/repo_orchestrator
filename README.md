@@ -87,7 +87,7 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 | **Ranked attention** | Health scores instead of tab soup |
 | **Plan-then-apply** | Review/sweep flows produce plans before mutation |
 | **Agent-ready JSON** | Structured reads for coding agents and MCP |
-| **Doctor + self-update** | Diagnose, repair, upgrade in place |
+| **Doctor** | Diagnose and repair the local environment |
 
 ---
 
@@ -223,7 +223,7 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 | Review | `review plan` (+ apply/rollback flows) | Plan-then-apply |
 | Sweep | `sweep …` | Commit / agent sweep helpers |
 | Config | `config` | Show / set configuration |
-| Meta | `self-update` · `robot-docs` · `fork …` | Upgrade, machine docs, forks |
+| Meta | `robot-docs` · `fork …` | Machine docs, forks |
 
 ```bash
 # Inventory
@@ -242,7 +242,6 @@ ro status my-org/service-a
 # Safety-oriented automation
 ro review plan
 ro doctor --fix
-ro self-update --check
 ```
 
 Run `ro --help` / `ro <cmd> --help` for full flags.
@@ -401,12 +400,26 @@ ro add owner/repo        # clone and track
 ro add .                 # track a repo you already have
 ```
 
-### How do I upgrade?
+### How do I install or upgrade?
+
+`ro` does not self-update. Re-run the install script; it is idempotent and
+replaces the binary in place.
 
 ```bash
-ro self-update --check
-ro self-update
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main/install.ps1 | iex
 ```
+
+Check what you have:
+
+```bash
+ro --version
+```
+
+Releases and checksums: <https://github.com/quangdang46/repo_orchestrator/releases>
 
 ---
 
