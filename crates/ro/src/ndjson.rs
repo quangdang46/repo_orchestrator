@@ -52,19 +52,6 @@ impl NdjsonEvent {
         }
     }
 
-    /// Plan was created for a repo.
-    pub fn plan_created(repo: &str, plan_id: &str, risk: &str) -> Self {
-        let mut payload = HashMap::new();
-        payload.insert("repo".into(), repo.into());
-        payload.insert("plan_id".into(), plan_id.into());
-        payload.insert("risk".into(), risk.into());
-        Self {
-            kind: "plan_created".into(),
-            ts: None,
-            payload,
-        }
-    }
-
     /// All quality gates passed for a repo/plan.
     pub fn gates_passed(repo: &str, plan_id: &str) -> Self {
         let mut payload = HashMap::new();
@@ -72,18 +59,6 @@ impl NdjsonEvent {
         payload.insert("plan_id".into(), plan_id.into());
         Self {
             kind: "gates_passed".into(),
-            ts: None,
-            payload,
-        }
-    }
-
-    /// A mutating command was applied to a repo.
-    pub fn applied(repo: &str, run_id: &str) -> Self {
-        let mut payload = HashMap::new();
-        payload.insert("repo".into(), repo.into());
-        payload.insert("run_id".into(), run_id.into());
-        Self {
-            kind: "applied".into(),
             ts: None,
             payload,
         }

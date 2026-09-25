@@ -43,11 +43,6 @@ impl ConfigPaths {
         self.config_dir.join("repos.list")
     }
 
-    /// Path to the policies file: `$config_dir/policies.yaml`.
-    pub fn policies_yaml(&self) -> PathBuf {
-        self.config_dir.join("policies.yaml")
-    }
-
     /// Path to the state database: `$state_dir/state.db`.
     pub fn state_db(&self) -> PathBuf {
         self.state_dir.join("state.db")
@@ -214,7 +209,6 @@ mod tests {
         };
         assert_eq!(paths.config_toml(), Path::new("/cfg/config.toml"));
         assert_eq!(paths.repos_list(), Path::new("/cfg/repos.list"));
-        assert_eq!(paths.policies_yaml(), Path::new("/cfg/policies.yaml"));
         assert_eq!(paths.state_db(), Path::new("/state/state.db"));
         assert_eq!(paths.run_log_dir("abc"), Path::new("/state/logs/abc"));
     }

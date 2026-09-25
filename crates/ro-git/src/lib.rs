@@ -13,7 +13,7 @@ pub mod status;
 pub use conflict::{ConflictOp, ConflictState, ConflictedFile};
 pub use lock::RepoLock;
 pub use mutation::{
-    CloneOpts, CloneOutcome, FetchOpts, GitCommandResult, GitErrorKind, PullOpts, PullOutcome,
+    CloneOpts, CloneOutcome, FetchOpts, GitCommandResult, PullOpts, PullOutcome,
     PullStrategy, PushOpts,
 };
 pub use status::{AheadBehind, RepoStatus};

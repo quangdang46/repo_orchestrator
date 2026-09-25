@@ -19,7 +19,6 @@ path = "src/main.rs"
 [dependencies]
 ro-core.workspace = true
 ro-config.workspace = true
-ro-output.workspace = true
 ro-state.workspace = true
 ro-git.workspace = true
 ro-github.workspace = true
@@ -34,6 +33,8 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+# NdjsonWriter stamps an RFC3339 timestamp on every event via `time`.
+time.workspace = true
 toml.workspace = true
 globset.workspace = true
 # tempfile is used by doctor tests in src/ (behind #[cfg(test)])

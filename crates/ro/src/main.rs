@@ -9,6 +9,7 @@
 //! - 64: usage error
 
 mod doctor;
+mod ndjson;
 
 use std::path::PathBuf;
 
@@ -23,15 +24,6 @@ enum OutputFormat {
     #[default]
     Text,
     Json,
-    Toon,
-}
-
-/// Print a value in TOON (compact tabular) form, the format `ru` emits.
-fn print_toon(value: &serde_json::Value) -> Result<()> {
-    let mut buf = Vec::new();
-    ro_output::text::write_toon(&mut buf, value)?;
-    print!("{}", String::from_utf8_lossy(&buf));
-    Ok(())
 }
 
 /// Auto-approve level for plan application.
@@ -612,7 +604,6 @@ fn run() -> Result<()> {
                         OutputFormat::Json => {
                             println!("{}", serde_json::to_string(&repo)?);
                         }
-                        OutputFormat::Toon => print_toon(&serde_json::to_value(&repo)?)?,
                     }
                 }
             }
@@ -656,7 +647,6 @@ fn run() -> Result<()> {
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string(r)?);
                     }
-                    OutputFormat::Toon => print_toon(&serde_json::to_value(r)?)?,
                 }
             }
         }
@@ -688,7 +678,6 @@ fn run() -> Result<()> {
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string(s)?);
                     }
-                    OutputFormat::Toon => print_toon(&serde_json::to_value(s)?)?,
                 }
             }
         }
@@ -794,7 +783,6 @@ fn run() -> Result<()> {
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string(snap)?);
                     }
-                    OutputFormat::Toon => print_toon(&serde_json::to_value(snap)?)?,
                 }
             }
         }
@@ -974,6 +962,14 @@ fn run() -> Result<()> {
                 output,
             } => {
                 let use_ndjson = output.as_deref() == Some("json");
+                // Every NDJSON line goes through the writer, which is what
+                // populates `ts`. The handler used to print
+                // `serde_json::to_string(&event)` directly, so the writer was
+                // dead code in a separate crate where nothing could see it —
+                // and every production line shipped `"ts": null`. Moving the
+                // module into this crate made the compiler point at it.
+                let mut ndjson_out =
+                    ndjson::NdjsonWriter::new(std::io::stdout().lock());
 
                 if repos.is_some() || filter.is_some() || all {
                     let conn = ro_state::open_db(&db_path).context("opening state database")?;
@@ -985,28 +981,28 @@ fn run() -> Result<()> {
                         &paths,
                     )?;
                     if use_ndjson {
-                        let event = ro_output::ndjson::NdjsonEvent::batch_start(
+                        let event = ndjson::NdjsonEvent::batch_start(
                             targets.len() as u32,
                             "sweep-agent",
                             dry_run,
                         );
-                        println!("{}", serde_json::to_string(&event)?);
+                        ndjson_out.write_event(event)?;
                     }
                     let mut applied = 0u32;
                     let mut skipped = 0u32;
                     let mut failed = 0u32;
                     for (rid, repo_path) in &targets {
                         if use_ndjson {
-                            let event = ro_output::ndjson::NdjsonEvent::repo_start(rid);
-                            println!("{}", serde_json::to_string(&event)?);
+                            let event = ndjson::NdjsonEvent::repo_start(rid);
+                            ndjson_out.write_event(event)?;
                         }
                         if dry_run {
                             eprintln!("[dry-run] would sweep {rid}");
                             skipped += 1;
                             if use_ndjson {
                                 let event =
-                                    ro_output::ndjson::NdjsonEvent::repo_done(rid, "skipped");
-                                println!("{}", serde_json::to_string(&event)?);
+                                    ndjson::NdjsonEvent::repo_done(rid, "skipped");
+                                ndjson_out.write_event(event)?;
                             }
                             continue;
                         }
@@ -1014,25 +1010,25 @@ fn run() -> Result<()> {
                         if summary.plan_created {
                             if use_ndjson {
                                 let event =
-                                    ro_output::ndjson::NdjsonEvent::gates_passed(rid, "plan");
-                                println!("{}", serde_json::to_string(&event)?);
+                                    ndjson::NdjsonEvent::gates_passed(rid, "plan");
+                                ndjson_out.write_event(event)?;
                             }
                             if matches!(auto_approve, AutoApproveLevel::Low) && summary.gates_passed
                             {
                                 applied += 1;
                                 if use_ndjson {
                                     let event =
-                                        ro_output::ndjson::NdjsonEvent::repo_done(rid, "ok");
-                                    println!("{}", serde_json::to_string(&event)?);
+                                        ndjson::NdjsonEvent::repo_done(rid, "ok");
+                                    ndjson_out.write_event(event)?;
                                 }
                             } else {
                                 skipped += 1;
                                 if use_ndjson {
-                                    let event = ro_output::ndjson::NdjsonEvent::repo_done(
+                                    let event = ndjson::NdjsonEvent::repo_done(
                                         rid,
                                         "needs-approval",
                                     );
-                                    println!("{}", serde_json::to_string(&event)?);
+                                    ndjson_out.write_event(event)?;
                                 }
                             }
                         } else {
@@ -1040,22 +1036,25 @@ fn run() -> Result<()> {
                             if use_ndjson {
                                 let reason = summary.error.as_deref().unwrap_or("gates failed");
                                 let event =
-                                    ro_output::ndjson::NdjsonEvent::gates_failed(rid, reason);
-                                println!("{}", serde_json::to_string(&event)?);
+                                    ndjson::NdjsonEvent::gates_failed(rid, reason);
+                                ndjson_out.write_event(event)?;
                                 let event =
-                                    ro_output::ndjson::NdjsonEvent::repo_done(rid, "failed");
-                                println!("{}", serde_json::to_string(&event)?);
+                                    ndjson::NdjsonEvent::repo_done(rid, "failed");
+                                ndjson_out.write_event(event)?;
                             }
                         }
                     }
                     if use_ndjson {
                         let event =
-                            ro_output::ndjson::NdjsonEvent::batch_done(applied, skipped, failed);
-                        println!("{}", serde_json::to_string(&event)?);
+                            ndjson::NdjsonEvent::batch_done(applied, skipped, failed);
+                        ndjson_out.write_event(event)?;
                     } else {
                         eprintln!(
                             "Sweep complete: {applied} applied, {skipped} skipped, {failed} failed"
                         );
+                    }
+                    if use_ndjson {
+                        ndjson_out.flush()?;
                     }
                 } else {
                     let id = repo_id.as_deref().unwrap_or("unknown");
@@ -1220,7 +1219,6 @@ fn run() -> Result<()> {
                         serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
                     println!("{json}");
                 }
-                OutputFormat::Toon => print_toon(&serde_json::to_value(&report)?)?,
             }
             std::process::exit(report.exit_code());
         }

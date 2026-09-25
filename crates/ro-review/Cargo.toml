@@ -15,7 +15,6 @@ ro-config.workspace = true
 ro-state.workspace = true
 ro-git.workspace = true
 ro-jobs.workspace = true
-ro-output.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true

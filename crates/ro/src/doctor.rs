@@ -13,7 +13,7 @@
 //!
 //! Each check returns a [`CheckResult`] with name, severity, status, and an
 //! optional fix hint or applied-fix description. The full report is rendered as
-//! human-readable text or JSON via [`ro_output`].
+//! human-readable text or JSON.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -38,56 +38,6 @@ impl GitCommandResult {
     }
 }
 
-/// Classification of a failed git command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GitErrorKind {
-    /// Authentication failure (bad creds, missing token, denied push).
-    Auth,
-    /// Network failure (DNS, TLS, refused connection).
-    Network,
-    /// Merge conflict.
-    Conflict,
-    /// Worktree is dirty (uncommitted changes block the operation).
-    Dirty,
-    /// Non-fast-forward push or pull rejected.
-    NonFastForward,
-    /// `git` binary not found on PATH.
-    GitMissing,
-    /// Anything we couldn't classify.
-    Other,
-}
-
-impl GitErrorKind {
-    pub fn classify(stderr: &str) -> Self {
-        let s = stderr.to_ascii_lowercase();
-        if s.contains("could not read username")
-            || s.contains("authentication failed")
-            || s.contains("permission denied")
-            || s.contains("403 forbidden")
-            || s.contains("401 unauthorized")
-        {
-            Self::Auth
-        } else if s.contains("could not resolve host")
-            || s.contains("connection refused")
-            || s.contains("operation timed out")
-            || s.contains("ssl certificate problem")
-        {
-            Self::Network
-        } else if s.contains("conflict") || s.contains("merge conflict") {
-            Self::Conflict
-        } else if s.contains("uncommitted changes")
-            || s.contains("would be overwritten")
-            || s.contains("local changes")
-        {
-            Self::Dirty
-        } else if s.contains("non-fast-forward") || s.contains("rejected") {
-            Self::NonFastForward
-        } else {
-            Self::Other
-        }
-    }
-}
 
 /// Options for `fetch`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -309,14 +259,6 @@ pub fn push(repo: &Path, opts: &PushOpts) -> Result<GitCommandResult> {
     run(repo, &argv)
 }
 
-/// Hard-reset the working tree to a specific OID. **Destructive.**
-pub fn reset_hard(repo: &Path, oid: &str) -> Result<GitCommandResult> {
-    if oid.is_empty() {
-        bail!("reset_hard requires an oid");
-    }
-    run(repo, &["reset", "--hard", oid])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,46 +281,6 @@ mod tests {
             "git {args:?} failed: stdout={:?} stderr={:?}",
             r.stdout,
             r.stderr
-        );
-    }
-
-    #[test]
-    fn classify_auth_errors() {
-        assert_eq!(
-            GitErrorKind::classify("fatal: Authentication failed"),
-            GitErrorKind::Auth
-        );
-        assert_eq!(
-            GitErrorKind::classify("ERROR: Permission denied"),
-            GitErrorKind::Auth
-        );
-    }
-
-    #[test]
-    fn classify_network_errors() {
-        assert_eq!(
-            GitErrorKind::classify("fatal: unable to access ... Could not resolve host"),
-            GitErrorKind::Network
-        );
-        assert_eq!(
-            GitErrorKind::classify("fatal: SSL certificate problem"),
-            GitErrorKind::Network
-        );
-    }
-
-    #[test]
-    fn classify_conflict() {
-        assert_eq!(
-            GitErrorKind::classify("CONFLICT (content): Merge conflict in foo"),
-            GitErrorKind::Conflict
-        );
-    }
-
-    #[test]
-    fn classify_other() {
-        assert_eq!(
-            GitErrorKind::classify("some random error"),
-            GitErrorKind::Other
         );
     }
 
@@ -413,26 +315,6 @@ mod tests {
         let (_tmp, path) = temp_repo();
         let err = commit(&path, &[], "msg").unwrap_err();
         assert!(err.to_string().contains("at least one file"));
-    }
-
-    #[test]
-    fn reset_hard_rejects_empty_oid() {
-        let (_tmp, path) = temp_repo();
-        let err = reset_hard(&path, "").unwrap_err();
-        assert!(err.to_string().contains("requires an oid"));
-    }
-
-    #[test]
-    fn reset_hard_to_previous_commit() {
-        let (_tmp, path) = temp_repo();
-        std::fs::write(path.join("a.txt"), "v1").unwrap();
-        let oid1 = commit(&path, &[PathBuf::from("a.txt")], "v1").unwrap();
-        std::fs::write(path.join("a.txt"), "v2").unwrap();
-        let _oid2 = commit(&path, &[PathBuf::from("a.txt")], "v2").unwrap();
-        let r = reset_hard(&path, &oid1).unwrap();
-        assert!(r.ok());
-        let content = std::fs::read_to_string(path.join("a.txt")).unwrap();
-        assert_eq!(content, "v1");
     }
 
     #[test]
