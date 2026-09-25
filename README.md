@@ -223,7 +223,7 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 | Review | `review plan` (+ apply/rollback flows) | Plan-then-apply |
 | Sweep | `sweep …` | Commit / agent sweep helpers |
 | Config | `config` | Show / set configuration |
-| Meta | `robot-docs` · `fork …` | Machine docs, forks |
+| Meta | `robot-docs` | Machine-readable docs |
 
 ```bash
 # Inventory

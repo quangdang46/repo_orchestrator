@@ -220,12 +220,6 @@ enum Commands {
         topic: Option<String>,
     },
 
-    // ── Fork ─────────────────────────────────────────────────────────
-    /// Fork management commands
-    Fork {
-        #[command(subcommand)]
-        sub: ForkCommands,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -359,31 +353,6 @@ enum ConfigCommands {
     Set {
         /// KEY=VALUE pair
         pair: String,
-    },
-}
-
-#[derive(Debug, Subcommand)]
-enum ForkCommands {
-    /// Show fork status for tracked repos
-    Status {
-        /// Specific repo key
-        repo: Option<String>,
-        /// Output format
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
-    },
-    /// Sync forks with upstream
-    Sync {
-        /// Specific repo key
-        repo: Option<String>,
-    },
-    /// Clean up stale fork branches
-    Clean {
-        /// Specific repo key
-        repo: Option<String>,
-        /// Preview only
-        #[arg(long)]
-        dry_run: bool,
     },
 }
 
@@ -1285,86 +1254,6 @@ fn run() -> Result<()> {
         Commands::RobotDocs { topic } => {
             let docs = generate_robot_docs(topic.as_deref());
             println!("{}", serde_json::to_string_pretty(&docs)?);
-        }
-
-        // ── Fork ──
-        Commands::Fork { sub } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
-            match sub {
-                ForkCommands::Status { repo, format } => {
-                    let repos = match repo {
-                        Some(key) => vec![manage::find_repo(&conn, &key)?],
-                        None => manage::list(&conn, None)?,
-                    };
-                    for r in &repos {
-                        let path = PathBuf::from(&r.local_path);
-                        let is_fork = ro_git::read::has_remote(&path, "upstream");
-                        match format {
-                            OutputFormat::Text => {
-                                let status = if is_fork {
-                                    "fork (has upstream)"
-                                } else {
-                                    "origin only"
-                                };
-                                println!("{}/{}: {status}", r.owner, r.name);
-                            }
-                            OutputFormat::Json => {
-                                let json = serde_json::json!({
-                                    "repo": format!("{}/{}", r.owner, r.name),
-                                    "is_fork": is_fork,
-                                });
-                                println!("{}", serde_json::to_string(&json)?);
-                            }
-                            OutputFormat::Toon => {
-                                let json = serde_json::json!({
-                                    "repo": format!("{}/{}", r.owner, r.name),
-                                    "is_fork": is_fork,
-                                });
-                                print_toon(&json)?;
-                            }
-                        }
-                    }
-                }
-                ForkCommands::Sync { repo } => {
-                    let repos = match repo {
-                        Some(key) => vec![manage::find_repo(&conn, &key)?],
-                        None => manage::list(&conn, None)?,
-                    };
-                    for r in &repos {
-                        let path = PathBuf::from(&r.local_path);
-                        if ro_git::read::has_remote(&path, "upstream") {
-                            match ro_git::mutation::fetch_remote(&path, "upstream") {
-                                Ok(()) => {
-                                    eprintln!("{}/{}: fetched upstream", r.owner, r.name);
-                                }
-                                Err(e) => {
-                                    eprintln!("{}/{}: fetch upstream failed: {e}", r.owner, r.name);
-                                }
-                            }
-                        }
-                    }
-                }
-                ForkCommands::Clean { repo, dry_run } => {
-                    let repos = match repo {
-                        Some(key) => vec![manage::find_repo(&conn, &key)?],
-                        None => manage::list(&conn, None)?,
-                    };
-                    for r in &repos {
-                        let path = PathBuf::from(&r.local_path);
-                        let merged = ro_git::read::merged_branches(&path);
-                        for branch in &merged {
-                            if dry_run {
-                                eprintln!(
-                                    "[dry-run] {}/{}: would delete branch {branch}",
-                                    r.owner, r.name
-                                );
-                            } else {
-                                eprintln!("{}/{}: cleaned branch {branch}", r.owner, r.name);
-                            }
-                        }
-                    }
-                }
-            }
         }
     }
 

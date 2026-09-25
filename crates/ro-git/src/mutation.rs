@@ -204,16 +204,6 @@ pub fn fetch(repo: &Path, opts: &FetchOpts) -> Result<GitCommandResult> {
     run(repo, &argv)
 }
 
-/// Fetch from a specific remote by name. Convenience wrapper around `fetch`.
-pub fn fetch_remote(repo: &Path, remote: &str) -> Result<()> {
-    let opts = FetchOpts {
-        remote: Some(remote.to_string()),
-        ..Default::default()
-    };
-    fetch(repo, &opts)?;
-    Ok(())
-}
-
 /// Pull from a remote.
 pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
     let mut args: Vec<String> = vec!["pull".to_string()];

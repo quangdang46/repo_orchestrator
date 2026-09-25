@@ -186,16 +186,6 @@ Plan-then-apply automation with a rollback path.
 
 ---
 
-## Forks
-
-| Command | Effect |
-|---|---|
-| `ro fork status` | Which tracked repos have an `upstream` remote |
-| `ro fork sync` | Sync a fork with upstream — `--strategy ff-only\|rebase\|merge`, `--push` |
-| `ro fork clean` | Remove stale branches left by a merge |
-
----
-
 ## Run history
 
 Every mutating operation records a run, so you can answer "what did we change
