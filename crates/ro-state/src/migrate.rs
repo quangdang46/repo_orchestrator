@@ -31,6 +31,8 @@ fn apply(conn: &Connection, from: i64) -> Result<()> {
         V2_REPO_TAGS,
         // v3: DROP inbox_dismissed (removed inbox feature)
         V3_DROP_INBOX,
+        // v4: DROP plans (review lifecycle) + the cached default_branch
+        V4_DROP_PLANS,
     ];
 
     for (i, sql) in migrations.iter().enumerate() {
@@ -223,6 +225,32 @@ const V3_DROP_INBOX: &str = r#"
 DROP TABLE IF EXISTS inbox_dismissed;
 "#;
 
+// v4 drops two things, and the asymmetry is the point:
+//
+//   plans                 gone, with the review lifecycle. Its table is named
+//                         by manage::NULLABLE_FK_TABLES, which was updated
+//                         in the same commit — that list is a raw string
+//                         array, and a stale entry there is invisible to
+//                         every static check and only breaks at runtime.
+//
+//   repos.default_branch  gone. It was a cache of a value git answers more
+//                         freshly: the base for a rebase comes from
+//                         `git symbolic-ref refs/remotes/origin/HEAD`, and
+//                         keeping a copy only lets the two disagree on a
+//                         rename.
+//
+// repo_health_snapshots is deliberately NOT dropped: the scorer survives and
+// --filter health:<N> still reads it.
+//
+// DROP COLUMN needs SQLite 3.35+ (2021). The workspace pins rusqlite with
+// `bundled`, so the version that matters is the one cargo resolves, not the
+// system sqlite3 — worth confirming rather than assuming.
+const V4_DROP_PLANS: &str = r#"
+-- v4: drop the review lifecycle and the cached default branch
+DROP TABLE IF EXISTS plans;
+ALTER TABLE repos DROP COLUMN default_branch;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,7 +296,6 @@ mod tests {
             "failures",
             "job_events",
             "jobs",
-            "plans",
             "repo_health_snapshots",
             "repo_tags",
             "repos",

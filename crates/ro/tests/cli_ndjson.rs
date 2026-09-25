@@ -103,8 +103,15 @@ fn the_batch_is_opened_and_closed() {
 
 #[test]
 fn timestamps_increase_along_the_batch() {
-    // A writer that is constructed per event, or one that reuses a stale
-    // clock, would still satisfy "has a ts" but not this.
+    // A writer constructed per event, or one reusing a stale clock, would
+    // still satisfy "has a ts" but not this.
+    //
+    // The comparison is `>=` and must stay `>=`. `NdjsonWriter` formats
+    // RFC3339 at nanosecond resolution, and a batch can legitimately
+    // contain two events stamped in the same nanosecond under load. Tightening
+    // this to `>` reads as "make it stricter" and would produce a test that
+    // fails perhaps one run in twenty on a busy CI machine — the kind of flake
+    // nobody believes and everybody learns to re-run.
     let events = Cli::new().sweep_ndjson();
     let stamps: Vec<&str> = events
         .iter()

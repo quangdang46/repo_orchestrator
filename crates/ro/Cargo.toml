@@ -24,7 +24,6 @@ ro-git.workspace = true
 ro-github.workspace = true
 ro-jobs.workspace = true
 ro-sync.workspace = true
-ro-review.workspace = true
 ro-sweep.workspace = true
 clap.workspace = true
 tokio.workspace = true

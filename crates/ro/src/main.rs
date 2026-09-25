@@ -26,13 +26,6 @@ enum OutputFormat {
     Json,
 }
 
-/// Auto-approve level for plan application.
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-enum AutoApproveLevel {
-    #[default]
-    None,
-    Low,
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "ro", about = "GitHub-first repo orchestration CLI", version, long_about = None)]
@@ -151,13 +144,6 @@ enum Commands {
 
     // ── Health ───────────────────────────────────────────────────────
     /// Show health score for repos
-    Health {
-        /// Specific repo key
-        repo: Option<String>,
-        /// Output format
-        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-        format: OutputFormat,
-    },
 
     // ── Runs / Timeline ──────────────────────────────────────────────
     /// Run management commands
@@ -175,10 +161,6 @@ enum Commands {
 
     // ── Review ───────────────────────────────────────────────────────
     /// Review plan/apply commands
-    Review {
-        #[command(subcommand)]
-        sub: ReviewCommands,
-    },
 
     // ── Sweep ────────────────────────────────────────────────────────
     /// Sweep commands (commit, agent)
@@ -237,29 +219,6 @@ enum ConflictCommands {
 }
 
 #[derive(Debug, Subcommand)]
-enum ReviewCommands {
-    /// Create a review plan
-    Plan {
-        /// Repo key
-        repo: String,
-        /// Plan description
-        #[arg(long)]
-        summary: Option<String>,
-        /// Risk level: low, medium, high
-        #[arg(long)]
-        risk: Option<String>,
-    },
-    /// Approve a pending plan so it can be applied
-    Approve { plan_id: String },
-    /// Reject a pending or approved plan
-    Reject { plan_id: String },
-    /// Apply a previously-approved review plan
-    Apply { plan_id: String },
-    /// Roll back a previously-applied plan
-    Rollback { plan_id: String },
-    /// List plans
-    ListPlans,
-}
 
 #[derive(Debug, Subcommand)]
 enum SweepCommands {
@@ -292,9 +251,6 @@ enum SweepCommands {
         /// Preview without changes
         #[arg(long)]
         dry_run: bool,
-        /// Auto-approve level: none (default), low
-        #[arg(long, value_enum, default_value_t = AutoApproveLevel::None)]
-        auto_approve: AutoApproveLevel,
         /// NDJSON event stream output
         #[arg(long)]
         output: Option<String>,
@@ -345,15 +301,6 @@ enum ConfigCommands {
     },
 }
 
-/// Parse a `--risk` flag value into a [`ro_review::plan::PlanRisk`].
-fn parse_risk(s: &str) -> Result<ro_review::plan::PlanRisk> {
-    match s.to_ascii_lowercase().as_str() {
-        "low" => Ok(ro_review::plan::PlanRisk::Low),
-        "medium" | "med" => Ok(ro_review::plan::PlanRisk::Medium),
-        "high" => Ok(ro_review::plan::PlanRisk::High),
-        other => anyhow::bail!("unknown risk class {other:?} (expected low|medium|high)"),
-    }
-}
 
 /// Build a `repo.id -> "owner/name"` map for friendlier text rendering.
 fn repo_labels_by_id(conn: &ro_state::Connection) -> std::collections::HashMap<String, String> {
@@ -761,31 +708,6 @@ fn run() -> Result<()> {
         }
 
         // ── Health / Inbox ──
-        Commands::Health { repo, format } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
-            let snapshots = match repo {
-                Some(key) => {
-                    let found = manage::find_repo(&conn, &key)?;
-                    vec![ro_state::queries::score_repo_health(&conn, &found.id)?]
-                }
-                None => ro_state::queries::score_all_health(&conn)?,
-            };
-            let repo_labels = repo_labels_by_id(&conn);
-            for snap in &snapshots {
-                match format {
-                    OutputFormat::Text => {
-                        let label = repo_labels
-                            .get(&snap.repo_id)
-                            .cloned()
-                            .unwrap_or_else(|| snap.repo_id.clone());
-                        println!("{}: score={} class={}", label, snap.score, snap.class);
-                    }
-                    OutputFormat::Json => {
-                        println!("{}", serde_json::to_string(snap)?);
-                    }
-                }
-            }
-        }
 
         // ── Runs / Timeline ──
         Commands::Run { sub } => {
@@ -875,59 +797,6 @@ fn run() -> Result<()> {
         }
 
         // ── Review ──
-        Commands::Review { sub } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
-            match sub {
-                ReviewCommands::Plan {
-                    repo,
-                    summary,
-                    risk,
-                } => {
-                    let found = manage::find_repo(&conn, &repo)?;
-                    let risk_class = match risk.as_deref() {
-                        Some(r) => Some(parse_risk(r)?),
-                        None => None,
-                    };
-                    let input = ro_review::plan::PlanInput {
-                        repo_id: Some(found.id.clone()),
-                        kind: "review".into(),
-                        plan_json: serde_json::json!({"summary": summary.unwrap_or_default()})
-                            .to_string(),
-                        risk_class,
-                        risk_reasons_json: None,
-                        rollback_json: None,
-                    };
-                    let plan = ro_review::plan::create_plan(&conn, &input)?;
-                    eprintln!("Created plan {} for {}", plan.id, repo);
-                }
-                ReviewCommands::Approve { plan_id } => {
-                    ro_review::plan::approve_plan(&conn, &plan_id)?;
-                    eprintln!("Approved plan {plan_id}.");
-                }
-                ReviewCommands::Reject { plan_id } => {
-                    ro_review::plan::reject_plan(&conn, &plan_id)?;
-                    eprintln!("Rejected plan {plan_id}.");
-                }
-                ReviewCommands::Apply { plan_id } => {
-                    let result = ro_review::apply::apply_plan(&conn, &plan_id)?;
-                    eprintln!(
-                        "Applied plan {} (status={}, applied_at={})",
-                        result.plan_id, result.status, result.applied_at
-                    );
-                }
-                ReviewCommands::Rollback { plan_id } => {
-                    ro_review::apply::rollback_plan(&conn, &plan_id)?;
-                    eprintln!("Rolled back plan {plan_id}.");
-                }
-                ReviewCommands::ListPlans => {
-                    let plans = ro_review::plan::list_plans(&conn, None)?;
-                    for p in &plans {
-                        let repo_label = p.repo_id.as_deref().unwrap_or("-");
-                        println!("{} {} {} {}", p.id, repo_label, p.kind, p.status);
-                    }
-                }
-            }
-        }
 
         // ── Sweep ──
         Commands::Sweep { sub } => match sub {
@@ -1013,8 +882,7 @@ fn run() -> Result<()> {
                                     ndjson::NdjsonEvent::gates_passed(rid, "plan");
                                 ndjson_out.write_event(event)?;
                             }
-                            if matches!(auto_approve, AutoApproveLevel::Low) && summary.gates_passed
-                            {
+                            if summary.gates_passed {
                                 applied += 1;
                                 if use_ndjson {
                                     let event =

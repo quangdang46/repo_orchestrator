@@ -166,9 +166,14 @@ pub fn delete_repo_cascade(conn: &Connection, repo_id: &str) -> rusqlite::Result
     // delete outright and must be cleared first.
     const CHILD_TABLES: &[&str] = &["sync_results", "repo_health_snapshots", "context_cache"];
     // Tables with a nullable FK to repos(id). We null them out so historical
-    // run/plan/job records survive a prune (audit-friendly) but no longer
+    // run/job records survive a prune (audit-friendly) but no longer
     // hold a reference to a row that's about to disappear.
-    const NULLABLE_FK_TABLES: &[&str] = &["jobs", "plans"];
+    //
+    // "plans" was here and is now gone with the V4 migration that drops its
+    // table. Leaving the name in would make `ro remove` issue an UPDATE
+    // against a table that no longer exists — green in every static check,
+    // broken at runtime.
+    const NULLABLE_FK_TABLES: &[&str] = &["jobs"];
 
     let tx = conn.unchecked_transaction()?;
     for table in CHILD_TABLES {
