@@ -84,17 +84,6 @@ Print the inventory. Use `--format json` or `--format toon` to read it from a
 script or an agent. Output is one JSON object per line, which makes it
 streamable and append-friendly.
 
-### `ro import`
-Bulk-load repos into the inventory.
-
-| Flag | Source |
-|---|---|
-| `--stars` | Repos you have starred |
-| `--org <NAME>` | Every repo in an organization |
-| `--user <NAME>` | Every repo belonging to a user |
-| `--limit <N>` | Cap the number imported |
-| *(no flag)* | Read a list of specs from a file |
-
 ---
 
 ## Working copies

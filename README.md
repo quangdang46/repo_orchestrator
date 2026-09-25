@@ -96,7 +96,6 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 ```bash
 ro init
 ro add quangdang46/repo_orchestrator
-ro import --org my-org --limit 50
 ro sync -j 4
 ro status --format json
 ro health
@@ -188,7 +187,6 @@ Requires Rust **1.85+**.
 ```bash
 ro init
 ro add quangdang46/repo_orchestrator
-ro import repos.list                 # or: ro import --stars / --org ORG / --user USER
 ro sync
 ro status
 ro health
@@ -230,7 +228,6 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 ```bash
 # Inventory
 ro add owner/repo
-ro import --org my-org --limit 100
 ro list --owner my-org --format json
 
 # Sync fleet
@@ -396,11 +393,12 @@ Local SQLite under the configured state directory (`ro init` / `ro doctor`).
 
 ### Can I import stars / orgs?
 
+No — bulk-loading a cloud org or stars list is orthogonal to managing a local
+fleet, and `ro import` was removed. Register the repos you want:
+
 ```bash
-ro import --stars --limit 100
-ro import --org my-org
-ro import --user someuser --limit 50
-ro import repos.list
+ro add owner/repo        # clone and track
+ro add .                 # track a repo you already have
 ```
 
 ### How do I upgrade?

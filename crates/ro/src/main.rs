@@ -474,7 +474,6 @@ fn generate_robot_docs(topic: Option<&str>) -> serde_json::Value {
                 {"name": "add", "description": "Add a repo to tracking", "args": ["<spec>"]},
                 {"name": "remove", "description": "Remove a repo from tracking", "args": ["<key>"]},
                 {"name": "list", "description": "List tracked repos", "flags": ["--owner", "--format"]},
-                {"name": "import", "description": "Import repos from file, stars, org, or user", "flags": ["--stars", "--org", "--user", "--limit"]},
                 {"name": "sync", "description": "Sync all tracked repos", "flags": ["--strategy", "--dry-run", "--clone-only", "--pull-only", "--autostash", "--parallel", "--timeout", "--resume"]},
                 {"name": "status", "description": "Show status of tracked repos", "args": ["[repo]"]},
                 {"name": "prune", "description": "Prune removed/missing repos", "flags": ["--archived", "--missing"]},
