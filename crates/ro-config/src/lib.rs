@@ -9,5 +9,5 @@ pub mod validate;
 
 pub use loader::{load_config, load_default, set_key_in_file, write_default};
 pub use paths::{ConfigPaths, default_config_toml, expand_tilde};
-pub use schema::AppConfig;
+pub use schema::{AppConfig, CheckpointConfig};
 pub use validate::validate;

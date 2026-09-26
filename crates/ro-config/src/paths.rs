@@ -165,9 +165,12 @@ stdio = true
 sse = false
 sse_port = 7300
 
-[review]
-provider = "claude"        # claude | codex
-quality_gates = "auto"     # auto | on | off
+# [review] was removed. Its two settings moved:
+#   review.provider      -> no longer needed; see [agent].engine
+#   review.quality_gates -> [checkpoint].quality_gates  (default changed
+#                           from "auto" to "off", see below)
+# A config still carrying [review] parses cleanly and the table is ignored,
+# which is why `ro` prints a deprecation note naming the new keys.
 
 # [agent] — which engine commits, and how it is invoked.
 # Exactly three built-ins, no plugin registry: claude | codex | git.
@@ -190,6 +193,22 @@ quality_gates = "auto"     # auto | on | off
 #
 # [providers.claude] and [providers.codex] are the old form. They are still
 # read, with a deprecation warning, and stop being read in a future release.
+
+# [checkpoint] — what runs before a WIP commit is written.
+# This is the last thing between a WIP commit and a leaked credential.
+#
+# secret_scan: off | warn | block. "block" is the default. A pasted
+#   ghp_... is stopped here, with the matched text redacted.
+#
+# quality_gates: off | on. **Off by default.** It runs
+#   `cargo test --workspace` over the WHOLE tree, so one pre-existing
+#   failure in an untouched crate blocks a one-file commit — and across
+#   a twenty-repo fleet that check dominates the cost of the run. A gate
+#   that fires on things you did not touch teaches you to override it,
+#   and the override disables the gates that matter.
+[checkpoint]
+secret_scan = "block"
+quality_gates = "off"
 
 [safety]
 secret_scan = "block"      # off | warn | block
@@ -252,7 +271,7 @@ mod tests {
         assert!(parsed.get("git").is_some());
         assert!(parsed.get("jobs").is_some());
         assert!(parsed.get("mcp").is_some());
-        assert!(parsed.get("review").is_some());
+        assert!(parsed.get("checkpoint").is_some());
         assert!(parsed.get("agent").is_some());
         assert!(parsed.get("auth").is_some());
         assert!(parsed.get("safety").is_some());

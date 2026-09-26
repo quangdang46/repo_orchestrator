@@ -28,7 +28,113 @@ pub struct AppConfig {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
+    pub checkpoint: CheckpointConfig,
+    #[serde(default)]
     pub safety: SafetyConfig,
+}
+
+/// `[checkpoint]` — what runs before a WIP commit is written.
+///
+/// This table exists because the preflight used to have **no**
+/// configuration at all: it hardcoded `SecretScanMode::Warn`, which makes
+/// `should_block` permanently false, so the `BlockedBySecrets` variant was
+/// unreachable and a repo containing a live-looking credential was committed
+/// anyway. A safety net nobody can switch is not a safety net.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointConfig {
+    /// `off` | `warn` | `block`.
+    ///
+    /// `block` is the default. The preflight is the last thing standing
+    /// between a WIP commit and a leaked credential, and a default that
+    /// permits the leak is not a default anyone would choose knowingly.
+    #[serde(default = "default_secret_scan")]
+    pub secret_scan: String,
+    /// `off` | `on`.
+    ///
+    /// **Off by default, and the reason is the cost.** `run_all` invokes
+    /// `cargo test --workspace` over the *whole* tree, so one
+    /// pre-existing failure in an untouched crate blocks a one-file commit
+    /// — and across a twenty-repo fleet that check is the dominant cost of
+    /// the run. A gate that fires on things the user did not touch trains
+    /// people to reach for the override, which disables the gates that do
+    /// matter.
+    #[serde(default = "default_quality_gates_off")]
+    pub quality_gates: String,
+}
+
+/// The gates do not run unless asked.
+///
+/// The old default was `"auto"`, a third value that meant "on, except when
+/// it looks expensive" — decided at runtime by code that then ran the same
+/// `cargo test --workspace` either way. Off is a value the user can reason
+/// about; "auto" was one they had to look up.
+fn default_quality_gates_off() -> String {
+    "off".to_string()
+}
+
+impl AppConfig {
+    /// A deprecation note, or `None` when the config is already current.
+    ///
+    /// `AppConfig` deliberately has no `deny_unknown_fields` — a config
+    /// carrying a key from a newer ro must still load — so a renamed
+    /// table is otherwise read as "your setting quietly does nothing",
+    /// which is the worst failure a config rename can have. Saying so is
+    /// the difference between a rename and a silent data loss.
+    pub fn review_deprecation_note(&self) -> Option<String> {
+        let mut moved: Vec<&str> = Vec::new();
+        if self.review.quality_gates.is_some() {
+            moved.push("checkpoint.quality_gates");
+        }
+        if self.review.provider.is_some() {
+            moved.push("agent.engine");
+        }
+        if moved.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "[review] is no longer read. Its settings moved: {}. \
+             A config still carrying [review] loads, and the old keys are \
+             ignored, so the setting you wrote is not the one in effect.",
+            moved.join(", ")
+        ))
+    }
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            secret_scan: default_secret_scan(),
+            quality_gates: default_quality_gates_off(),
+        }
+    }
+}
+
+impl CheckpointConfig {
+    /// The secret-scan mode, as a string.
+    ///
+    /// Returns the string rather than a parsed enum because the enum
+    /// lives in `ro-sweep` and `ro-config` must not depend on it —
+    /// `ro-sweep` already depends on `ro-config`, so parsing there is
+    /// the only layering that works. `validate` rejects bad values at
+    /// load time, so an unrecognised value here means validation was
+    /// skipped; `block` is the safe answer in that case, because letting
+    /// a credential through is the outcome nobody can undo.
+    pub fn secret_scan_mode(&self) -> &str {
+        match self.secret_scan.as_str() {
+            "off" => "off",
+            "warn" => "warn",
+            _ => "block",
+        }
+    }
+
+    /// Should the quality gates run at all?
+    ///
+    /// Off by default, for the cost reason in the field docs. Off means
+    /// *not run*, not *run and pass* — a skipped gate must not be
+    /// recorded as a passed one.
+    pub fn quality_gates_enabled(&self) -> bool {
+        self.quality_gates == "on"
+    }
 }
 
 impl AppConfig {
@@ -228,22 +334,22 @@ impl Default for McpConfig {
     }
 }
 
-/// `[review]` — review/sweep defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `[review]` — removed; the settings moved to `[checkpoint]`.
+///
+/// Kept only to recognise it. `AppConfig` has no `deny_unknown_fields`, so
+/// a config still carrying `[review]` parses cleanly and the table is
+/// ignored — which is exactly the silent-failure mode that makes a rename
+/// a data-loss event. Reading it here turns "your setting does nothing" into
+/// a message naming the key to write instead.
+///
+/// The type is otherwise unused: nothing reads `provider` or
+/// `quality_gates` from here any more.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReviewConfig {
-    #[serde(default = "default_review_provider")]
-    pub provider: String,
-    #[serde(default = "default_quality_gates")]
-    pub quality_gates: String,
-}
-
-impl Default for ReviewConfig {
-    fn default() -> Self {
-        Self {
-            provider: default_review_provider(),
-            quality_gates: default_quality_gates(),
-        }
-    }
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub quality_gates: Option<String>,
 }
 
 /// `[agent]` — which engine commits, and how it is invoked.
@@ -358,12 +464,6 @@ fn default_job_timeout_secs() -> u32 {
 fn default_sse_port() -> u16 {
     7300
 }
-fn default_review_provider() -> String {
-    "claude".into()
-}
-fn default_quality_gates() -> String {
-    "auto".into()
-}
 
 #[cfg(test)]
 mod tests {
@@ -429,6 +529,46 @@ default_args = ["exec"]
         let cfg: AppConfig = toml::from_str("[agent]\nengine = \"codex\"\n").unwrap();
         assert_eq!(cfg.resolved_engine(), Some("codex"));
         assert!(cfg.engine_deprecation_note().is_none());
+    }
+
+    /// The gate that actually blocks a leaked credential has to be the
+    /// default. Anything else and the safe path is opt-in, which is the
+    /// one thing a safety net cannot be.
+    #[test]
+    fn the_secret_scan_blocks_by_default_and_the_gates_do_not_run() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.checkpoint.secret_scan, "block");
+        assert_eq!(
+            cfg.checkpoint.secret_scan_mode(),
+            "block",
+            "and the accessor must agree with the field, or the two can drift"
+        );
+        assert!(
+            !cfg.checkpoint.quality_gates_enabled(),
+            "quality gates are off by default; see the field docs for why"
+        );
+    }
+
+    /// A renamed table that is merely ignored is a silent data loss: the
+    /// config parses, the setting does nothing, and the user finds out by
+    /// watching their commits not happen.
+    #[test]
+    fn a_config_still_carrying_review_is_told_where_the_settings_moved() {
+        let cfg: AppConfig =
+            toml::from_str("[review]\nprovider = \"claude\"\nquality_gates = \"on\"\n").unwrap();
+        let note = cfg
+            .review_deprecation_note()
+            .expect("a moved table must warn");
+        assert!(note.contains("checkpoint.quality_gates"), "got: {note}");
+        assert!(note.contains("agent.engine"), "got: {note}");
+    }
+
+    /// And a current config must not warn, or the warning is noise people
+    /// learn to scroll past — and then the one that matters is missed too.
+    #[test]
+    fn a_current_config_says_nothing_about_review() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.review_deprecation_note(), None);
     }
 
     /// Path 1 of 3: the global config file.
@@ -511,8 +651,9 @@ expected_login = "quangdang46"
         assert!(cfg.mcp.stdio);
         assert!(!cfg.mcp.sse);
         assert_eq!(cfg.mcp.sse_port, 7300);
-        assert_eq!(cfg.review.provider, "claude");
-        assert_eq!(cfg.review.quality_gates, "auto");
+        // `[review]` is gone; its settings moved to `[checkpoint]`, and a
+        // default config must not trip its own deprecation note.
+        assert_eq!(cfg.review_deprecation_note(), None);
         assert_eq!(cfg.safety.secret_scan, "block");
         assert!(cfg.safety.require_plan_for_ai_apply);
         assert_eq!(cfg.safety.max_auto_apply_risk, "low");

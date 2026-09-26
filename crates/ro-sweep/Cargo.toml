@@ -12,6 +12,9 @@ publish = false
 [dependencies]
 # For the single redaction rule, shared with the identity guard.
 ro-core.workspace = true
+# For CheckpointConfig, so the preflight reads the configured mode instead of
+# the hardcoded Warn that made BlockedBySecrets unreachable.
+ro-config.workspace = true
 ro-sync.workspace = true
 ro-state.workspace = true
 ro-git.workspace = true

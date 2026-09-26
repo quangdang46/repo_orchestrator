@@ -9,6 +9,7 @@ use std::path::Path;
 use crate::denylist::Denylist;
 use crate::quality_gates;
 use crate::secret_scan::{self};
+use ro_config::CheckpointConfig;
 use serde::{Deserialize, Serialize};
 
 /// Summary of an agent sweep attempt.
@@ -16,7 +17,13 @@ use serde::{Deserialize, Serialize};
 pub struct SweepSummary {
     pub repo_id: String,
     pub plan_created: bool,
-    pub gates_passed: bool,
+    /// `None` when the gates were **not run** — which is the default.
+    ///
+    /// A `bool` here would have to say `true` for "skipped", and "skipped"
+    /// reported as "passed" is the same unknown-versus-false confusion
+    /// ro-dab.4 removed one layer up: a user reading this field would
+    /// conclude the gates cleared a tree they never touched.
+    pub gates_passed: Option<bool>,
     pub secrets_clean: bool,
     pub denylist_clean: bool,
     pub applied: bool,
@@ -29,20 +36,29 @@ pub struct SweepSummary {
 /// 2. Scan all files in the repo for secrets.
 /// 3. Check denylist on all files.
 /// 4. If all pass, mark as sweepable.
-pub fn sweep_repo(repo_path: &Path, repo_id: &str) -> Result<SweepSummary> {
+pub fn sweep_repo(
+    repo_path: &Path,
+    repo_id: &str,
+    checkpoint: &CheckpointConfig,
+) -> Result<SweepSummary> {
     let mut summary = SweepSummary {
         repo_id: repo_id.to_string(),
         plan_created: false,
-        gates_passed: false,
+        gates_passed: None,
         secrets_clean: false,
         denylist_clean: false,
         applied: false,
         error: None,
     };
 
-    // Run quality gates
-    let gates = quality_gates::run_all(repo_path)?;
-    summary.gates_passed = !quality_gates::any_failed(&gates);
+    // Quality gates, opt-in. `run_all` invokes `cargo test --workspace`
+    // over the whole tree, so leaving it on by default means one
+    // pre-existing failure in an untouched crate makes every repo look
+    // unsweepable — across a fleet, that is not a gate, it is an outage.
+    if checkpoint.quality_gates_enabled() {
+        let gates = quality_gates::run_all(repo_path)?;
+        summary.gates_passed = Some(!quality_gates::any_failed(&gates));
+    }
 
     // Collect all files (tracked + untracked)
     let all_files = collect_all_files(repo_path)?;
@@ -67,7 +83,10 @@ pub fn sweep_repo(repo_path: &Path, repo_id: &str) -> Result<SweepSummary> {
         .collect();
     summary.denylist_clean = violations.is_empty();
 
-    if summary.gates_passed && summary.secrets_clean && summary.denylist_clean {
+    // `None` is a skip, not a failure: an unrun gate must not block, or
+    // turning the gates off would block everything instead.
+    let gates_ok = summary.gates_passed.unwrap_or(true);
+    if gates_ok && summary.secrets_clean && summary.denylist_clean {
         summary.plan_created = true;
     }
 
@@ -143,12 +162,51 @@ mod tests {
             .expect("git config name");
     }
 
+    /// Quality gates explicitly on. They invoke `cargo test --workspace`,
+    /// so a test that wants them has to say so.
+    fn gates_on() -> CheckpointConfig {
+        CheckpointConfig {
+            quality_gates: "on".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The default is off, and that is a real answer rather than a pass.
+    ///
+    /// `gates_passed` is `Option<bool>` precisely so "not run" is
+    /// distinguishable from "ran and passed". With the gates on by default
+    /// this would have been `None` on a fresh repo and `Some(true)` on one
+    /// whose tests happen to pass — and a reader could not tell those apart.
+    #[test]
+    fn the_gates_are_off_by_default_and_say_so() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let summary = sweep_repo(tmp.path(), "test-repo", &CheckpointConfig::default()).unwrap();
+        assert_eq!(
+            summary.gates_passed, None,
+            "an unrun gate must report None, never Some(true)"
+        );
+    }
+
+    /// And a skipped gate must not block the sweep. If it did, turning the
+    /// gates off would block every repo instead of running fewer checks.
+    #[test]
+    fn a_skipped_gate_does_not_block() {
+        let tmp = TempDir::new().unwrap();
+        git_init(tmp.path());
+        let summary = sweep_repo(tmp.path(), "test-repo", &CheckpointConfig::default()).unwrap();
+        assert!(
+            summary.plan_created,
+            "nothing should block when the gates are off"
+        );
+    }
+
     #[test]
     fn sweep_repo_empty_repo_passes_gates() {
         let tmp = TempDir::new().unwrap();
         git_init(tmp.path());
-        let summary = sweep_repo(tmp.path(), "test-repo").unwrap();
-        assert!(summary.gates_passed);
+        let summary = sweep_repo(tmp.path(), "test-repo", &gates_on()).unwrap();
+        assert_eq!(summary.gates_passed, Some(true));
         assert!(summary.secrets_clean);
         assert!(summary.denylist_clean);
         assert!(summary.plan_created);
@@ -164,7 +222,7 @@ mod tests {
             b"api_key = 'ghp_1234567890abcdef1234567890abcdef1234'\n",
         )
         .unwrap();
-        let summary = sweep_repo(tmp.path(), "test-repo").unwrap();
+        let summary = sweep_repo(tmp.path(), "test-repo", &CheckpointConfig::default()).unwrap();
         assert!(!summary.secrets_clean, "expected secrets_clean=false");
     }
 
@@ -173,7 +231,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         git_init(tmp.path());
         std::fs::write(tmp.path().join(".env"), b"SECRET=foo\n").unwrap();
-        let summary = sweep_repo(tmp.path(), "test-repo").unwrap();
+        let summary = sweep_repo(tmp.path(), "test-repo", &CheckpointConfig::default()).unwrap();
         assert!(!summary.denylist_clean, "expected denylist_clean=false");
     }
 }

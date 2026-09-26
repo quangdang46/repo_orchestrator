@@ -47,22 +47,29 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
         bail!("jobs.max_attempts: must be >= 1");
     }
 
-    if !["claude", "codex"].contains(&cfg.review.provider.as_str()) {
+    // `[checkpoint]` is the only place these two settings live now.
+    // `review.quality_gates` used to be validated here and read by nobody:
+    // a key that is checked and then ignored is worse than one that is
+    // absent, because a user who sets it reasonably concludes it is
+    // doing something.
+    if !["off", "warn", "block"].contains(&cfg.checkpoint.secret_scan.as_str()) {
         bail!(
-            "review.provider: '{}' is not valid (expected: claude | codex)",
-            cfg.review.provider
+            "checkpoint.secret_scan: '{}' is not valid (expected: off | warn | block)",
+            cfg.checkpoint.secret_scan
         );
     }
-    if !["auto", "on", "off"].contains(&cfg.review.quality_gates.as_str()) {
+    if !["off", "on"].contains(&cfg.checkpoint.quality_gates.as_str()) {
         bail!(
-            "review.quality_gates: '{}' is not valid (expected: auto | on | off)",
-            cfg.review.quality_gates
+            "checkpoint.quality_gates: '{}' is not valid (expected: off | on)",
+            cfg.checkpoint.quality_gates
         );
     }
 
     if !["off", "warn", "block"].contains(&cfg.safety.secret_scan.as_str()) {
         bail!(
-            "safety.secret_scan: '{}' is not valid (expected: off | warn | block)",
+            "safety.secret_scan: '{}' is not valid (expected: off | warn | block). \
+             The checkpoint preflight reads `checkpoint.secret_scan`; this key is \
+             read by nothing.",
             cfg.safety.secret_scan
         );
     }

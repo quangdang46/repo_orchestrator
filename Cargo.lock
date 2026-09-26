@@ -2817,6 +2817,7 @@ dependencies = [
  "anyhow",
  "globset",
  "regex",
+ "ro-config",
  "ro-core",
  "ro-git",
  "ro-state",

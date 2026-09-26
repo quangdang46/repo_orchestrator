@@ -530,6 +530,12 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = resolve_paths(&cli)?;
     let db_path = paths.state_db();
+    // Loaded once and threaded into the preflights, which use to have no
+    // configuration at all. `unwrap_or_default` because a command that
+    // never reaches a preflight should not fail on a config it never read.
+    let checkpoint_config = ro_config::load_config(&paths.config_toml())
+        .unwrap_or_default()
+        .checkpoint;
     let non_interactive = cli.non_interactive;
     let _quiet = cli.quiet;
 
@@ -854,7 +860,26 @@ fn run() -> Result<()> {
         // ── Sweep ──
         Commands::Sweep { sub } => match sub {
             SweepCommands::Commit { path, message } => {
-                let result = ro_sweep::commit::sweep_commit(&path, &message)?;
+                // The preflight's settings come from `[checkpoint]`. They
+                // used to be hardcoded, which is what made the secret-scan
+                // block unreachable — a user could not have turned it on,
+                // because there was nothing to turn.
+                let config = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
+                let result = ro_sweep::commit::sweep_commit(&path, &message, &config.checkpoint)?;
+                // Decided before the match: the arms below move fields out
+                // of `result`, so checking afterwards would read a partially
+                // moved value.
+                //
+                // A block is a failure, and a script driving `ro` cannot see
+                // the message on stderr — only the exit code. Exiting 0 after
+                // refusing to commit reports success for a run that did
+                // nothing, which is how a credential scan gets disabled
+                // "temporarily" and then forgotten.
+                let blocked = !matches!(
+                    result,
+                    ro_sweep::commit::CommitOutcome::Committed { .. }
+                        | ro_sweep::commit::CommitOutcome::NothingToCommit
+                );
                 match result {
                     ro_sweep::commit::CommitOutcome::Committed { oid, .. } => {
                         eprintln!("Committed: {oid}");
@@ -863,14 +888,31 @@ fn run() -> Result<()> {
                         eprintln!("Nothing to commit.");
                     }
                     ro_sweep::commit::CommitOutcome::BlockedByGates { failures } => {
-                        eprintln!("Blocked by gates: {:?}", failures);
+                        eprintln!("Blocked by quality gates: {}", failures.join(", "));
+                        eprintln!(
+                            "  these run `cargo test --workspace` over the whole tree, so a \
+                             pre-existing failure in an untouched crate can block a one-file \
+                             commit. Set `checkpoint.quality_gates = \"off\"` (the default) to \
+                             skip them, or \"on\" to keep this check."
+                        );
                     }
                     ro_sweep::commit::CommitOutcome::BlockedBySecrets { files } => {
-                        eprintln!("Blocked by secrets: {:?}", files);
+                        eprintln!("Blocked: possible secret in {}", files.join(", "));
+                        eprintln!(
+                            "  the matched text is redacted. Remove the secret, or set \
+                             `checkpoint.secret_scan = \"warn\"` to commit anyway (the \
+                             default is \"block\")."
+                        );
                     }
                     ro_sweep::commit::CommitOutcome::BlockedByDenylist { files } => {
-                        eprintln!("Blocked by denylist: {:?}", files);
+                        eprintln!("Blocked by denylist: {}", files.join(", "));
+                        eprintln!(
+                            "  these paths are never committed. Add to .gitignore to stop seeing this."
+                        );
                     }
+                }
+                if blocked {
+                    std::process::exit(1);
                 }
             }
             SweepCommands::Agent {
@@ -925,13 +967,17 @@ fn run() -> Result<()> {
                             }
                             continue;
                         }
-                        let summary = ro_sweep::agent::sweep_repo(repo_path, rid)?;
+                        let summary =
+                            ro_sweep::agent::sweep_repo(repo_path, rid, &checkpoint_config)?;
                         if summary.plan_created {
                             if use_ndjson {
                                 let event = ndjson::NdjsonEvent::gates_passed(rid, "plan");
                                 ndjson_out.write_event(event)?;
                             }
-                            if summary.gates_passed {
+                            // `None` = the gates were off, so they did not
+                            // block. Reporting that as a skip would make
+                            // every repo look blocked by default.
+                            if summary.gates_passed.unwrap_or(true) {
                                 applied += 1;
                                 if use_ndjson {
                                     let event = ndjson::NdjsonEvent::repo_done(rid, "ok");
@@ -969,7 +1015,7 @@ fn run() -> Result<()> {
                     }
                 } else {
                     let id = repo_id.as_deref().unwrap_or("unknown");
-                    let summary = ro_sweep::agent::sweep_repo(&path, id)?;
+                    let summary = ro_sweep::agent::sweep_repo(&path, id, &checkpoint_config)?;
                     println!("{}", serde_json::to_string_pretty(&summary)?);
                 }
             }

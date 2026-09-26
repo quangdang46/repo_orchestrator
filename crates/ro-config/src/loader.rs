@@ -24,6 +24,10 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
     // Loud, not silent. A deprecated key that is merely tolerated is a
     // deprecated key nobody migrates off, and the whole point of reading the
     // old table is that the reading stops eventually.
+    if let Some(note) = config.review_deprecation_note() {
+        tracing::warn!("{note}");
+        eprintln!("warning: {note}");
+    }
     if let Some(note) = config.engine_deprecation_note() {
         tracing::warn!("{note}");
         eprintln!("warning: {note}");
