@@ -53,6 +53,16 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@stable
+      # `keyring` (ro-core's default-on `keychain` feature) reaches
+      # `dbus-secret-service` -> `libdbus-sys`, whose build script links
+      # against the system `dbus-1`. Without the headers it panics with a
+      # bare "explicit panic" and no crate name, so the failure reads as a
+      # broken build rather than a missing dependency.
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Windows post-save sometimes fails with file-lock errors, marking
