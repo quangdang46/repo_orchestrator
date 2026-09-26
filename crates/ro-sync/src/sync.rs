@@ -250,6 +250,39 @@ pub fn sync_repo(
             ..Default::default()
         };
 
+        // A dirty worktree is skipped, not clobbered.
+        //
+        // There is deliberately no `--force` on this command. A fleet tool
+        // that discards uncommitted work because someone typed a flag
+        // while rushing is a tool that gets uninstalled after the first
+        // accident. `--autostash` is the way to say "yes, I mean it", and
+        // the skip names the count so the user can decide.
+        let dirty_count = dirty_file_count(local)?;
+        if dirty_count > 0 && !opts.autostash && !opts.dry_run {
+            let duration = start.elapsed().as_millis() as u64;
+            let detail = format!("{dirty_count} uncommitted change(s) (use --autostash)");
+            record_result(
+                conn,
+                run_id,
+                &repo.id,
+                "skipped_dirty",
+                "skipped",
+                duration,
+                Some(&detail),
+                &pre_oid,
+                &pre_oid,
+            )?;
+            return Ok(SyncResult {
+                repo_id: repo.id.clone(),
+                action: "skipped_dirty".into(),
+                status: "skipped".into(),
+                duration_ms: duration,
+                error: None,
+                pre_oid: pre_oid.clone(),
+                post_oid: pre_oid,
+            });
+        }
+
         let pull_result = ro_git::mutation::pull(local, &pull_opts);
         let post_oid = ro_git::read::head_oid(local).ok().flatten();
 
@@ -383,7 +416,16 @@ pub fn sync_repo(
 /// run left open means "still going", and a fleet that crashed halfway
 /// would leave a run that never ends and a status that never updates.
 pub fn sync_all(conn: &Connection, opts: &SyncOptions) -> Result<Vec<SyncResult>> {
-    let repos = crate::manage::list(conn, None)?;
+    // Archived and disabled rows are excluded here rather than at each
+    // call site. `list(conn, None)` returns every row, so a sync that did
+    // not filter would reach into repos the user had explicitly retired —
+    // and a sync that touches an archived repo is a sync that does
+    // something you asked it not to do.
+    let all = crate::manage::list(conn, None)?;
+    let repos: Vec<_> = all
+        .into_iter()
+        .filter(|r| !r.archived && !r.disabled)
+        .collect();
     let run = ro_jobs::open_run(conn, "sync", &[]).context("opening the sync run record")?;
     let run_id = run.id.clone();
 
@@ -760,5 +802,207 @@ mod tests {
         assert_eq!(SyncStrategy::FfOnly.to_string(), "ff-only");
         assert_eq!(SyncStrategy::Rebase.to_string(), "rebase");
         assert_eq!(SyncStrategy::Merge.to_string(), "merge");
+    }
+}
+
+/// How many uncommitted changes a worktree has.
+///
+/// `-uall` so an untracked directory is counted as its files: a directory
+/// holding three new files is three changes the user could lose, and
+/// "skipped: 1 uncommitted change" understates it.
+fn dirty_file_count(repo: &Path) -> Result<usize> {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "-z", "-uall"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| anyhow::anyhow!("running git status: {e}"))?;
+    if !out.status.success() {
+        return Ok(0);
+    }
+    Ok(ro_git::primitives::parse_porcelain(&String::from_utf8_lossy(&out.stdout)).len())
+}
+
+#[cfg(test)]
+mod filter_and_skip_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, Connection) {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        (tmp, conn)
+    }
+
+    fn track(conn: &Connection, owner: &str, name: &str, archived: bool, disabled: bool) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at,
+                                 archived, disabled)
+             VALUES (?1, 'github.com', ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8)",
+            rusqlite::params![
+                format!("id-{owner}-{name}"),
+                owner,
+                name,
+                format!("https://example.com/{owner}/{name}.git"),
+                format!("/nonexistent/{owner}/{name}"),
+                now,
+                archived as i64,
+                disabled as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    /// Archived and disabled rows are **not** synced.
+    ///
+    /// `list(conn, None)` returns every row, so without the filter
+    /// `ro sync` reached into repos the user had explicitly retired — and
+    /// a sync that touches an archived repo is a sync that does something
+    /// you asked it not to do.
+    #[test]
+    fn archived_and_disabled_repos_are_excluded() {
+        let (_tmp, conn) = setup();
+        track(&conn, "acme", "live", false, false);
+        track(&conn, "acme", "archived", true, false);
+        track(&conn, "acme", "disabled", false, true);
+
+        // `--pull-only` means "do nothing but touch existing checkouts",
+        // which is the cheapest way to observe the selection.
+        let opts = SyncOptions {
+            pull_only: true,
+            ..Default::default()
+        };
+        let results = sync_all(&conn, &opts).unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "only the live repo may be synced, got {:?}",
+            results.iter().map(|r| &r.action).collect::<Vec<_>>()
+        );
+    }
+
+    /// A dirty worktree is **skipped**, with the count named.
+    ///
+    /// There is no `--force` on this command. A fleet tool that discards
+    /// uncommitted work because someone typed a flag while rushing is a
+    /// tool that gets uninstalled after the first accident.
+    #[test]
+    fn a_dirty_worktree_is_skipped_and_says_how_many() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+
+        // A real repo on a real remote, so the pull has somewhere to be a
+        // no-op rather than a failure.
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare", "-q", "--initial-branch=main"]);
+
+        let work = tmp.path().join("work");
+        run_git(
+            tmp.path(),
+            &["clone", "-q", &remote.to_string_lossy(), "work"],
+        );
+        run_git(&work, &["config", "user.email", "t@e.com"]);
+        run_git(&work, &["config", "user.name", "T"]);
+        run_git(&work, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run_git(&work, &["push", "-q", "-u", "origin", "main"]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('r1', 'github.com', 'acme', 'api', ?1, ?2, ?3, ?3)",
+            rusqlite::params![remote.to_string_lossy(), work.to_string_lossy(), now],
+        )
+        .unwrap();
+
+        // Two uncommitted files.
+        std::fs::write(work.join("a.txt"), "one\n").unwrap();
+        std::fs::write(work.join("b.txt"), "two\n").unwrap();
+
+        let results = sync_all(&conn, &SyncOptions::default()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].action, "skipped_dirty",
+            "a dirty worktree must be skipped, got {:?}",
+            results[0]
+        );
+        assert_eq!(results[0].status, "skipped");
+
+        // And nothing was written.
+        let porcelain = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&work)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned();
+        assert!(
+            porcelain.contains("a.txt") && porcelain.contains("b.txt"),
+            "the uncommitted work must still be there, got: {porcelain}"
+        );
+    }
+
+    /// A clean worktree is not skipped — the guard must not become a
+    /// blanket "never pull".
+    #[test]
+    fn a_clean_worktree_is_not_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare", "-q", "--initial-branch=main"]);
+        let work = tmp.path().join("work");
+        run_git(
+            tmp.path(),
+            &["clone", "-q", &remote.to_string_lossy(), "work"],
+        );
+        run_git(&work, &["config", "user.email", "t@e.com"]);
+        run_git(&work, &["config", "user.name", "T"]);
+        run_git(&work, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        run_git(&work, &["push", "-q", "-u", "origin", "main"]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('r1', 'github.com', 'acme', 'api', ?1, ?2, ?3, ?3)",
+            rusqlite::params![remote.to_string_lossy(), work.to_string_lossy(), now],
+        )
+        .unwrap();
+
+        let results = sync_all(&conn, &SyncOptions::default()).unwrap();
+        assert_ne!(
+            results[0].action, "skipped_dirty",
+            "a clean worktree must not be skipped, got {:?}",
+            results[0]
+        );
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
