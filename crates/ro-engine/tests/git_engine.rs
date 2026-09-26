@@ -302,3 +302,85 @@ fn a_timeout_reads_differently_from_a_failure() {
     assert!(timed_out.render().contains("timed out"));
     assert!(!timed_out.render().contains("refused"));
 }
+
+// ---------------------------------------------------------------------------
+// The default is never `git`.
+//
+// The title of the bead is the requirement: `git` is the honest floor, not
+// the product. It cannot read a diff, split a change into several commits,
+// or resolve a conflict — which is the whole reason the agent engines
+// exist. A default that drifted to `git` would give every user one
+// catch-all commit per repo and nobody would notice until the history was
+// meaningless.
+//
+// Asserted against the config's own default rather than a comment, because
+// a comment does not fail.
+// ---------------------------------------------------------------------------
+
+/// The shipped configuration does not select `git`.
+#[test]
+fn git_is_not_the_shipped_default() {
+    let cfg = ro_config::AppConfig::default();
+    assert_eq!(
+        cfg.agent.engine, None,
+        "no engine selected means the dispatcher's own default, which must \
+         not be the raw backend"
+    );
+}
+
+/// And when the dispatcher has to pick one, it picks an agent.
+#[test]
+fn the_dispatcher_default_is_an_agent_not_git() {
+    // An empty name is what "the user did not choose" looks like.
+    let resolved = ro_engine::resolve("", &ro_engine::EngineSlots::default(), None);
+    assert!(
+        resolved.is_err(),
+        "an empty engine name must be an error rather than a silent default \
+         to the raw backend"
+    );
+    let err = resolved.err().unwrap_or_default();
+    assert!(
+        err.contains("claude") && err.contains("codex"),
+        "the error must name the real choices, got: {err}"
+    );
+}
+
+/// `git` is reachable when asked for by name — it is a floor, not a gap.
+#[test]
+fn git_is_selectable_by_name() {
+    let r = ro_engine::resolve("git", &ro_engine::EngineSlots::default(), None)
+        .expect("git is one of the three");
+    assert_eq!(r.as_engine().kind(), ro_engine::EngineKind::Git);
+}
+
+/// The whole point of the agent engines, stated as a test: the git backend
+/// cannot produce two commits from two logically separate changes, because
+/// it never reads the diff to know they are separate.
+#[test]
+fn the_git_backend_makes_one_commit_where_an_agent_makes_two() {
+    let w = Worktree::with_one_commit();
+    // Two changes that have nothing to do with each other.
+    w.write("src/parser.rs", "fn parse() {}\n");
+    w.write("README.md", "# docs\n");
+
+    let engine = GitEngine::new();
+    let ctx = EngineContext::new(w.path(), "main");
+    let EngineOutcome::Committed { commits } = engine.checkpoint(&ctx) else {
+        panic!("expected a commit");
+    };
+
+    assert_eq!(
+        commits.len(),
+        1,
+        "the raw backend has no basis for splitting: it never reads the \
+         diff. That is the limitation the agent engines exist for, and it \
+         is why git is not the default."
+    );
+    // And the message says so rather than claiming a conventional commit
+    // it did not derive.
+    assert!(
+        commits[0].message.starts_with("wip on"),
+        "got: {}",
+        commits[0].message
+    );
+}

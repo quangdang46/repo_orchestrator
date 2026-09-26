@@ -2756,6 +2756,7 @@ dependencies = [
 name = "ro-engine"
 version = "0.2.0"
 dependencies = [
+ "ro-config",
  "ro-core",
  "ro-git",
  "ro-testkit",

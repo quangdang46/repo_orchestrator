@@ -244,5 +244,6 @@ pub trait Engine: Send + Sync {
 }
 
 pub use agent::{AgentEngine, BUILTIN_PROMPT, StreamFormat};
+pub use dispatch::{EngineSlots, ResolvedEngine, resolve};
 pub use env::ChildEnv;
 pub use git_engine::GitEngine;

@@ -10,6 +10,7 @@ publish = false
 # The auth vocabulary and the failure taxonomy both live in ro-core, which
 # depends on no workspace crate. Defining either here would be the second
 # definition in the tree, and ro-core exists precisely so there is one.
+ro-config.workspace = true
 ro-core.workspace = true
 
 # No clap and no tokio. A library that pulls in an argument parser to read
@@ -27,6 +28,7 @@ serde_json.workspace = true
 [dev-dependencies]
 # The trait references FailureClass, so a test that builds a Failed outcome
 # needs the enum itself.
+ro-config.workspace = true
 ro-core.workspace = true
 tempfile.workspace = true
 ro-testkit = { path = "../ro-testkit" }
