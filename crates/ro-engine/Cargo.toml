@@ -1,0 +1,28 @@
+[package]
+name = "ro-engine"
+description = "The engine trait, the three built-in engines, and the context that bounds them"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+# The auth vocabulary and the failure taxonomy both live in ro-core, which
+# depends on no workspace crate. Defining either here would be the second
+# definition in the tree, and ro-core exists precisely so there is one.
+ro-core.workspace = true
+
+# No clap and no tokio. A library that pulls in an argument parser to read
+# three strings cannot be used from a plain unit test, and an async runtime
+# buys nothing for a subprocess with a deadline.
+#
+# The subprocess work goes through ro-git, which already owns the env
+# hardening block, the timeout, and the child-tree kill.
+ro-git.workspace = true
+
+[dev-dependencies]
+# The trait references FailureClass, so a test that builds a Failed outcome
+# needs the enum itself.
+ro-core.workspace = true
+tempfile.workspace = true
+ro-testkit = { path = "../ro-testkit" }

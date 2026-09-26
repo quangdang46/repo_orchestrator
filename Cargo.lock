@@ -2702,6 +2702,7 @@ dependencies = [
  "predicates",
  "ro-config",
  "ro-core",
+ "ro-engine",
  "ro-git",
  "ro-github",
  "ro-jobs",
@@ -2749,6 +2750,16 @@ dependencies = [
  "time",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "ro-engine"
+version = "0.2.0"
+dependencies = [
+ "ro-core",
+ "ro-git",
+ "ro-testkit",
+ "tempfile",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ members = [
     "crates/ro-jobs",
     "crates/ro-sync",
     "crates/ro-sweep",
+    "crates/ro-engine",
     # Dev-only. Listed as a workspace member so `cargo test --workspace`
     # runs its own tests — a fixture nobody exercises is a fixture that
     # rots. It is a `[dev-dependencies]` entry everywhere it is used, so
@@ -38,6 +39,7 @@ ro-github      = { path = "crates/ro-github" }
 ro-jobs        = { path = "crates/ro-jobs" }
 ro-sync        = { path = "crates/ro-sync" }
 ro-sweep       = { path = "crates/ro-sweep" }
+ro-engine      = { path = "crates/ro-engine" }
 
 # External — shared across multiple crates
 anyhow          = "1.0"

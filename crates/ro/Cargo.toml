@@ -25,6 +25,9 @@ ro-github.workspace = true
 ro-jobs.workspace = true
 ro-sync.workspace = true
 ro-sweep.workspace = true
+# The Engine trait and the three built-ins. Part of the same commit as the
+# workspace registration, per the bead.
+ro-engine.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
