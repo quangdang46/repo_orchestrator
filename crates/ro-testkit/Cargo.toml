@@ -7,6 +7,9 @@ description = "Cross-platform test fixtures: fake gh, fake agent engines, bare r
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]
