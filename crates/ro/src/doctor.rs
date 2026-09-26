@@ -595,7 +595,7 @@ fn check_state(paths: &ConfigPaths, fix: bool) -> CheckResult {
 }
 
 fn check_provider(name: &str, lookup_path: Option<&Path>) -> CheckResult {
-    if which_in(name, lookup_path).is_some() {
+    if ro_git::which_in(name, lookup_path).is_some() {
         CheckResult::ok(
             format!("provider:{name}"),
             Severity::Optional,
@@ -611,26 +611,6 @@ fn check_provider(name: &str, lookup_path: Option<&Path>) -> CheckResult {
             )),
         )
     }
-}
-
-/// `which`-style binary lookup. Honors `lookup_path` override for tests.
-fn which_in(bin: &str, lookup_path: Option<&Path>) -> Option<PathBuf> {
-    let path_var = match lookup_path {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => std::env::var("PATH").ok()?,
-    };
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(bin);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        // Windows .exe suffix
-        let candidate_exe = dir.join(format!("{bin}.exe"));
-        if candidate_exe.is_file() {
-            return Some(candidate_exe);
-        }
-    }
-    None
 }
 
 /// Render a human-readable summary line per check.

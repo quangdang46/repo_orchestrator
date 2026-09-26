@@ -28,6 +28,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
+    pub engines: EnginesConfig,
+    #[serde(default)]
     pub checkpoint: CheckpointConfig,
     #[serde(default)]
     pub safety: SafetyConfig,
@@ -352,6 +354,98 @@ pub struct ReviewConfig {
     pub quality_gates: Option<String>,
 }
 
+/// One engine's binary and arguments.
+///
+/// `deny_unknown_fields` on **each** slot, and on the table. That is the
+/// whole difference between a config that helps and one that costs an
+/// afternoon: `[engines.cladue] bin = "claude"` in a free-form table would
+/// parse cleanly, register a phantom engine nobody asked for, and fail at
+/// dispatch. Here it is a parse error naming the key.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EngineSlot {
+    /// The binary to spawn. Empty means "take the shipped value for this
+    /// slot" — a slot cannot know its own field name, so `Default` must
+    /// not guess, or `[engine_claude]` would default to `git`.
+    #[serde(default)]
+    pub bin: String,
+    /// Arguments before the prompt.
+    #[serde(default)]
+    pub default_args: Vec<String>,
+}
+
+/// The three slots. Fixed, not a free-form table — see [`EngineSlot`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnginesConfig {
+    #[serde(default)]
+    pub engine_claude: EngineSlot,
+    #[serde(default)]
+    pub engine_codex: EngineSlot,
+    #[serde(default)]
+    pub engine_git: EngineSlot,
+}
+
+impl EnginesConfig {
+    /// The shipped defaults, which each slot cannot know for itself: the
+    /// slot named `engine_claude` defaults to `claude` by the virtue of
+    /// its name, and `Default for EngineSlot` cannot read its own field
+    /// name.
+    pub fn shipped() -> Self {
+        Self {
+            engine_claude: EngineSlot {
+                bin: "claude".into(),
+                default_args: vec!["-p".into(), "--output-format".into(), "stream-json".into()],
+            },
+            engine_codex: EngineSlot {
+                bin: "codex".into(),
+                default_args: vec!["exec".into()],
+            },
+            engine_git: EngineSlot {
+                bin: "git".into(),
+                default_args: vec![],
+            },
+        }
+    }
+
+    /// The configured value for a slot, falling back to the shipped one.
+    ///
+    /// The fallback is per **field**, not per slot: a user who set only
+    /// `default_args` still gets the right binary.
+    pub fn resolve_slot(&self, kind: &str) -> Option<EngineSlot> {
+        let shipped = Self::shipped();
+        let (configured, fallback) = match kind {
+            "claude" => (&self.engine_claude, shipped.engine_claude),
+            "codex" => (&self.engine_codex, shipped.engine_codex),
+            "git" => (&self.engine_git, shipped.engine_git),
+            _ => return None,
+        };
+        Some(EngineSlot {
+            bin: if configured.bin.trim().is_empty() {
+                fallback.bin
+            } else {
+                configured.bin.clone()
+            },
+            default_args: if configured.default_args.is_empty() {
+                fallback.default_args
+            } else {
+                configured.default_args.clone()
+            },
+        })
+    }
+
+    /// The configured value for a kind, or `None` for a name that is not
+    /// one of the three.
+    pub fn slot(&self, kind: &str) -> Option<&EngineSlot> {
+        match kind {
+            "claude" => Some(&self.engine_claude),
+            "codex" => Some(&self.engine_codex),
+            "git" => Some(&self.engine_git),
+            _ => None,
+        }
+    }
+}
+
 /// `[agent]` — which engine commits, and how it is invoked.
 ///
 /// Replaces `[providers.claude]` / `[providers.codex]`. The old table is still
@@ -569,6 +663,83 @@ default_args = ["exec"]
     fn a_current_config_says_nothing_about_review() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.review_deprecation_note(), None);
+    }
+
+    /// The phantom engine, stopped at parse time.
+    ///
+    /// A free-form `[engines.cladue]` table would parse, register an
+    /// engine nobody named, and fail at dispatch. With three fixed slots
+    /// each carrying `deny_unknown_fields`, one wrong character is a
+    /// parse error naming the key.
+    #[test]
+    fn a_misspelled_slot_is_a_parse_error_not_a_phantom_engine() {
+        let err = toml::from_str::<AppConfig>("[engines.cladue]\nbin = \"claude\"\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("engines") || msg.contains("unknown field"),
+            "the error must name the table or the key, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_key_inside_a_real_slot_is_a_parse_error() {
+        let err = toml::from_str::<AppConfig>("[engines.engine_claude]\ncladue = \"claude\"\n")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cladue"),
+            "the error must name the key the user typed, got: {err}"
+        );
+    }
+
+    /// And the positive case: the three real slots load.
+    #[test]
+    fn the_three_real_slots_load() {
+        let cfg: AppConfig = toml::from_str(concat!(
+            "[engines.engine_claude]\n",
+            "bin = \"claude\"\n",
+            "default_args = [\"-p\"]\n",
+            "[engines.engine_codex]\n",
+            "bin = \"codex\"\n",
+            "[engines.engine_git]\n",
+            "bin = \"git\"\n",
+        ))
+        .unwrap();
+        assert_eq!(cfg.engines.engine_claude.bin, "claude");
+        assert_eq!(cfg.engines.engine_claude.default_args, vec!["-p"]);
+        assert_eq!(cfg.engines.engine_codex.bin, "codex");
+        assert_eq!(cfg.engines.engine_git.bin, "git");
+        assert!(
+            cfg.engines.slot("gemini").is_none(),
+            "a fourth slot must not exist; a fourth agent is a config \
+             override of an existing one, not a new entry"
+        );
+    }
+
+    /// A slot that sets only `default_args` still gets the right binary.
+    ///
+    /// This is the trap a guessing `Default` sets: `engine_claude` would
+    /// default to `git`, and the user would silently get a git engine
+    /// invoked with an agent's arguments.
+    #[test]
+    fn a_partial_slot_falls_back_per_field() {
+        let cfg: AppConfig =
+            toml::from_str("[engines.engine_claude]\ndefault_args = [\"-p\"]\n").unwrap();
+        let resolved = cfg.engines.resolve_slot("claude").unwrap();
+        assert_eq!(
+            resolved.bin, "claude",
+            "an unset bin must take the shipped one, not another slot's"
+        );
+        assert_eq!(resolved.default_args, vec!["-p"]);
+    }
+
+    #[test]
+    fn the_shipped_defaults_name_the_right_binaries() {
+        let e = EnginesConfig::shipped();
+        assert_eq!(e.engine_claude.bin, "claude");
+        assert_eq!(e.engine_codex.bin, "codex");
+        assert_eq!(e.engine_git.bin, "git");
+        assert!(e.engine_claude.default_args.contains(&"-p".to_string()));
+        assert_eq!(e.engine_git.default_args.len(), 0);
     }
 
     /// Path 1 of 3: the global config file.

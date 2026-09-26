@@ -17,6 +17,7 @@
 //! boring ones.
 
 pub mod agent;
+pub mod dispatch;
 pub mod env;
 pub mod git_engine;
 

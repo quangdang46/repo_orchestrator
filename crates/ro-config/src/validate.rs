@@ -52,6 +52,7 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     // a key that is checked and then ignored is worse than one that is
     // absent, because a user who sets it reasonably concludes it is
     // doing something.
+
     if !["off", "warn", "block"].contains(&cfg.checkpoint.secret_scan.as_str()) {
         bail!(
             "checkpoint.secret_scan: '{}' is not valid (expected: off | warn | block)",

@@ -28,7 +28,6 @@
 //! account, so it is handed to `execve` as a single argument and no shell
 //! ever sees it.
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use ro_core::FailureClass;
@@ -84,6 +83,42 @@ impl AgentEngine {
                 "stream-json".to_string(),
             ],
             stream: StreamFormat::ClaudeStreamJson,
+        }
+    }
+
+    /// An engine pointed at a specific binary and argument list.
+    ///
+    /// This is the whole of the extensibility: a fourth agent is a
+    /// different binary and different arguments through this constructor,
+    /// not a fourth variant. It cannot relax the agent-does-not-push
+    /// boundary — ro still owns the push, so the credential and the
+    /// identity guard apply to whatever binary is named here.
+    ///
+    /// The stream format follows the slot, not the binary: ro reads what
+    /// each of the three built-ins emits, and a repointed binary is
+    /// expected to speak the same one. That is the trade for a fixed
+    /// three-entry registry, and it is stated rather than discovered.
+    pub fn with(
+        kind: EngineKind,
+        bin: impl Into<String>,
+        default_args: Option<Vec<String>>,
+    ) -> Self {
+        let stream = match kind {
+            EngineKind::Codex => StreamFormat::CodexText,
+            _ => StreamFormat::ClaudeStreamJson,
+        };
+        Self {
+            kind,
+            bin: bin.into(),
+            default_args: default_args.unwrap_or_else(|| match kind {
+                EngineKind::Codex => vec!["exec".to_string()],
+                _ => vec![
+                    "-p".to_string(),
+                    "--output-format".to_string(),
+                    "stream-json".to_string(),
+                ],
+            }),
+            stream,
         }
     }
 
@@ -167,7 +202,7 @@ impl Engine for AgentEngine {
     /// because a `PATH` walk across a fleet is work the answer does not
     /// depend on.
     fn availability(&self) -> Availability {
-        match which(&self.bin) {
+        match ro_git::which(&self.bin) {
             Some(p) => Availability::Present(p),
             None => Availability::Missing,
         }
@@ -403,37 +438,10 @@ fn kill_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// The first `name` on `PATH`, if it is there.
-pub(crate) fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        for ext in [".exe", ".cmd", ".bat"] {
-            let with_ext = dir.join(format!("{name}{ext}"));
-            if with_ext.is_file() {
-                return Some(with_ext);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn is_executable(path: &std::path::Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(windows)]
-fn is_executable(path: &std::path::Path) -> bool {
-    path.is_file()
-}
+// The PATH probe is `ro_git::which`. It was a private copy here, and
+// another one in `doctor.rs`, and the two could disagree about what
+// "installed" means — which is how a fleet ends up reporting a provider
+// as present at dispatch and absent in the doctor output.
 
 #[cfg(test)]
 mod tests {

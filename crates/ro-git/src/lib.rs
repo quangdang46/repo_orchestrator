@@ -10,6 +10,7 @@ pub mod mutation;
 pub mod primitives;
 pub mod read;
 pub mod status;
+pub mod which;
 
 pub use conflict::{ConflictOp, ConflictState, ConflictedFile};
 pub use lock::RepoLock;
@@ -18,3 +19,4 @@ pub use mutation::{
     PullStrategy, PushOpts, RunOpts, run_in,
 };
 pub use status::{AheadBehind, RepoStatus};
+pub use which::{which, which_in};

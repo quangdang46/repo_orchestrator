@@ -32,6 +32,14 @@ impl GitEngine {
     }
 }
 
+impl GitEngine {
+    /// Point at a different binary, for a git installed under an
+    /// unusual name. Same reason as `AgentEngine::with`.
+    pub fn set_bin(&mut self, bin: impl Into<String>) {
+        self.bin = bin.into();
+    }
+}
+
 impl Default for GitEngine {
     fn default() -> Self {
         Self::new()
@@ -56,7 +64,7 @@ impl Engine for GitEngine {
     /// one, which is the difference between "git is not installed" and
     /// "this repository failed".
     fn availability(&self) -> Availability {
-        match which(&self.bin) {
+        match ro_git::which(&self.bin) {
             Some(p) => Availability::Present(p),
             None => Availability::Missing,
         }
@@ -200,36 +208,6 @@ fn classify(stderr: &str) -> FailureClass {
         return FailureClass::NetworkTimeout;
     }
     FailureClass::DirtyWorktree
-}
-
-/// The first `name` on `PATH`, if it is there.
-fn which(name: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        // Executable, not merely present: a directory called `git` on PATH
-        // would otherwise read as available and fail per-repo instead of
-        // as a setup problem.
-        if is_executable(&candidate) {
-            return Some(candidate);
-        }
-        #[cfg(windows)]
-        for ext in [".exe", ".cmd", ".bat"] {
-            let with_ext = dir.join(format!("{name}{ext}"));
-            if with_ext.is_file() {
-                return Some(with_ext);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 #[cfg(windows)]
