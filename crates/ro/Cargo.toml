@@ -51,5 +51,8 @@ tempfile.workspace = true
 # environment and a real bare remote, so the guarantee is checked against a
 # real chain rather than a unit test of one link.
 ro-testkit = { path = "../ro-testkit" }
+# Two authors, two credentials, one run: the reason the tool exists.
+ro-engine.workspace = true
+ro-core.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
