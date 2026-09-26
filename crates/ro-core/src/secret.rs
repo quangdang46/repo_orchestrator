@@ -130,6 +130,11 @@ mod tests {
     #[test]
     fn a_derived_debug_on_a_holder_still_renders_stars() {
         #[derive(Debug)]
+        // The fields are read *by the Debug impl being tested* — printing
+        // the struct is the assertion. Dead-code analysis does not count
+        // that, so it is silenced here rather than by deleting fields the
+        // test exists to prove are redacted.
+        #[allow(dead_code)]
         struct Holder {
             name: &'static str,
             credential: SecretString,

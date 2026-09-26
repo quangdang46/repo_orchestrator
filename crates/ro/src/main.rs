@@ -652,15 +652,30 @@ fn run() -> Result<()> {
                 match format {
                     OutputFormat::Text => {
                         let dirty = if s.is_dirty { " (dirty)" } else { "" };
-                        println!(
-                            "{}/{}: {}{} ahead={} behind={}",
-                            s.owner,
-                            s.name,
-                            s.branch.as_deref().unwrap_or("HEAD"),
-                            dirty,
-                            s.ahead,
-                            s.behind
-                        );
+                        // An unmeasurable repo prints `ahead=unknown`, never
+                        // `ahead=0`. Printing zero here is the bug this bead
+                        // exists to remove: a green board over rows nobody
+                        // measured is worse than a visibly broken one,
+                        // because the user stops looking.
+                        match (s.ahead, s.behind) {
+                            (Some(a), Some(b)) => println!(
+                                "{}/{}: {}{} ahead={} behind={}",
+                                s.owner,
+                                s.name,
+                                s.branch.as_deref().unwrap_or("HEAD"),
+                                dirty,
+                                a,
+                                b
+                            ),
+                            _ => println!(
+                                "{}/{}: {}{} ahead=unknown behind=unknown — {}",
+                                s.owner,
+                                s.name,
+                                s.branch.as_deref().unwrap_or("HEAD"),
+                                dirty,
+                                s.unmeasurable_reason.as_deref().unwrap_or("unknown reason")
+                            ),
+                        }
                     }
                     OutputFormat::Json => {
                         println!("{}", serde_json::to_string(s)?);

@@ -732,7 +732,7 @@ mod tests {
         // A bare remote, so "did a push land" is answerable without a network.
         let init = Command::new("git")
             .args(["init", "--bare", "-q"])
-            .current_dir(&origin.parent().expect("tmp has a parent"))
+            .current_dir(origin.parent().expect("tmp has a parent"))
             .arg(&origin)
             .output()
             .expect("git runs");
@@ -1266,7 +1266,10 @@ echo "PROBE_ARGS=$*"
     }
 
     fn run_git(dir: &Path, args: &[&str]) {
-        let r = run(dir, args).unwrap();
+        // The real API, not the deprecated `run` shim. CI compiles tests
+        // with `-D warnings`, so a shim kept "so callers do not churn" turns
+        // into a build error for exactly the callers it was meant to spare.
+        let r = run_in(Some(dir), args, &RunOpts::none()).unwrap();
         assert!(
             r.ok(),
             "git {args:?} failed: stdout={:?} stderr={:?}",
@@ -1276,9 +1279,9 @@ echo "PROBE_ARGS=$*"
     }
 
     #[test]
-    fn run_returns_command_result() {
+    fn run_in_returns_command_result() {
         let (_tmp, path) = temp_repo();
-        let r = run(&path, &["status", "--porcelain"]).unwrap();
+        let r = run_in(Some(&path), &["status", "--porcelain"], &RunOpts::none()).unwrap();
         assert!(r.ok());
         assert!(r.stdout.is_empty());
     }

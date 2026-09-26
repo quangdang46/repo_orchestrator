@@ -10,7 +10,7 @@
 //!
 //! See PLAN.md §12.5 for the API surface.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 
 use crate::status::{AheadBehind, RepoStatus};
@@ -95,6 +95,14 @@ pub fn status(repo_path: &Path) -> Result<RepoStatus> {
 
 /// Get ahead/behind counts of HEAD relative to a ref name like
 /// `origin/main`. Shells out to `git rev-list --left-right --count`.
+///
+/// **An error is an error, not zero.** This used to return
+/// `AheadBehind::ZERO` on any git failure, which conflated *"I do not know"*
+/// with *"you are in sync"* — a typo'd upstream displayed as up to date, and a
+/// repo whose `.git` is corrupt displayed as clean. Across a twenty-repo fleet
+/// that is a green board over two unmeasured rows, which is worse than no board.
+///
+/// A number that is always zero when it cannot be computed is not data.
 pub fn ahead_behind(repo_path: &Path, upstream: &str) -> Result<AheadBehind> {
     let output = std::process::Command::new("git")
         .args([
@@ -109,59 +117,125 @@ pub fn ahead_behind(repo_path: &Path, upstream: &str) -> Result<AheadBehind> {
         .output()
         .with_context(|| format!("running git rev-list in {}", repo_path.display()))?;
     if !output.status.success() {
-        return Ok(AheadBehind::ZERO);
+        // The reason matters and is not "unknown revision" in every case: it
+        // can equally be a corrupt object store or an unreadable directory.
+        bail!(
+            "cannot measure {upstream} against HEAD in {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     let s = String::from_utf8_lossy(&output.stdout);
     let mut iter = s.split_whitespace();
-    let behind: u32 = iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let ahead: u32 = iter.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let behind: u32 = iter
+        .next()
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("unreadable rev-list output for {upstream}: {s:?}"))?;
+    let ahead: u32 = iter
+        .next()
+        .and_then(|s| s.parse().ok())
+        .with_context(|| format!("unreadable rev-list output for {upstream}: {s:?}"))?;
     Ok(AheadBehind { ahead, behind })
 }
 
-/// The URL of a named remote, if it has one.
+/// The URL of a named remote.
 ///
-/// Separate from `has_remote` because "does it have one" and "what is it" are
-/// different questions, and the second is needed to adopt a checkout: a row
-/// needs a `clone_url`, and there is no honest way to invent one when the
-/// answer is available for the cost of one git call.
+/// Separate from `has_remote` because "does it have one" and "what is it"
+/// are different questions, and the second is needed to adopt a checkout: a
+/// row needs a `clone_url`.
 ///
-/// Returns `None` for a non-repo, a missing remote, or a query failure — the
-/// last deliberately not distinguished, because every caller's correct
-/// response to all three is the same.
-pub fn remote_url(repo_path: &Path, remote: &str) -> Option<String> {
+/// `Ok(None)` means the remote genuinely has no URL. `Err` means the query
+/// could not be run — a path that is not a repo, or `git` failing.
+///
+/// The distinction is not theoretical. `ro add <local-path>` stores this
+/// value as the row's `clone_url`, and on `None` the caller falls back to
+/// synthesising `https://github.com/<parent>/<name>.git` from the directory
+/// layout. A `None` produced by a *failed query* therefore becomes a stored
+/// URL that has never been verified against the actual remote, and the
+/// failure surfaces much later as a clone error against a nonsense
+/// repository. `Ok(None)` is a fact worth handling; `Err` is a broken
+/// measurement and must not be answered with a guess.
+pub fn remote_url(repo_path: &Path, remote: &str) -> Result<Option<String>> {
     let out = std::process::Command::new("git")
         .args(["remote", "get-url", remote])
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
         .output()
-        .ok()?;
+        .with_context(|| {
+            format!(
+                "reading remote {remote:?} in {} — the path may not be a git repository",
+                repo_path.display()
+            )
+        })?;
     if !out.status.success() {
-        return None;
+        // git exits non-zero here for two quite different reasons: the
+        // remote does not exist (exit 2, "No such remote"), and something
+        // went wrong. Collapsing both into `None` is the bug, so the
+        // stderr decides.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No such remote") {
+            return Ok(None);
+        }
+        bail!(
+            "cannot read remote {remote:?} in {}: {}",
+            repo_path.display(),
+            stderr.trim()
+        );
     }
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if url.is_empty() { None } else { Some(url) }
+    if url.is_empty() {
+        // An empty URL is git reporting a remote that exists but is
+        // unset. That is not the same as a missing remote, and the
+        // caller synthesises differently for each.
+        bail!(
+            "remote {remote:?} in {} has an empty URL",
+            repo_path.display()
+        );
+    }
+    Ok(Some(url))
 }
 
-/// Return true if the repository has a remote with the given name.
+/// Return whether the repository has a remote with the given name.
 ///
-/// Returns false if the path is not a git repo or the remote query fails.
-pub fn has_remote(repo_path: &Path, remote: &str) -> bool {
-    let Ok(out) = std::process::Command::new("git")
+/// `Ok(false)` is a real answer: the remote is genuinely not configured.
+/// `Err` is *"I could not find out"* — the path is not a repo, or `git`
+/// failed.
+///
+/// Those were the same value before, and the difference is the whole
+/// point of the bead. `ro sync` uses this for the *"no GitHub remote →
+/// local commit only"* rule (PLAN §1, the `has_remote` exception), so a
+/// `false` obtained from a failed query tells the orchestrator to skip
+/// the push **because there is nowhere to push** — when in fact the push
+/// was never attempted and the remote may well exist. A wrong `false` is
+/// silent: the run reports success having done less than it claimed.
+pub fn has_remote(repo_path: &Path, remote: &str) -> Result<bool> {
+    let out = std::process::Command::new("git")
         .args(["remote"])
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
         .output()
-    else {
-        return false;
-    };
+        .with_context(|| {
+            format!(
+                "listing remotes in {} — the path may not be a git repository",
+                repo_path.display()
+            )
+        })?;
     if !out.status.success() {
-        return false;
+        bail!(
+            "cannot list remotes in {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-    String::from_utf8_lossy(&out.stdout)
+    // `git remote` prints one bare name per line — confirmed against real
+    // output rather than assumed, because the `-v` form is
+    // `name<TAB>url (fetch)` and comparing a whole line to a name would
+    // then never match.
+    Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
-        .any(|line| line.trim() == remote)
+        .any(|line| line.trim() == remote))
 }
 
 fn open_repo(path: &Path) -> Result<gix::Repository> {

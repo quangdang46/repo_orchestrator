@@ -240,7 +240,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let original = default_config_toml();
-        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&path, original).unwrap();
 
         let err = set_key_in_file(&path, "core.layout", "\"not-a-layout\"").unwrap_err();
         assert!(
@@ -264,7 +264,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let original = default_config_toml();
-        std::fs::write(&path, &original).unwrap();
+        std::fs::write(&path, original).unwrap();
 
         assert!(set_key_in_file(&path, "core.layout", "{{{").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);

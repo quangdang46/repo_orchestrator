@@ -42,19 +42,6 @@ pub enum RepoAnswer {
     Unauthorised,
 }
 
-impl RepoAnswer {
-    pub fn can_push(self) -> bool {
-        matches!(
-            self,
-            RepoAnswer::Permissions {
-                push: true,
-                maintain: false,
-                admin: false
-            }
-        )
-    }
-}
-
 struct Inner {
     login: String,
     repos: BTreeMap<String, RepoAnswer>,
@@ -266,7 +253,6 @@ fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     /// Is the instrument measuring anything?
     ///

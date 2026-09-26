@@ -241,6 +241,9 @@ mod tests {
     #[test]
     fn a_derived_debug_on_a_holder_does_not_leak_it() {
         #[derive(Debug)]
+        // Read by the Debug impl under test — printing the struct *is*
+        // the assertion. Dead-code analysis does not count that.
+        #[allow(dead_code)]
         struct Request {
             endpoint: &'static str,
             token: AuthToken,

@@ -377,7 +377,7 @@ pub fn add_from_input(
             register(conn, &spec, &dest.to_string_lossy(), opts)
         }
         AddSource::Local { path, owner, name } => {
-            let remote = git_remote_url(&path);
+            let remote = git_remote_url(&path)?;
             let spec = RepoSpec {
                 host: "github.com".to_string(),
                 owner,
@@ -394,12 +394,19 @@ pub fn add_from_input(
 /// The origin URL of a local checkout, or a synthesised one.
 ///
 /// A checkout with no remote is an ordinary state — a repo you have not
-/// pushed — so this must not fail. The synthesised value is a real, correct
-/// GitHub URL when the layout is the conventional one, and clearly marked
-/// otherwise, because `clone_url` is what a later `ro sync` would use.
-fn git_remote_url(path: &Path) -> String {
-    if let Some(url) = ro_git::read::remote_url(path, "origin") {
-        return url;
+/// pushed — so that case must not fail, and the synthesised value is a
+/// real, correct GitHub URL when the layout is the conventional one.
+///
+/// A *failed* query is the other case, and it does fail. `remote_url`
+/// returns `Err` when it could not run at all, and answering that with a
+/// synthesised URL would store a `clone_url` nobody has ever seen, on a
+/// row whose whole purpose is to point at the real remote. A wrong
+/// `clone_url` surfaces much later as a clone error against a repository
+/// that does not exist — exactly the "a green row over an unmeasured
+/// fact" shape this bead exists to remove.
+fn git_remote_url(path: &Path) -> Result<String> {
+    if let Some(url) = ro_git::read::remote_url(path, "origin")? {
+        return Ok(url);
     }
     let owner = path
         .parent()
@@ -410,7 +417,7 @@ fn git_remote_url(path: &Path) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
-    format!("https://github.com/{owner}/{name}.git")
+    Ok(format!("https://github.com/{owner}/{name}.git"))
 }
 
 /// Insert the row. Shared by both branches so the column list, the duplicate
@@ -703,6 +710,35 @@ mod tests {
         tmp.path().join("projects")
     }
 
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        if !out.status.success() {
+            panic!(
+                "git {args:?} failed:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// A real repository, not a directory with an empty `.git` in it.
+    ///
+    /// `create_dir_all(".git")` was enough for a classifier that only
+    /// tests for the directory's existence, and stops being enough the
+    /// moment something actually runs git in the checkout — which is the
+    /// point of these tests.
+    fn init_repo(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        run_git(dir, &["init", "-q", "-b", "main"]);
+        run_git(dir, &["config", "user.email", "test@example.com"]);
+        run_git(dir, &["config", "user.name", "Test"]);
+    }
+
     #[test]
     fn init_creates_config_and_db() {
         let tmp = TempDir::new().unwrap();
@@ -927,7 +963,7 @@ mod tests {
 
     #[test]
     fn setting_config_on_an_unknown_repo_is_an_error_not_a_no_op() {
-        let (tmp, conn) = setup();
+        let (_tmp, conn) = setup();
         let err = set_repo_config(&conn, "acme/nope", "engine", "codex").unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
     }
@@ -962,8 +998,7 @@ mod tests {
     fn classify_recognises_a_local_checkout() {
         let tmp = TempDir::new().unwrap();
         let checkout = tmp.path().join("acme").join("api");
-        std::fs::create_dir_all(&checkout).unwrap();
-        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        init_repo(&checkout);
 
         match classify_add_input(checkout.to_str().unwrap()).unwrap() {
             AddSource::Local { path, owner, name } => {
@@ -1044,8 +1079,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let conn = ro_state::open_memory().unwrap();
         let checkout = tmp.path().join("acme").join("web");
-        std::fs::create_dir_all(&checkout).unwrap();
-        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        init_repo(&checkout);
 
         let repo = add_from_input(
             &conn,
