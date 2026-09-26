@@ -210,9 +210,16 @@ fn ro_output_carries_no_pat_shaped_string() {
     work.commit("a commit");
 
     let secret = SecretString::new(CRED_A);
-    let env = ChildEnv::from_parent();
+    // The child environment is built **inside** the `TestEnv` closure.
+    // `ChildEnv::from_parent` reads `PATH`, and the shim directory is
+    // prepended by the `TestEnv` — which is only live inside. Built
+    // outside, the child gets a `PATH` with no `claude` in it, and the
+    // spawn fails with "No such file or directory". That is not a flake:
+    // it passed on macOS because a real `claude` happened to be installed
+    // in the developer's `PATH`, and failed on a runner where it is not.
     let agent_out = unsafe {
         TestEnv::new().shim(&agent).var("GH_TOKEN", CRED_A).run(|| {
+            let env = ChildEnv::from_parent();
             Command::new("claude")
                 .arg("-p")
                 .arg("x")
