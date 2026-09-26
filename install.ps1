@@ -58,6 +58,11 @@
     Write-Step "target: $target"
 
     # ── Build download URL ───────────────────────────────────────────────
+    # Every published release predates the `rfo` -> `ro` rename, so every
+    # artifact is `rfo-$target.zip` while this asked for `ro-$target.zip` —
+    # and the Windows installer has 404'd for exactly as long as the shell
+    # one. The current name is tried first, so a release cut after the
+    # rename behaves exactly as before.
     $archiveName = "ro-$target.zip"
     $downloadUrl = "https://github.com/$GH_REPO/releases/download/$tag/$archiveName"
 
@@ -66,10 +71,20 @@
     try {
         Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
     } catch {
-        Fail "download failed: $_`n  URL: $downloadUrl`n  Ensure a release for $tag exists with a Windows binary."
+        $legacyName = "rfo-$target.zip"
+        $legacyUrl = "https://github.com/$GH_REPO/releases/download/$tag/$legacyName"
+        try {
+            Write-Step "release $tag predates the rename; using $legacyName"
+            Invoke-WebRequest -Uri $legacyUrl -OutFile $zipPath -UseBasicParsing
+            $downloadUrl = $legacyUrl
+        } catch {
+            Fail "download failed: $_`n  URL: $downloadUrl`n  Ensure a release for $tag exists with a Windows binary."
+        }
     }
 
     # ── Verify SHA-256 if checksum file is available ─────────────────────
+    # Built from $downloadUrl rather than the original name, so the legacy
+    # path verifies against the legacy asset it actually downloaded.
     $sha256Url = "$downloadUrl.sha256"
     try {
         $resp = Invoke-WebRequest -Uri $sha256Url -UseBasicParsing
@@ -96,8 +111,16 @@
     try {
         Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
 
-        $exe = Get-ChildItem -Path $extractDir -Filter 'ro.exe' -Recurse | Select-Object -First 1
-        if (-not $exe) { Fail 'ro.exe not found inside the downloaded archive' }
+        # A pre-rename release ships a binary literally called rfo.exe, so
+        # the download and the checksum can both succeed and the install
+        # still fail on an archive it is already holding.
+        $exe = Get-ChildItem -Path $extractDir -Filter 'ro.exe' -Recurse |
+            Select-Object -First 1
+        if (-not $exe) {
+            $exe = Get-ChildItem -Path $extractDir -Filter 'rfo.exe' -Recurse |
+                Select-Object -First 1
+        }
+        if (-not $exe) { Fail 'no ro.exe (or pre-rename rfo.exe) inside the downloaded archive' }
 
         Copy-Item -Path $exe.FullName -Destination (Join-Path $prefix 'ro.exe') -Force
     } finally {
