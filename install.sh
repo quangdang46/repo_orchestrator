@@ -181,17 +181,36 @@ main() {
     tag="$(resolve_version)"
     info "version: ${C_BOLD}${tag}${C_RESET}"
 
+    # Every published release predates the `rfo` -> `ro` rename, so every
+    # artifact on GitHub is `rfo-<target>.tar.xz` while this asks for
+    # `ro-<target>.tar.xz` — and every install failed with a 404 whose
+    # error pointed at the release rather than at the rename.
+    #
+    # The current name is tried first, so a release cut after the rename
+    # behaves exactly as before, and the legacy branch disappears on its
+    # own once there is no legacy release left to serve.
+    local base="https://github.com/${REPO}/releases/download/${tag}"
+    local archive_name checksum_url
     archive_name="${BIN}-${target}.tar.xz"
-    archive_url="https://github.com/${REPO}/releases/download/${tag}/${archive_name}"
-    checksum_url="${archive_url}.sha256"
+    checksum_url="${base}/${archive_name}.sha256"
 
     TMPDIR_RO="$(mktemp -d 2>/dev/null || mktemp -d -t ro-install)"
 
     info "downloading ${archive_name}"
-    if ! http_get "$archive_url" "${TMPDIR_RO}/${archive_name}"; then
-        err "failed to download $archive_url"
-        err "check that release ${tag} exists and includes ${archive_name}"
-        exit 3
+    if ! http_get "${base}/${archive_name}" "${TMPDIR_RO}/${archive_name}"; then
+        local legacy="rfo-${target}.tar.xz"
+        if [ "$legacy" != "$archive_name" ] &&
+           http_get "${base}/${legacy}" "${TMPDIR_RO}/${archive_name}"; then
+            info "release ${tag} predates the rename; using ${legacy}"
+            # The checksum is a separate asset under the same legacy name, so
+            # pointing it at ${archive_name} 404s and the install dies on a
+            # verification it could have performed.
+            checksum_url="${base}/${legacy}.sha256"
+        else
+            err "failed to download ${base}/${archive_name}"
+            err "check that release ${tag} exists and includes it for ${target}"
+            exit 3
+        fi
     fi
     ok "downloaded $(du -h "${TMPDIR_RO}/${archive_name}" | awk '{print $1}')"
 
@@ -224,6 +243,13 @@ main() {
     if [ ! -f "$extracted" ]; then
         # Fall back to a recursive find in case the layout changes.
         extracted="$(find "$TMPDIR_RO" -type f -name "$BIN" -perm -u+x 2>/dev/null | head -n1 || true)"
+    fi
+    if [ -z "$extracted" ] || [ ! -f "$extracted" ]; then
+        # A pre-rename release ships a binary literally called `rfo`, and
+        # the archive directory is named after it too. Without this the
+        # download and the checksum both succeed and the install still
+        # fails, on an archive we already hold.
+        extracted="$(find "$TMPDIR_RO" -type f \( -name rfo -o -name "${BIN}" \) -perm -u+x 2>/dev/null | head -n1 || true)"
     fi
     if [ -z "$extracted" ] || [ ! -f "$extracted" ]; then
         err "could not locate '${BIN}' binary inside ${archive_name}"
