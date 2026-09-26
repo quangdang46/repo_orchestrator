@@ -13,6 +13,18 @@ pub struct RepoSpec {
     pub clone_url: String,
 }
 
+/// A Windows drive letter: one ASCII letter followed by a colon, and nothing else.
+///
+/// GitHub owners are longer than one character and never contain a colon, so
+/// this shape is unambiguous in practice.
+fn is_drive_letter(owner: &str) -> bool {
+    let mut chars = owner.chars();
+    match (chars.next(), chars.next(), chars.next()) {
+        (Some(c), Some(':'), None) => c.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
 impl RepoSpec {
     /// Canonical display: `owner/name`.
     pub fn canonical(&self) -> String {
@@ -30,11 +42,22 @@ impl RepoSpec {
     /// - `owner/repo#branch`
     /// - `owner/repo as alias`
     ///
-    /// Rejected: non-GitHub hosts (gitlab, gitea, forgejo, bitbucket).
+    /// Rejected: non-GitHub hosts (gitlab, gitea, forgejo, bitbucket), and
+    /// local filesystem paths — a Windows path in either separator style.
     pub fn parse(input: &str) -> Result<Self, crate::CoreError> {
         let input = input.trim();
         if input.is_empty() {
             return Err(crate::CoreError::InvalidRepoSpec("empty input".into()));
+        }
+
+        // A backslash never appears in a remote spec, so one that contains it
+        // is almost certainly a local path typed on Windows. Reject it up
+        // front so the message names the real problem rather than the
+        // two-part split failing for an unrelated-looking reason.
+        if input.contains('\\') {
+            return Err(crate::CoreError::InvalidRepoSpec(format!(
+                "looks like a local path, not a repo spec: {input}"
+            )));
         }
 
         // Reject known non-GitHub prefixes.
@@ -125,6 +148,17 @@ impl RepoSpec {
         if owner.is_empty() || name.is_empty() {
             return Err(crate::CoreError::InvalidRepoSpec(format!(
                 "owner and name must be non-empty: {owner_name_path}"
+            )));
+        }
+        // `C:/work/backend` splits into exactly two parts, so it survives the
+        // check above and becomes owner="C:" with a clone URL of
+        // https://github.com/C:/work/backend.git — a row for an owner that
+        // does not exist, failing much later as a clone error against a
+        // nonsense URL. A single letter followed by a colon is a Windows
+        // drive, never a GitHub owner.
+        if is_drive_letter(&owner) {
+            return Err(crate::CoreError::InvalidRepoSpec(format!(
+                "looks like a local path, not a repo spec: {owner_name_path}"
             )));
         }
         // Reject specs with consecutive slashes (invalid///spec)
@@ -220,6 +254,42 @@ mod tests {
     fn reject_empty() {
         assert!(RepoSpec::parse("").is_err());
         assert!(RepoSpec::parse("  ").is_err());
+    }
+
+    /// A Windows path in forward-slash form splits into exactly two parts, so
+    /// it used to parse cleanly as owner="C:" and produce the nonsense clone
+    /// URL https://github.com/C:/work/backend.git.
+    #[test]
+    fn reject_windows_path_with_forward_slashes() {
+        let err = RepoSpec::parse("C:/work/backend").unwrap_err();
+        assert!(
+            err.to_string().contains("local path"),
+            "message should name the real problem, got: {err}"
+        );
+    }
+
+    /// The backslash form was already rejected, by the two-part split rather
+    /// than on purpose. Asserted so the drive-letter fix cannot regress it and
+    /// so the message keeps naming the actual cause.
+    #[test]
+    fn reject_windows_path_with_backslashes() {
+        let err = RepoSpec::parse(r"C:\work\backend").unwrap_err();
+        assert!(
+            err.to_string().contains("local path"),
+            "message should name the real problem, got: {err}"
+        );
+    }
+
+    /// A single-letter owner is a drive letter; a longer one with a colon in
+    /// the middle is not a path, and must not be swept up by the fix.
+    #[test]
+    fn drive_letter_check_does_not_reject_real_owners() {
+        assert!(RepoSpec::parse("acme/api").is_ok());
+        assert!(RepoSpec::parse("a1/b2").is_ok());
+        assert!(!is_drive_letter("acme"));
+        assert!(!is_drive_letter("a"));
+        assert!(is_drive_letter("C:"));
+        assert!(is_drive_letter("z:"));
     }
 
     #[test]
