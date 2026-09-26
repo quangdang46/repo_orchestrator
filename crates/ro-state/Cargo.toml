@@ -21,3 +21,8 @@ time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The migration tests drive the real `ro_sync` API against a database the
+# previous binary created, because a stale column read is a runtime
+# failure and only the runtime path can see it. ro-sync already depends on
+# ro-state, so this is dev-only and adds no cycle.
+ro-sync = { path = "../ro-sync" }

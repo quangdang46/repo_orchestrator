@@ -2814,6 +2814,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "ro-core",
+ "ro-sync",
  "rusqlite",
  "serde",
  "serde_json",

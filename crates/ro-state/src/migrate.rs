@@ -108,7 +108,7 @@ pub fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
 /// `[identity].default`, no `engine` means `[agent].engine`. An existing row
 /// that predates this migration therefore stays on the global configuration,
 /// which is what a user upgrading should get.
-fn v5_add_repo_config(conn: &Connection) -> Result<()> {
+pub fn v5_add_repo_config(conn: &Connection) -> Result<()> {
     for column in ["credential_ref", "author_ref", "engine", "engine_args"] {
         if column_exists(conn, "repos", column) {
             tracing::debug!(column, "column already present, skipping");
@@ -132,7 +132,11 @@ pub fn current_version(conn: &Connection) -> Result<i64> {
     Ok(v)
 }
 
-const V1_INITIAL_SCHEMA: &str = r#"
+/// The initial schema. `pub` so `tests/migrations.rs` can build a
+/// pre-V2 database and actually exercise the upgrade path; a fresh
+/// test database skips it, and skipping it is how a broken migration
+/// ships green.
+pub const V1_INITIAL_SCHEMA: &str = r#"
 -- v1: initial schema (PLAN.md §13)
 
 CREATE TABLE IF NOT EXISTS repos (
@@ -278,7 +282,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
 CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts);
 "#;
 
-const V2_REPO_TAGS: &str = r#"
+/// Adds `repo_tags`. See [`V1_INITIAL_SCHEMA`] for why this is `pub`.
+pub const V2_REPO_TAGS: &str = r#"
 -- v2: repo tags (ADDITION.md A2)
 
 CREATE TABLE IF NOT EXISTS repo_tags (
@@ -290,7 +295,8 @@ CREATE TABLE IF NOT EXISTS repo_tags (
 CREATE INDEX IF NOT EXISTS idx_repo_tags_tag ON repo_tags(tag);
 "#;
 
-const V3_DROP_INBOX: &str = r#"
+/// Drops `inbox_dismissed`. See [`V1_INITIAL_SCHEMA`].
+pub const V3_DROP_INBOX: &str = r#"
 -- v3: drop inbox_dismissed (removed inbox feature ro-refactor)
 DROP TABLE IF EXISTS inbox_dismissed;
 "#;
@@ -315,7 +321,9 @@ DROP TABLE IF EXISTS inbox_dismissed;
 // DROP COLUMN needs SQLite 3.35+ (2021). The workspace pins rusqlite with
 // `bundled`, so the version that matters is the one cargo resolves, not the
 // system sqlite3 — worth confirming rather than assuming.
-const V4_DROP_PLANS: &str = r#"
+/// Drops the `plans` table and the cached `default_branch`.
+/// See [`V1_INITIAL_SCHEMA`].
+pub const V4_DROP_PLANS: &str = r#"
 -- v4: drop the review lifecycle and the cached default branch
 DROP TABLE IF EXISTS plans;
 ALTER TABLE repos DROP COLUMN default_branch;
