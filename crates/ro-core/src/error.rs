@@ -8,6 +8,9 @@ pub enum CoreError {
     #[error("invalid repo spec: {0}")]
     InvalidRepoSpec(String),
 
+    #[error("invalid credential reference: {0}")]
+    InvalidCredentialRef(String),
+
     #[error("config error: {0}")]
     Config(String),
 

@@ -10,6 +10,9 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# For `CredentialRef`, so the [auth] table can reject a pasted secret at parse
+# time. Readded in Phase 2 with a caller.
+ro-core.workspace = true
 serde.workspace = true
 toml.workspace = true
 anyhow.workspace = true

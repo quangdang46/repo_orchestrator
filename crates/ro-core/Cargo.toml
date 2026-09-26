@@ -18,3 +18,8 @@ uuid.workspace = true
 time.workspace = true
 regex.workspace = true
 dirs.workspace = true
+
+[dev-dependencies]
+# Only so the credential tests can deserialize from a TOML table, which is
+# the shape a config file actually has.
+toml.workspace = true

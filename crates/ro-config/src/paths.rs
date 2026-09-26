@@ -128,6 +128,23 @@ layout = "flat"            # flat | nested
 parallel = 8
 timeout_secs = 30
 
+# [auth] — the credential SOURCE for any repo that does not override it.
+# The key name IS the transport; the value is a *reference* to a secret,
+# never the secret.
+#
+# Omit this table and ro uses the machine's own credential — SSH agent, git
+# credential manager, `gh auth` — which is the right answer for a work repo
+# whose SSH key is already correct and needs no configuration at all.
+#
+# There is no `token` key, in any layer. A credential is read at push time,
+# exists in ro's memory and in the argv of the one git invocation that needs
+# it, and is never written anywhere ro controls. A pasted `ghp_...` is a parse
+# error, not a value.
+[auth]
+# https = "env:GH_PERSONAL_TOKEN"
+# ssh   = "keychain:ssh-work"
+# expected_login = "quangdang46"
+
 [github]
 host = "github.com"
 auth = "auto"              # env | gh | config-token | auto

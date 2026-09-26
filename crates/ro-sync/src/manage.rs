@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 use ro_config::paths::ConfigPaths;
+use ro_core::CredentialRef;
 use ro_core::repo_spec::RepoSpec;
 
 /// A tracked repo as returned by list queries.
@@ -254,6 +255,67 @@ pub fn list(conn: &Connection, owner_filter: Option<&str>) -> Result<Vec<Tracked
     Ok(repos)
 }
 
+/// The per-repo config keys that may be set, and whether they are validated as
+/// a credential reference.
+///
+/// A `credential_ref` column is the only place in the whole system a secret
+/// could plausibly be written, because it is the only column whose *meaning*
+/// is "the thing ro reads instead of asking for a token". So it is validated on
+/// the way in, here, rather than in whichever command happens to write it.
+pub const REPO_CONFIG_KEYS: &[(&str, bool)] = &[
+    // (column, is_credential_reference)
+    ("credential_ref", true),
+    ("author_ref", false),
+    ("engine", false),
+    ("engine_args", false),
+];
+
+/// Set one per-repo config value, validating it first.
+///
+/// `repo` is any key [`find_repo`] accepts (`owner/name`, an alias, or an id)
+/// and `config_key` must be one of [`REPO_CONFIG_KEYS`]. A `credential_ref` is
+/// parsed as a `CredentialRef` **before** the UPDATE, so a pasted GitHub token
+/// is rejected and the row is left exactly as it was. The alternative is a
+/// live credential in a database that gets backed up, synced and pasted into
+/// issues, discovered long after the keystroke that created it.
+///
+/// The validation lives here rather than in `ro config set` so that every
+/// writer gets it, including a future one.
+pub fn set_repo_config(conn: &Connection, repo: &str, config_key: &str, value: &str) -> Result<()> {
+    let target = find_repo(conn, repo).with_context(|| format!("repo not found: {repo}"))?;
+
+    let Some((column, is_credential)) = REPO_CONFIG_KEYS
+        .iter()
+        .find(|(k, _)| *k == config_key)
+        .copied()
+    else {
+        let known: Vec<&str> = REPO_CONFIG_KEYS.iter().map(|(k, _)| *k).collect();
+        bail!(
+            "unknown per-repo config key {config_key:?}; expected one of: {}",
+            known.join(", ")
+        );
+    };
+
+    // Parse for the side effect of failing, then write the canonical rendering,
+    // so a value with surrounding whitespace is stored in the one form the
+    // resolver will compare against later.
+    let stored = if is_credential {
+        let parsed: CredentialRef = value.parse()?;
+        parsed.to_string()
+    } else {
+        value.to_string()
+    };
+
+    let changed = conn.execute(
+        &format!("UPDATE repos SET {column} = ?1 WHERE id = ?2"),
+        params![stored, target.id],
+    )?;
+    if changed == 0 {
+        bail!("repo {repo} matched but no row was updated");
+    }
+    Ok(())
+}
+
 /// Find a repo by `owner/name`, alias, or raw id.
 /// Owner/name lookups are case-insensitive (GitHub convention).
 pub fn find_repo(conn: &Connection, key: &str) -> Result<TrackedRepo> {
@@ -475,6 +537,87 @@ mod tests {
         let repos = list(&conn, Some("alice")).unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].owner, "alice");
+    }
+
+    /// Path 2 of 3: the registry row.
+    ///
+    /// The global config rejects a pasted secret at parse time and the row
+    /// rejects it at write time, and both because the value has to survive
+    /// being a `CredentialRef` first. Assert the rejection is *loud* — the
+    /// other failure mode is a value that quietly lands in `state.db`, which
+    /// is a file that gets backed up and pasted into issues.
+    #[test]
+    fn setting_a_credential_ref_rejects_a_pasted_secret() {
+        let (tmp, conn) = setup();
+        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+
+        let err = set_repo_config(
+            &conn,
+            "acme/api",
+            "credential_ref",
+            "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("env:VAR_NAME") && msg.contains("keychain:ENTRY_NAME"),
+            "message must teach the two accepted forms, got: {msg}"
+        );
+
+        // The row is untouched: a rejected write must not half-apply.
+        let row = &list(&conn, None).unwrap()[0];
+        assert_eq!(
+            row.credential_ref, None,
+            "a rejected credential must not be stored"
+        );
+    }
+
+    #[test]
+    fn setting_a_credential_ref_accepts_a_reference() {
+        let (tmp, conn) = setup();
+        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        set_repo_config(&conn, "acme/api", "credential_ref", "env:WORK_GH_TOKEN").unwrap();
+        set_repo_config(&conn, "acme/api", "author_ref", "work").unwrap();
+        set_repo_config(&conn, "acme/api", "engine", "codex").unwrap();
+
+        let row = &list(&conn, None).unwrap()[0];
+        assert_eq!(row.credential_ref.as_deref(), Some("env:WORK_GH_TOKEN"));
+        assert_eq!(row.author_ref.as_deref(), Some("work"));
+        assert_eq!(row.engine.as_deref(), Some("codex"));
+    }
+
+    /// `engine` and `author_ref` are not credential references, so they are not
+    /// parsed as one — otherwise `author_ref = "Tran Quang Dang"` would fail,
+    /// and the four keys would need four different validation rules at the
+    /// call site instead of one flag in the table.
+    #[test]
+    fn non_credential_keys_are_not_parsed_as_references() {
+        let (tmp, conn) = setup();
+        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        set_repo_config(&conn, "acme/api", "author_ref", "Tran Quang Dang").unwrap();
+        set_repo_config(&conn, "acme/api", "engine_args", "--model opus").unwrap();
+        let row = &list(&conn, None).unwrap()[0];
+        assert_eq!(row.author_ref.as_deref(), Some("Tran Quang Dang"));
+        assert_eq!(row.engine_args.as_deref(), Some("--model opus"));
+    }
+
+    #[test]
+    fn setting_an_unknown_config_key_is_a_named_error() {
+        let (tmp, conn) = setup();
+        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        let err = set_repo_config(&conn, "acme/api", "token", "whatever").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown per-repo config key"), "got: {msg}");
+        // `token` is precisely the key a user reaches for, so the error has to
+        // point at the real ones.
+        assert!(msg.contains("credential_ref"), "got: {msg}");
+    }
+
+    #[test]
+    fn setting_config_on_an_unknown_repo_is_an_error_not_a_no_op() {
+        let (tmp, conn) = setup();
+        let err = set_repo_config(&conn, "acme/nope", "engine", "codex").unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
     }
 
     /// The trap V5 had two halves to.

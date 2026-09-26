@@ -3,6 +3,7 @@
 //! Mirrors the TOML config from PLAN.md §12. All fields default to the
 //! values shipped with `ro init`. Validation lives in [`crate::validate`].
 
+use ro_core::CredentialRef;
 use serde::{Deserialize, Serialize};
 
 /// Top-level application configuration.
@@ -10,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     #[serde(default)]
     pub core: CoreConfig,
+    #[serde(default)]
+    pub auth: AuthConfig,
     #[serde(default)]
     pub github: GitHubConfig,
     #[serde(default)]
@@ -24,6 +27,41 @@ pub struct AppConfig {
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub safety: SafetyConfig,
+}
+
+/// `[auth]` — the credential **source** for any repo that does not override it.
+///
+/// The key name is the transport and the value is a *reference* to a secret,
+/// never the secret:
+///
+/// ```toml
+/// [auth]
+/// https = "env:GH_PERSONAL_TOKEN"
+/// ssh   = "keychain:ssh-work"
+/// ```
+///
+/// `deny_unknown_fields` is the load-bearing part, and it is what makes this a
+/// P0 rather than a style rule. The shape a user actually reaches for is
+/// `token = "ghp_…"`. Without this attribute that key is ignored in silence,
+/// the credential does not work, and the pasted secret sits in a file that gets
+/// backed up and pasted into issues. With it, the key is a parse error naming
+/// the two forms that do work.
+///
+/// Omit the whole table and ro uses the machine's own credential — SSH agent,
+/// git credential manager, `gh auth` — which is the right answer for a repo
+/// whose SSH key is already correct and needs no configuration at all.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Reference to the HTTPS credential. `env:VAR` or `keychain:ENTRY`.
+    pub https: Option<CredentialRef>,
+    /// Reference to the SSH credential. `env:VAR` or `keychain:ENTRY`.
+    pub ssh: Option<CredentialRef>,
+    /// The login the credential is expected to resolve to, checked before a
+    /// push. This is *not* the commit author, which ro sets and therefore
+    /// cannot get wrong; it is the account the remote sees, which ro does not
+    /// control.
+    pub expected_login: Option<String>,
 }
 
 /// `[core]` — global runtime knobs.
@@ -246,6 +284,69 @@ fn default_quality_gates() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Path 1 of 3: the global config file.
+    ///
+    /// `deny_unknown_fields` is what makes this work. Without it, a
+    /// `token = "ghp_…"` key is ignored in silence — no error, the credential
+    /// simply does not work, and the pasted secret stays in a file that gets
+    /// backed up and pasted into issues.
+    #[test]
+    fn auth_rejects_a_token_key() {
+        let err = toml::from_str::<AppConfig>(
+            r#"[auth]
+token = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("token") || msg.contains("unknown field"),
+            "the error must name the offending key, got: {msg}"
+        );
+    }
+
+    /// Path 1 of 3, second shape: the key is right but the value is a secret
+    /// rather than a reference, so `CredentialRef`'s own deserializer rejects
+    /// it and the message names the two forms that do work.
+    #[test]
+    fn auth_rejects_a_pasted_secret_as_a_value() {
+        let err = toml::from_str::<AppConfig>(
+            r#"[auth]
+https = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"
+"#,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("env:VAR_NAME") && msg.contains("keychain:ENTRY_NAME"),
+            "the message must teach the two accepted forms, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn auth_accepts_references_and_omission() {
+        let cfg: AppConfig = toml::from_str(
+            r#"[auth]
+https = "env:GH_PERSONAL_TOKEN"
+ssh   = "keychain:ssh-work"
+expected_login = "quangdang46"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.auth.https.as_ref().unwrap().to_string(),
+            "env:GH_PERSONAL_TOKEN"
+        );
+        assert_eq!(cfg.auth.ssh.as_ref().unwrap().name(), "ssh-work");
+        assert_eq!(cfg.auth.expected_login.as_deref(), Some("quangdang46"));
+
+        // The whole table omitted is valid and means "use the machine's own
+        // credential" — not "use an empty credential".
+        let bare: AppConfig = toml::from_str("").unwrap();
+        assert!(bare.auth.https.is_none());
+        assert!(bare.auth.ssh.is_none());
+    }
 
     #[test]
     fn defaults_match_plan_example() {
