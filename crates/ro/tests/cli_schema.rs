@@ -24,7 +24,8 @@ use tempfile::TempDir;
 /// entry, and that is deliberate — the failure is supposed to be a red test a
 /// human reads, not a type error.
 const EXPECTED_COMMANDS: &[&str] = &[
-    "init", "add", "remove", "list", "sync", "status", "prune", "run", "conflict", "doctor",
+    "init", "add", "remove", "list", "sync", "status", "prune", "run", "conflict",
+    "commit", "push", "ship", "doctor",
     "config", "schema",
 ];
 

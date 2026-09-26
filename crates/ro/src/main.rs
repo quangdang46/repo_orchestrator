@@ -9,6 +9,7 @@
 //! - 64: usage error
 
 mod doctor;
+mod ship;
 
 use std::path::PathBuf;
 
@@ -188,6 +189,58 @@ enum Commands {
         #[command(subcommand)]
         sub: ConflictCommands,
     },
+    /// Commit what the engine finds, and stop
+    Commit {
+        /// Target repos by pattern (e.g. "owner/*")
+        #[arg(long)]
+        repos: Option<String>,
+        /// Target repos by filter (e.g. "tag:needs-fmt")
+        #[arg(long)]
+        filter: Option<String>,
+        /// Target all tracked repos
+        #[arg(long)]
+        all: bool,
+        /// Which engine commits
+        #[arg(long)]
+        engine: Option<String>,
+        /// A binary under another name, for a nightly or an odd install
+        #[arg(long)]
+        engine_bin: Option<String>,
+        /// Preview without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Commit and push
+    Push {
+        #[arg(long)]
+        repos: Option<String>,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        engine: Option<String>,
+        #[arg(long)]
+        engine_bin: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// The whole thing: fetch, rebase, commit, push
+    Ship {
+        #[arg(long)]
+        repos: Option<String>,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        engine: Option<String>,
+        #[arg(long)]
+        engine_bin: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     // ── Doctor ───────────────────────────────────────────────────────
     /// Diagnose installation health
     Doctor {
@@ -403,6 +456,64 @@ fn run() -> Result<()> {
     let _quiet = cli.quiet;
 
     match cli.command {
+        // ── commit / push / ship ───────────────────────────────────────
+        //
+        // One module, three verbs. The difference is `HowFar`, and a
+        // shorter verb stops earlier rather than taking a different path:
+        // three paths that mostly agree drift, and the drift surfaces as
+        // "commit blocked but push did it anyway".
+        Commands::Commit {
+            repos,
+            filter,
+            all,
+            engine,
+            engine_bin,
+            dry_run,
+        } => ship::run_verb(
+            &paths,
+            ship::HowFar::Commit,
+            repos.as_deref(),
+            filter.as_deref(),
+            all,
+            engine.as_deref(),
+            engine_bin.as_deref(),
+            dry_run,
+        ),
+        Commands::Push {
+            repos,
+            filter,
+            all,
+            engine,
+            engine_bin,
+            dry_run,
+        } => ship::run_verb(
+            &paths,
+            ship::HowFar::Push,
+            repos.as_deref(),
+            filter.as_deref(),
+            all,
+            engine.as_deref(),
+            engine_bin.as_deref(),
+            dry_run,
+        ),
+        Commands::Ship {
+            repos,
+            filter,
+            all,
+            engine,
+            engine_bin,
+            dry_run,
+        } => ship::run_verb(
+            &paths,
+            ship::HowFar::Ship,
+            repos.as_deref(),
+            filter.as_deref(),
+            all,
+            engine.as_deref(),
+            engine_bin.as_deref(),
+            dry_run,
+        ),
+
         // ── Repo management ──
         Commands::Init => {
             let created = manage::init(&paths).context("initializing ro")?;
