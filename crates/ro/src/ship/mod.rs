@@ -73,7 +73,7 @@ pub fn run_verb(
                  falling back silently would commit with the raw backend \\
                  while you believed an agent was reading the diff."
             );
-            std::process::exit(2);
+            std::process::exit(crate::exit::EX_USAGE as i32);
         }
     };
 
@@ -93,7 +93,7 @@ pub fn run_verb(
             // An invalid glob or an unknown filter is a **usage** error:
             // exit 2, distinct from a run that failed.
             eprintln!("error: {e:#}");
-            std::process::exit(2);
+            std::process::exit(crate::exit::EX_USAGE as i32);
         }
     };
 
@@ -120,12 +120,12 @@ pub fn run_verb(
                 }
                 Err(e) => {
                     eprintln!("error planning {}: {e:#}", t.label);
-                    std::process::exit(2);
+                    std::process::exit(crate::exit::EX_FATAL as i32);
                 }
             },
             Err(e) => {
                 eprintln!("error reading {}: {e:#}", t.label);
-                std::process::exit(1);
+                std::process::exit(crate::exit::EX_FATAL as i32);
             }
         }
     }
@@ -153,9 +153,13 @@ pub fn run_verb(
     };
 
     print!("{}", summary.render());
-    let code = summary.exit_code();
+    // The summary counts; the table decides. A summary that assigned a
+    // code itself would collapse "all failed" and "some failed", which
+    // is the distinction the table exists for.
+    let (succeeded, failed) = summary.counts();
+    let code = crate::exit::RunExit::from_counts(succeeded, failed).code();
     if dry_run && code == 0 {
         eprintln!("(dry run — nothing was written)");
     }
-    std::process::exit(code);
+    std::process::exit(code as i32);
 }

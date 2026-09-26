@@ -9,6 +9,7 @@
 //! - 64: usage error
 
 mod doctor;
+mod exit;
 mod ship;
 
 use std::path::PathBuf;
@@ -365,8 +366,17 @@ fn resolve_paths(cli: &Cli) -> Result<ConfigPaths> {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("error: {err:?}");
-        std::process::exit(1);
+        // A fatal is its own code. Exiting 1 here reported a config file
+        // that will not parse as "some repos succeeded", which is worse
+        // than a wrong number: it invites a retry that cannot work.
+        let (message, code) = match err.downcast_ref::<exit::FatalError>() {
+            Some(f) => (f.message.clone(), f.code()),
+            // Anything that escapes without a FatalError is still fatal —
+            // it just did not say so at the point it was raised.
+            None => (format!("{err:#}"), exit::EX_FATAL),
+        };
+        eprintln!("error: {message}");
+        std::process::exit(code as i32);
     }
 }
 
@@ -551,7 +561,8 @@ fn run() -> Result<()> {
             author,
             tags,
         } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             let projects_dir = paths.state_dir.join("projects");
             let opts = manage::AddOptions {
                 name,
@@ -569,13 +580,15 @@ fn run() -> Result<()> {
         }
 
         Commands::Remove { key } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             let repo = manage::remove(&conn, &key).context("removing repo")?;
             eprintln!("Removed: {}/{}", repo.owner, repo.name);
         }
 
         Commands::List { owner, format } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             let repos = manage::list(&conn, owner.as_deref()).context("listing repos")?;
             if repos.is_empty() {
                 eprintln!("No tracked repos. Use 'ro add <spec>' to add one.");
@@ -608,7 +621,8 @@ fn run() -> Result<()> {
             if clone_only && pull_only {
                 anyhow::bail!("--clone-only and --pull-only cannot be used together");
             }
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             let opts = sync::SyncOptions {
                 strategy,
                 autostash,
@@ -636,7 +650,8 @@ fn run() -> Result<()> {
         }
 
         Commands::Status { repo, format } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             let statuses: Vec<status::RepoStatus> = match repo {
                 Some(key) => {
                     let found = manage::find_repo(&conn, &key)?;
@@ -695,7 +710,8 @@ fn run() -> Result<()> {
             archive,
             delete,
         } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
 
             if orphans || archive || delete {
                 use ro_sync::prune::{OrphanAction, find_orphans, handle_orphans};
@@ -770,7 +786,8 @@ fn run() -> Result<()> {
 
         // ── Runs / Timeline ──
         Commands::Run { sub } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             match sub {
                 RunCommands::List { limit } => {
                     let runs = ro_jobs::recent_runs(&conn, limit)?;
@@ -801,7 +818,8 @@ fn run() -> Result<()> {
 
         // ── Conflict ──
         Commands::Conflict { sub } => {
-            let conn = ro_state::open_db(&db_path).context("opening state database")?;
+            let conn = ro_state::open_db(&db_path)
+                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             match sub {
                 ConflictCommands::List => {
                     let repos = manage::list(&conn, None)?;
@@ -875,7 +893,9 @@ fn run() -> Result<()> {
                     println!("{json}");
                 }
             }
-            std::process::exit(report.exit_code());
+            // The doctor is not a fleet command: its own code, and its
+            // Severity::Optional probes can never move it.
+            std::process::exit(report.exit_code() as i32);
         }
 
         // ── Config ──
@@ -905,7 +925,9 @@ fn run() -> Result<()> {
                         if repo.is_empty() || config_key.is_empty() {
                             anyhow::bail!("expected repos.<name>.<key>, got: {key}");
                         }
-                        let conn = ro_state::open_db(&db_path).context("opening state database")?;
+                        let conn = ro_state::open_db(&db_path).map_err(|e| {
+                            exit::FatalError::new(format!("opening state database: {e}"))
+                        })?;
                         manage::set_repo_config(&conn, repo, config_key, value)
                             .with_context(|| format!("setting {key}"))?;
                         eprintln!("Set {key} = {value} in the registry");

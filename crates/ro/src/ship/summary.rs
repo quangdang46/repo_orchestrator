@@ -64,13 +64,13 @@ impl Summary {
             .count()
     }
 
-    /// 0 when every repo succeeded, 1 when any failed.
+    /// The counts the exit table needs.
     ///
-    /// A script driving ro cannot read the summary on stderr, only the
-    /// exit code — and "one repo failed" reporting success is how a
-    /// twenty-repo run gets trusted when three of them did nothing.
-    pub fn exit_code(&self) -> i32 {
-        if self.failures() > 0 { 1 } else { 0 }
+    /// The code itself comes from `exit::RunExit`, because a summary that
+    /// assigns 0/1 on its own would collapse "all failed" and "some
+    /// failed" — which is the exact distinction the table exists for.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.rows.len() - self.failures(), self.failures())
     }
 
     /// The human-readable table.
@@ -124,7 +124,7 @@ mod tests {
             row("acme/a", RepoOutcome::Pushed { oid: "aaa".into() }),
             row("acme/b", RepoOutcome::Pushed { oid: "bbb".into() }),
         ]);
-        assert_eq!(s.exit_code(), 0);
+        assert_eq!(s.counts(), (2, 0));
         assert_eq!(s.pushed(), 2);
     }
 
@@ -138,10 +138,9 @@ mod tests {
             row("acme/c", RepoOutcome::Pushed { oid: "ccc".into() }),
         ]);
         assert_eq!(
-            s.exit_code(),
-            1,
-            "one failing repo must make the run exit non-zero even when the \
-             others succeeded"
+            s.counts(),
+            (2, 1),
+            "one failure among successes is partial, not total"
         );
         assert_eq!(s.pushed(), 2, "and the successes are still reported");
         assert_eq!(s.failures(), 1);
@@ -156,7 +155,7 @@ mod tests {
                 detail: "github_token".into(),
             },
         )]);
-        assert_eq!(s.exit_code(), 1, "a safety block is not a success");
+        assert_eq!(s.counts().1, 1, "a safety block is not a success");
     }
 
     #[test]
@@ -173,7 +172,7 @@ mod tests {
             ),
             row("acme/b", RepoOutcome::NothingToCommit),
         ]);
-        assert_eq!(s.exit_code(), 0);
+        assert_eq!(s.counts(), (2, 0));
     }
 
     #[test]
@@ -195,6 +194,6 @@ mod tests {
     #[test]
     fn an_empty_selection_says_so() {
         assert!(Summary::default().render().contains("no repos selected"));
-        assert_eq!(Summary::default().exit_code(), 0);
+        assert_eq!(Summary::default().counts(), (0, 0));
     }
 }

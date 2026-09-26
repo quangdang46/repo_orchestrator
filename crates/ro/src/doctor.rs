@@ -152,8 +152,17 @@ impl DoctorReport {
     /// Recommended exit code.
     ///
     /// `0` healthy or warnings only; `1` if any check failed.
-    pub fn exit_code(&self) -> i32 {
-        if self.failures() > 0 { 1 } else { 0 }
+    /// The doctor's own 0/1, deliberately not the fleet table.
+    ///
+    /// A failed environment check is not a partial run, and reading it as
+    /// one is how a green run gets retried for the wrong reason. The
+    ///  probes can never move it.
+    pub fn exit_code(&self) -> u8 {
+        if self.failures() > 0 {
+            crate::exit::EX_DOCTOR_FAILED
+        } else {
+            crate::exit::EX_OK
+        }
     }
 }
 
