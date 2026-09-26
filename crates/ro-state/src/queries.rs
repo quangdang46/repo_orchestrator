@@ -161,10 +161,6 @@ pub fn score_all_health(conn: &Connection) -> Result<Vec<HealthSnapshot>> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn row_to_health(row: &rusqlite::Row<'_>) -> std::result::Result<HealthSnapshot, rusqlite::Error> {
     let class_str: String = row.get(4)?;
     let class = match class_str.as_str() {
