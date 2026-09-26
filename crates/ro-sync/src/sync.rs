@@ -991,12 +991,25 @@ mod filter_and_skip_tests {
         );
     }
 
+    /// Run git, with an identity and no signing forced on the child.
+    ///
+    /// Both are set here rather than left to the machine. A developer's
+    /// global `~/.gitconfig` supplies them locally, so a test that commits
+    /// passes on a workstation and fails on a CI runner with no identity
+    /// configured — "Author identity unknown" on one machine and green on
+    /// another, for the same commit.
     fn run_git(dir: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .output()
             .expect("git runs");
         assert!(

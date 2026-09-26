@@ -311,7 +311,7 @@ fn shim_body(log_line: &str, windows: &str, log: &Path) -> String {
 /// platform decides.
 fn write_shim(dir: &std::path::Path, name: &str, body: &str) {
     #[cfg(windows)]
-    let file = dir.path().join(format!("{name}.cmd"));
+    let file = dir.join(format!("{name}.cmd"));
     #[cfg(not(windows))]
     let file = dir.join(name);
 

@@ -161,10 +161,34 @@ impl Default for RemotePair {
     }
 }
 
+/// A `git` invocation that does not depend on the machine's own config.
+///
+/// The identity and the empty global/system config are the load-bearing
+/// parts. A developer has `user.email` in their `~/.gitconfig`; a CI
+/// runner does not, so a fixture that commits passes on one and fails on the
+/// other with "Author identity unknown" — the same commit, two verdicts.
+///
+/// `GIT_CONFIG_GLOBAL=/dev/null` is not portable to Windows, so the
+/// identity is supplied through the environment git documents for exactly
+/// this purpose, and the config files are only neutralised where the path
+/// exists.
 fn git() -> Command {
     let mut c = Command::new("git");
     c.env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "Never")
-        .env("LC_ALL", "C");
+        .env("LC_ALL", "C")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com");
+    // `NUL` on Windows, `/dev/null` elsewhere — a fixture that reaches for
+    // a POSIX path is a fixture that does not run on two thirds of the
+    // matrix, which is worse than one that fails loudly.
+    #[cfg(windows)]
+    c.env("GIT_CONFIG_GLOBAL", "NUL")
+        .env("GIT_CONFIG_SYSTEM", "NUL");
+    #[cfg(not(windows))]
+    c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
     c
 }

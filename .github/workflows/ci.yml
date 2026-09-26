@@ -39,6 +39,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # `--all-features` enables ro-core's default-on `keychain` feature,
+      # which reaches `libdbus-sys` and links against the system `dbus-1`.
+      # Without the headers the build script panics with a bare "explicit
+      # panic" naming no crate, so it reads as a broken build rather than a
+      # missing system package.
+      - name: Install Linux system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
