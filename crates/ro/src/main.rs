@@ -206,6 +206,9 @@ enum Commands {
         /// A binary under another name, for a nightly or an odd install
         #[arg(long)]
         engine_bin: Option<String>,
+        /// The branch the work should land on, when it is not the current one
+        #[arg(long)]
+        onto: Option<String>,
         /// Preview without writing
         #[arg(long)]
         dry_run: bool,
@@ -222,6 +225,9 @@ enum Commands {
         engine: Option<String>,
         #[arg(long)]
         engine_bin: Option<String>,
+        /// The branch the work should land on, when it is not the current one
+        #[arg(long)]
+        onto: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -237,6 +243,9 @@ enum Commands {
         engine: Option<String>,
         #[arg(long)]
         engine_bin: Option<String>,
+        /// The branch the work should land on, when it is not the current one
+        #[arg(long)]
+        onto: Option<String>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -468,6 +477,7 @@ fn run() -> Result<()> {
             all,
             engine,
             engine_bin,
+            onto,
             dry_run,
         } => ship::run_verb(
             &paths,
@@ -477,6 +487,7 @@ fn run() -> Result<()> {
             all,
             engine.as_deref(),
             engine_bin.as_deref(),
+            onto.as_deref(),
             dry_run,
         ),
         Commands::Push {
@@ -485,6 +496,7 @@ fn run() -> Result<()> {
             all,
             engine,
             engine_bin,
+            onto,
             dry_run,
         } => ship::run_verb(
             &paths,
@@ -494,6 +506,7 @@ fn run() -> Result<()> {
             all,
             engine.as_deref(),
             engine_bin.as_deref(),
+            onto.as_deref(),
             dry_run,
         ),
         Commands::Ship {
@@ -502,6 +515,7 @@ fn run() -> Result<()> {
             all,
             engine,
             engine_bin,
+            onto,
             dry_run,
         } => ship::run_verb(
             &paths,
@@ -511,6 +525,7 @@ fn run() -> Result<()> {
             all,
             engine.as_deref(),
             engine_bin.as_deref(),
+            onto.as_deref(),
             dry_run,
         ),
 

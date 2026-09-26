@@ -22,15 +22,24 @@ use anyhow::{Context, Result, bail};
 use crate::mutation::{RunOpts, run_in};
 
 /// Branches ro refuses to commit to or push.
-const PROTECTED_BRANCHES: &[&str] = &["main", "master"];
+const PROTECTED_BRANCHES: &[&str] = &["main", "master", "production", "staging"];
 const PROTECTED_PREFIX: &str = "release/";
 
-/// True when the branch must not be committed to or pushed by a sweep.
+/// True when the branch must not be committed to or pushed.
 ///
-/// `release/*` counts because a release branch is the one place a mistaken
-/// push is expensive in a way that is not obvious at the time.
+/// **Case-insensitive**, deliberately. The previous version matched
+/// exactly, so `Main` and `MASTER` were not protected — and a guard a
+/// differently-cased branch walks straight through is not a guard. Git
+/// refs are case-sensitive, so `Main` and `main` really are two different
+/// branches, and a user with both should be protected on both.
+///
+/// `release/*` counts because a release branch is the one place a
+/// mistaken push is expensive in a way that is not obvious at the time.
+/// `production` and `staging` stay for the same reason: they are the
+/// branches where a WIP commit is never what anyone wanted.
 pub fn is_protected_branch(branch: &str) -> bool {
-    PROTECTED_BRANCHES.contains(&branch) || branch.starts_with(PROTECTED_PREFIX)
+    let lowered = branch.to_ascii_lowercase();
+    PROTECTED_BRANCHES.contains(&lowered.as_str()) || lowered.starts_with(PROTECTED_PREFIX)
 }
 
 /// One entry of `git status --porcelain=v1 -z`.

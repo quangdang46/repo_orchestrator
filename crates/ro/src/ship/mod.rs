@@ -55,6 +55,7 @@ pub fn run_verb(
     all: bool,
     engine: Option<&str>,
     engine_bin: Option<&str>,
+    onto: Option<&str>,
     dry_run: bool,
 ) -> ! {
     // The engine the user named, else the config, else an error naming
@@ -113,7 +114,10 @@ pub fn run_verb(
                 engine_bin,
                 global_identity.as_ref(),
             ) {
-                Ok(p) => plans.push(p),
+                Ok(mut p) => {
+                    p.onto = onto.map(str::to_string);
+                    plans.push(p)
+                }
                 Err(e) => {
                     eprintln!("error planning {}: {e:#}", t.label);
                     std::process::exit(2);

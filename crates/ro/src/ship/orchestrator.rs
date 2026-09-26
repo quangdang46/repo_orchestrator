@@ -59,6 +59,16 @@ pub enum RepoOutcome {
         reason: String,
         detail: String,
     },
+    /// Refused before any push was attempted.
+    ///
+    /// Distinct from `Blocked` and from `Failed`: nothing was wrong with
+    /// the repo and nothing failed, the operation simply is not one ro
+    /// does. A caller that has to tell these apart can, and a run summary
+    /// that merges them loses the one that tells the user what to do.
+    Refused {
+        branch: String,
+        reason: String,
+    },
     Pushed {
         oid: String,
     },
@@ -72,7 +82,7 @@ impl RepoOutcome {
     pub fn is_failure(&self) -> bool {
         matches!(
             self,
-            RepoOutcome::Blocked { .. } | RepoOutcome::Failed { .. }
+            RepoOutcome::Blocked { .. } | RepoOutcome::Failed { .. } | RepoOutcome::Refused { .. }
         )
     }
 
@@ -83,6 +93,7 @@ impl RepoOutcome {
             RepoOutcome::NothingToCommit => "nothing to commit".into(),
             RepoOutcome::SkippedConflict { .. } => "skipped: mid-conflict".into(),
             RepoOutcome::Blocked { reason, .. } => format!("blocked: {reason}"),
+            RepoOutcome::Refused { branch, .. } => format!("refused: {branch} is protected"),
             RepoOutcome::Pushed { oid } => format!("pushed {oid}"),
             RepoOutcome::Failed { error } => format!("failed: {error}"),
         }
@@ -119,6 +130,11 @@ pub struct RepoPlan {
     #[allow(dead_code)]
     pub author_ref: Option<String>,
     pub credential_ref: Option<String>,
+    /// The branch the work should land on, when the user named one.
+    ///
+    /// `None` means "whatever the repo is on", which is why a protected
+    /// branch is a refusal rather than a rebase onto something invented.
+    pub onto: Option<String>,
     /// The commit author resolved from `author_ref` and the global
     /// identity table. `None` means "inherit git's own config".
     pub identity: Option<CommitIdentity>,
@@ -306,6 +322,29 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     // (e) Push, with the credential resolved from the row. `None` means
     //     "use the machine's own" — the right answer for a repo whose SSH
     //     key is already correct and needs no configuration.
+    // The refusal. ro does **not** create a branch.
+    //
+    // The old behaviour silently made `ro/wip/<slug>-<run>` so a pull
+    // request would have something to point at, and with PRs cut the
+    // reason is gone. Naming a branch has consequences: it is what a
+    // teammate fetches, what appears in `git branch` next month, and
+    // what a later `ro push` assumes. A tool that invents a name is a
+    // tool making a decision with a blast radius on your behalf.
+    //
+    // `--onto` is the escape, for the rare case where the work genuinely
+    // belongs on a different branch.
+    if plan.onto.is_none() && ro_git::primitives::is_protected_branch(&plan.base_branch) {
+        return RepoOutcome::Refused {
+            branch: plan.base_branch.clone(),
+            reason: format!(
+                "{} is a protected branch. Create a branch first \
+                 (`git checkout -b feat/x`), or pass --onto <BRANCH> if the \
+                 work genuinely belongs somewhere else.",
+                plan.base_branch
+            ),
+        };
+    }
+
     let secret = match resolve_credential(plan.credential_ref.as_deref()) {
         Ok(s) => s,
         Err(e) => {
@@ -319,7 +358,11 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         repo,
         &ro_git::mutation::PushOpts {
             remote: Some("origin".into()),
-            branch: Some(plan.base_branch.clone()),
+            branch: Some(
+                plan.onto
+                    .clone()
+                    .unwrap_or_else(|| plan.base_branch.clone()),
+            ),
             set_upstream: true,
             host: Some(plan.host_for_extraheader()),
             ..Default::default()
@@ -599,6 +642,7 @@ mod tests {
             base_branch: "main".into(),
             author_ref: None,
             credential_ref: None,
+            onto: None,
             identity: None,
             engine: ro_engine::resolve("git", &ro_engine::EngineSlots::default(), None)
                 .expect("git is one of the three built-ins"),
@@ -918,9 +962,183 @@ pub(crate) mod tests_support {
             String::from_utf8_lossy(&out.stdout).contains(message)
         }
 
-        #[allow(dead_code)]
         pub fn remote_path(&self) -> &Path {
             &self.remote
+        }
+
+        /// Does the remote have a branch with this name?
+        pub fn remote_has(&self, branch: &str) -> bool {
+            self.remote_refs().iter().any(|r| r == branch)
+        }
+
+        /// Every branch on the remote.
+        pub fn remote_refs(&self) -> Vec<String> {
+            let out = std::process::Command::new("git")
+                .args(["for-each-ref", "--format=%(refname:short)", "refs/heads"])
+                .current_dir(&self.remote)
+                .output()
+                .expect("git runs");
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Commit subjects on a remote branch, for a failure message.
+        pub fn remote_subjects(&self) -> Vec<String> {
+            self.remote_refs()
+        }
+    }
+}
+
+#[cfg(test)]
+mod protected_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    /// `main` refuses, names the fix, and **attempts no push**.
+    ///
+    /// The reflog check is the part that matters: "it printed a refusal"
+    /// and "it did not push" are different claims, and only the second is
+    /// the one a user needs.
+    #[test]
+    fn a_protected_branch_refuses_and_pushes_nothing() {
+        let f = Fixture::new();
+        f.write_local("f.txt", "work\n");
+
+        let plan = plan_on(&f, "main", None);
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        match &outcome {
+            RepoOutcome::Refused { branch, reason } => {
+                assert_eq!(branch, "main");
+                assert!(
+                    reason.contains("checkout -b"),
+                    "the message must name the fix, got: {reason}"
+                );
+            }
+            other => panic!("a protected branch must be refused, got {other:?}"),
+        }
+
+        // The remote's ref is untouched.
+        assert!(
+            !f.remote_has("work"),
+            "nothing may reach the remote; the remote has: {:?}",
+            f.remote_subjects()
+        );
+    }
+
+    /// The case-insensitivity, which the previous exact match missed.
+    #[test]
+    fn the_protected_set_is_case_insensitive() {
+        for b in ["main", "Main", "MAIN", "master", "MASTER", "Master"] {
+            assert!(
+                ro_git::primitives::is_protected_branch(b),
+                "{b} must be protected"
+            );
+        }
+        for b in [
+            "production",
+            "PRODUCTION",
+            "staging",
+            "release/1.2",
+            "RELEASE/9",
+        ] {
+            assert!(
+                ro_git::primitives::is_protected_branch(b),
+                "{b} must be protected"
+            );
+        }
+        // And the negative, so the check is not simply always true.
+        for b in ["feature/x", "mainline", "release-notes", "fix/main"] {
+            assert!(
+                !ro_git::primitives::is_protected_branch(b),
+                "{b} must NOT be protected"
+            );
+        }
+    }
+
+    /// `--onto` is the escape, and it must actually work.
+    #[test]
+    fn onto_is_the_escape_from_a_protected_branch() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feat/x"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feat/x"]);
+        f.write_local("f.txt", "work\n");
+
+        // The repo is on a feature branch, and the work is aimed at
+        // another one: exactly what `--onto` is for.
+        let plan = plan_on(&f, "main", Some("feat/x"));
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        assert!(
+            !matches!(outcome, RepoOutcome::Refused { .. }),
+            "--onto must lift the refusal, got {outcome:?}"
+        );
+    }
+
+    /// A plan pointed at a feature branch pushes normally.
+    #[test]
+    fn a_feature_branch_pushes_normally() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feat/y"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feat/y"]);
+        f.write_local("f.txt", "work\n");
+
+        let plan = plan_on(&f, "feat/y", None);
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        assert!(
+            matches!(outcome, RepoOutcome::Pushed { .. }),
+            "a feature branch must push, got {outcome:?}"
+        );
+        assert!(
+            f.remote_has("feat/y"),
+            "and the commit must reach the remote: {:?}",
+            f.remote_subjects()
+        );
+    }
+
+    /// A refusal is a distinct outcome, not folded into "failed".
+    ///
+    /// Nothing was wrong with the repo and nothing failed; the operation
+    /// simply is not one ro does. A summary that merges them loses the
+    /// one that tells the user what to do.
+    #[test]
+    fn a_refusal_is_its_own_outcome() {
+        let refused = RepoOutcome::Refused {
+            branch: "main".into(),
+            reason: "protected".into(),
+        };
+        assert!(
+            refused.is_failure(),
+            "a refusal is a failure for the exit code"
+        );
+        assert!(refused.render().contains("main"));
+        assert!(!refused.render().contains("failed:"));
+    }
+
+    fn opts_for(f: &Fixture) -> RunOptions {
+        RunOptions {
+            how_far: HowFar::Push,
+            state_dir: f.repo().join(".ro-state"),
+            ..Default::default()
+        }
+    }
+
+    fn plan_on(f: &Fixture, branch: &str, onto: Option<&str>) -> RepoPlan {
+        RepoPlan {
+            repo_id: "r1".into(),
+            label: "acme/api".into(),
+            local_path: f.repo().to_path_buf(),
+            clone_url: f.remote_path().to_string_lossy().into_owned(),
+            base_branch: branch.to_string(),
+            author_ref: None,
+            credential_ref: None,
+            onto: onto.map(str::to_string),
+            identity: None,
+            engine: ro_engine::resolve("git", &ro_engine::EngineSlots::default(), None)
+                .expect("git is one of the three built-ins"),
         }
     }
 }

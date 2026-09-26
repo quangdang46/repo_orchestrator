@@ -125,6 +125,7 @@ pub fn plan_for(
         base_branch,
         author_ref: repo.author_ref.clone(),
         credential_ref: repo.credential_ref.clone(),
+        onto: None,
         identity,
         engine,
     })
