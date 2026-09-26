@@ -16,6 +16,7 @@
 //! that repo. Every outcome is a *fact about one repo*, including the
 //! boring ones.
 
+pub mod env;
 pub mod git_engine;
 
 use std::path::PathBuf;
@@ -240,4 +241,5 @@ pub trait Engine: Send + Sync {
     fn checkpoint(&self, ctx: &EngineContext<'_>) -> EngineOutcome;
 }
 
+pub use env::ChildEnv;
 pub use git_engine::GitEngine;

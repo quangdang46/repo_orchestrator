@@ -131,18 +131,30 @@ fn path_is_restored_after_the_guard_drops() {
     );
 }
 
-/// The stronger half: restored even when the body panics. A panic between
-/// the swap and the restore is the case that produced a whole binary of
-/// unrelated failures.
+/// The stronger half: restored even when the body panics.
+///
+/// A panic between the swap and the restore is the case that produced a
+/// whole binary of unrelated failures, so the property is worth
+/// asserting. The panic is caught rather than resumed, and the hook is
+/// silenced for its duration: a panicking test in a parallel binary
+/// interleaves its message with every other test's, and that interleaving
+/// is what made this test flaky for reasons unrelated to PATH.
 #[test]
 fn path_is_restored_even_when_the_body_panics() {
     let before = std::env::var("PATH").unwrap_or_default();
     let shim = FakeBinary::recording("gh");
 
-    let result = std::panic::catch_unwind(|| {
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    // `TestEnv::run` resumes the panic after restoring, so `catch_unwind`
+    // here observes it and the process carries on — which is exactly
+    // what a caller outside a test would not do, and why the restore is
+    // asserted here rather than assumed from the absence of a crash.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: the body mutates nothing but panics, which is the point.
         unsafe { shim.with_on_path(|| panic!("deliberate panic inside the PATH guard")) }
-    });
+    }));
+    std::panic::set_hook(previous_hook);
 
     assert!(result.is_err(), "the body was supposed to panic");
     assert_eq!(
