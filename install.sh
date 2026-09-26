@@ -41,6 +41,7 @@ fi
 info()  { printf "%s==>%s %s\n"        "$C_BLUE"   "$C_RESET" "$*" >&2; }
 ok()    { printf "%s ✓ %s%s\n"         "$C_GREEN"  "$*"       "$C_RESET" >&2; }
 warn()  { printf "%s ! %s%s\n"         "$C_YELLOW" "$*"       "$C_RESET" >&2; }
+die()   { printf "%s x %s%s\n"         "$C_RED"   "$*"       "$C_RESET" >&2; exit 1; }
 err()   { printf "%s ✗ %s%s\n"         "$C_RED"    "$*"       "$C_RESET" >&2; }
 
 # ---------- helpers ----------
@@ -231,8 +232,12 @@ main() {
 
     mkdir -p "$INSTALL_DIR"
     local dest="${INSTALL_DIR%/}/${BIN}"
+    # `RO_FORCE=0` is the default, and it means *refuse*. The old code
+    # warned about it while installing unconditionally, so the warning
+    # named the value the user already had and promised a refusal that
+    # never happened. A safeguard that does not fire is worse than none.
     if [ -e "$dest" ] && [ "$FORCE" != "1" ]; then
-        warn "overwriting existing $dest (set RO_FORCE=0 to refuse)"
+        die "$dest already exists. Re-run with RO_FORCE=1 to replace it."
     fi
 
     install -m 0755 "$extracted" "$dest" 2>/dev/null || {

@@ -135,6 +135,7 @@ Next steps:
   3. ro add owner/repo       # track a repository
   4. ro sync                 # sync all tracked repos
 
-Configuration lives at %LOCALAPPDATA%\ro\config.toml (run `ro init` first).
+Config lives at %APPDATA%\ro\ (Roaming); state.db at %LOCALAPPDATA%\ro\.
+Both are created by `ro init`.
 '@
 }

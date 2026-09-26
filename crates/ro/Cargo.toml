@@ -33,6 +33,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 # NdjsonWriter stamps an RFC3339 timestamp on every event via `time`.
@@ -47,12 +49,7 @@ toml_edit.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
-# The end-to-end credential test needs a fake engine that tries to observe its
-# environment and a real bare remote, so the guarantee is checked against a
-# real chain rather than a unit test of one link.
+# The docs are checked against the live clap tree, so the test reads
+# `ro schema` and needs the JSON it emits.
+serde_json.workspace = true
 ro-testkit = { path = "../ro-testkit" }
-# Two authors, two credentials, one run: the reason the tool exists.
-ro-engine.workspace = true
-ro-core.workspace = true
-assert_cmd.workspace = true
-predicates.workspace = true

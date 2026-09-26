@@ -98,9 +98,14 @@ Bring every tracked repo in line with its remote.
 | `--clone-only` / `--pull-only` | Do one half of the job. |
 | `--autostash` | Stash before pulling, pop afterwards. |
 | `--dry-run` | Show what would happen. |
-| `--resume` | Continue an interrupted run. |
 | `--timeout <SECONDS>` | Per-operation network timeout. |
-| `--format <FMT>` | `text`, `json`, `toon`. |
+| `--format <FMT>` | `text`, `json`, `ndjson`. |
+
+There is no `--resume`. There is no daemon to resume into: a run is a
+process, and a process that was killed is gone. The flag survived a while
+because removing it was nobody's urgent work, and it read as a capability
+the tool had. A `ro sync` that had been interrupted is re-run, and it is
+idempotent by construction — which is a better answer than resuming.
 
 ### `ro status [REPO]`
 Per-repo state: current branch, whether the worktree is dirty, and how far
@@ -178,16 +183,25 @@ one is in, and lets you bail out or record that you have handled it by hand.
 
 ---
 
-## Run history
+## The per-repo summary
 
-Every mutating operation records a run, so you can answer "what did we change
-last Tuesday?".
+`ro ship` prints one line per repository — branch, engine, what happened,
+and, for a push, the account the credential resolved to. That line *is* the
+record of the run.
 
-| Command | Effect |
-|---|---|
-| `ro run list` | Recent runs |
-| `ro run show <ID>` | One run in detail |
-| `ro run timeline` | Its events in order |
+There is no `ro run list` and no run-history command. The `runs` and
+`run_events` tables exist and are written during a sync, but nothing reads
+them: with no command to query them, a table nobody queries is not an audit
+trail, it is a second copy of the truth that can disagree with the first.
+
+**What this answers:** *what did ro do to this repository?* **What it does
+not answer:** *what did ro do last Tuesday?* That gap is real and it is
+deliberate — the alternative is a queryable history of an event stream that
+nothing is allowed to trust, because a half-populated table answers with
+confidence.
+
+The exit code carries the run-level verdict: `0` all succeeded, `1` partial,
+`2` all failed, `64` bad usage, `70` fatal.
 
 ---
 
@@ -251,7 +265,11 @@ progress across many repos.
 | `--config-dir <DIR>` | Override the config location |
 | `--state-dir <DIR>` | Override the state location |
 | `--non-interactive` | Never prompt. Use this in automation and CI. |
-| `--quiet` / `--verbose` | Less or more output |
+
+There is no `--quiet` or `--verbose`. `--verbose` was read nowhere, and
+`--quiet`'s only real read sat inside the `ro import` branch that Phase 1
+deleted. A verbosity flag that changes nothing is a promise the tool does
+not keep, and the fix is removal rather than wiring it up later.
 
 ---
 
