@@ -78,13 +78,14 @@ impl SecretFinding {
 }
 
 /// Redact a secret to a short preview.
+/// Redact a matched secret to a short preview.
+///
+/// Delegates to the one rule in `ro-core::secret`. This was a *second* rule
+/// (first-4 only) and the tree now has exactly one, because the identity guard
+/// compares redacted forms and a guard that redacts differently on each side
+/// of a comparison is not a guard.
 fn redact(s: &str) -> String {
-    if s.len() <= 4 {
-        "****".to_string()
-    } else {
-        let head: String = s.chars().take(4).collect();
-        format!("{head}…")
-    }
+    ro_core::redact(s)
 }
 
 struct Rule {

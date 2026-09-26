@@ -14,27 +14,43 @@ use std::env;
 pub use ro_core::{AuthPolicy, AuthProvider, CommitIdentity, CredentialRef};
 
 /// A GitHub token, never displayed in full.
-#[derive(Clone, Debug)]
-pub struct AuthToken(String);
+///
+/// This **used to** `#[derive(Debug)]`, which meant `{:?}` printed the raw
+/// token. Redaction that is opt-in and manual is not redaction: one
+/// `tracing` field, one `dbg!`, or one Debug-formatted panic message and the
+/// value is in a log file. `Debug` is now manual and delegates to the single
+/// rule in `ro-core::secret`, so there is nothing left to forget to call.
+///
+/// There is deliberately **no `Display`**. `format!("{token}")` is then a
+/// compile error rather than a silent `***`, and a caller who genuinely wants
+/// the value has to say `as_str()` — which makes every read greppable.
+pub struct AuthToken(ro_core::SecretString);
+
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AuthToken").field(&self.0.preview()).finish()
+    }
+}
 
 impl AuthToken {
     /// Create from an explicit string (e.g., from config).
     pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
+        Self(ro_core::SecretString::new(token))
     }
 
     /// Return the raw token (for HTTP headers).
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.expose()
     }
 
-    /// Redact for logging: show first 4 and last 4 chars, or "****" if short.
+    /// Redact for logging: first 4 and last 4, or `****` if too short to
+    /// reveal both ends without revealing most of it.
+    ///
+    /// Delegates to the one rule rather than implementing a second. The old
+    /// version byte-sliced `&s[..4]`, which panics when byte 4 lands inside a
+    /// multi-byte character.
     pub fn redact(&self) -> String {
-        let s = &self.0;
-        if s.len() <= 12 {
-            return "****".to_string();
-        }
-        format!("{}…{}", &s[..4], &s[s.len() - 4..])
+        self.0.preview()
     }
 }
 
@@ -116,6 +132,80 @@ pub fn build_client(token: &AuthToken, host: Option<&str>) -> Result<octocrab::O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// True if `haystack` contains a PAT-shaped token.
+    ///
+    /// The same rule the end-to-end output check uses, duplicated rather than
+    /// shared: this crate cannot depend on the `ro` binary's test tree, and a
+    /// shared helper that both copies could drift from is worse than a
+    /// four-line predicate.
+    fn contains_pat(haystack: &str) -> bool {
+        haystack
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|t| {
+                (t.starts_with("ghp_") || t.starts_with("github_pat_"))
+                    && t.len() >= 20
+                    && t.chars().any(|c| c.is_ascii_digit())
+            })
+    }
+
+    /// The bug: `AuthToken` derived `Debug`, so `{:?}` printed the raw token.
+    /// Asserted here rather than only end-to-end because nothing in the tree
+    /// currently Debug-formats a token, which means an end-to-end check alone
+    /// would pass even with `Debug` reverted to leaking.
+    #[test]
+    fn debug_of_a_token_contains_no_pat() {
+        for fake in [
+            "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+            "github_pat_11ABCDEFG0aBcDeFgHiJkLmNoPqRsT",
+        ] {
+            let rendered = format!("{:?}", AuthToken::new(fake));
+            assert!(!contains_pat(&rendered), "Debug leaked a PAT: {rendered}");
+        }
+    }
+
+    /// The negative control. Without this, the test above is vacuous — it
+    /// would pass just as happily against a `Debug` that prints the raw value,
+    /// because nothing else in the tree prints one either way.
+    #[test]
+    fn the_debug_assertion_has_teeth() {
+        let fake = "ghp_16C7e42F292c6912E7710c838347Ae178B4a";
+        // What the old derived Debug produced.
+        assert!(
+            contains_pat(&format!("AuthToken(\"{fake}\")")),
+            "the predicate must flag the raw value the old Debug printed, \
+             otherwise debug_of_a_token_contains_no_pat proves nothing"
+        );
+    }
+
+    /// A Debug-formatted struct is how a token actually reaches a log line:
+    /// some field holds it and the whole record is printed.
+    #[test]
+    fn a_derived_debug_on_a_holder_does_not_leak_it() {
+        #[derive(Debug)]
+        struct Request {
+            endpoint: &'static str,
+            token: AuthToken,
+        }
+        let r = Request {
+            endpoint: "/repos/acme/api",
+            token: AuthToken::new("ghp_16C7e42F292c6912E7710c838347Ae178B4a"),
+        };
+        let rendered = format!("{r:?}");
+        assert!(
+            rendered.contains("/repos/acme/api"),
+            "other fields stay visible"
+        );
+        assert!(!contains_pat(&rendered), "the token leaked: {rendered}");
+    }
+
+    /// The old implementation byte-sliced, which panics in the middle of a
+    /// multi-byte character.
+    #[test]
+    fn redaction_does_not_panic_on_a_multibyte_token() {
+        let t = AuthToken::new("héllo wörld — a token, but not ASCII");
+        assert!(t.redact().contains('…'));
+    }
 
     #[test]
     fn token_redact_long() {

@@ -10,6 +10,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# For the single redaction rule, shared with the identity guard.
+ro-core.workspace = true
 ro-sync.workspace = true
 ro-state.workspace = true
 ro-git.workspace = true

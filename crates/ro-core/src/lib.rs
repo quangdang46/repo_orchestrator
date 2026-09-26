@@ -8,12 +8,14 @@ pub mod credential;
 pub mod error;
 pub mod failure;
 pub mod repo_spec;
+pub mod secret;
 
 pub use auth::{AuthPolicy, AuthProvider, CommitIdentity, LoginMismatch};
 pub use credential::{CredentialRef, CredentialSource};
 pub use error::{CoreError, CoreResult};
 pub use failure::FailureClass;
 pub use repo_spec::RepoSpec;
+pub use secret::{SecretString, redact};
 
 /// The layering this crate exists to protect, asserted rather than documented.
 ///
