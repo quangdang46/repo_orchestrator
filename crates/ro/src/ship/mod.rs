@@ -50,7 +50,12 @@ use ro_config::ConfigPaths;
 pub fn run_verb(
     paths: &ConfigPaths,
     how_far: HowFar,
-    repos: Option<&str>,
+    // Repos named positionally, by name or alias; and a glob from
+    // `--pattern`. They are separate parameters rather than one
+    // comma-joined string so the precedence between them is visible in
+    // the signature.
+    named: &[String],
+    pattern: Option<&str>,
     filter: Option<&str>,
     all: bool,
     engine: Option<&str>,
@@ -86,8 +91,25 @@ pub fn run_verb(
     };
 
     let projects_dir = paths.state_dir.join("projects");
-    let targets = match ro_sync::targets::resolve_targets(&conn, repos, filter, all, &projects_dir)
-    {
+
+    // A name someone typed outranks a flag left in a shell profile, so the
+    // positional list wins when both are given. `--all` is explicit and
+    // beats both: it is the only way to say "everything".
+    let selection: Option<String> = if all {
+        None
+    } else if !named.is_empty() {
+        Some(named.join(","))
+    } else {
+        pattern.map(str::to_string)
+    };
+
+    let targets = match ro_sync::targets::resolve_targets(
+        &conn,
+        selection.as_deref(),
+        filter,
+        all,
+        &projects_dir,
+    ) {
         Ok(t) => t,
         Err(e) => {
             // An invalid glob or an unknown filter is a **usage** error:

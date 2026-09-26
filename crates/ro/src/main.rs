@@ -192,9 +192,17 @@ enum Commands {
     },
     /// Commit what the engine finds, and stop
     Commit {
-        /// Target repos by pattern (e.g. "owner/*")
+        /// Repos to act on, by name or alias: `ro sync cass voice-ai-agent`
+        ///
+        /// Positional because that is how the command is typed, and because a
+        /// name someone typed should outrank a flag left in a shell profile.
+        /// `--pattern` still works and is the glob form.
+        #[arg(value_name = "REPO")]
+        repos: Vec<String>,
+
+        /// Target repos by glob (e.g. "owner/*")
         #[arg(long)]
-        repos: Option<String>,
+        pattern: Option<String>,
         /// Target repos by filter (e.g. "tag:needs-fmt")
         #[arg(long)]
         filter: Option<String>,
@@ -216,8 +224,16 @@ enum Commands {
     },
     /// Commit and push
     Push {
+        /// Repos to act on, by name or alias: `ro sync cass voice-ai-agent`
+        ///
+        /// Positional because that is how the command is typed, and because a
+        /// name someone typed should outrank a flag left in a shell profile.
+        /// `--pattern` still works and is the glob form.
+        #[arg(value_name = "REPO")]
+        repos: Vec<String>,
+        /// Target repos by glob (e.g. "owner/*")
         #[arg(long)]
-        repos: Option<String>,
+        pattern: Option<String>,
         #[arg(long)]
         filter: Option<String>,
         #[arg(long)]
@@ -234,8 +250,16 @@ enum Commands {
     },
     /// The whole thing: fetch, rebase, commit, push
     Ship {
+        /// Repos to act on, by name or alias: `ro sync cass voice-ai-agent`
+        ///
+        /// Positional because that is how the command is typed, and because a
+        /// name someone typed should outrank a flag left in a shell profile.
+        /// `--pattern` still works and is the glob form.
+        #[arg(value_name = "REPO")]
+        repos: Vec<String>,
+        /// Target repos by glob (e.g. "owner/*")
         #[arg(long)]
-        repos: Option<String>,
+        pattern: Option<String>,
         #[arg(long)]
         filter: Option<String>,
         #[arg(long)]
@@ -482,7 +506,8 @@ fn run() -> Result<()> {
         // three paths that mostly agree drift, and the drift surfaces as
         // "commit blocked but push did it anyway".
         Commands::Commit {
-            repos,
+            repos: named,
+            pattern: glob,
             filter,
             all,
             engine,
@@ -492,7 +517,8 @@ fn run() -> Result<()> {
         } => ship::run_verb(
             &paths,
             ship::HowFar::Commit,
-            repos.as_deref(),
+            &named,
+            glob.as_deref(),
             filter.as_deref(),
             all,
             engine.as_deref(),
@@ -501,7 +527,8 @@ fn run() -> Result<()> {
             dry_run,
         ),
         Commands::Push {
-            repos,
+            repos: named,
+            pattern: glob,
             filter,
             all,
             engine,
@@ -511,7 +538,8 @@ fn run() -> Result<()> {
         } => ship::run_verb(
             &paths,
             ship::HowFar::Push,
-            repos.as_deref(),
+            &named,
+            glob.as_deref(),
             filter.as_deref(),
             all,
             engine.as_deref(),
@@ -520,7 +548,8 @@ fn run() -> Result<()> {
             dry_run,
         ),
         Commands::Ship {
-            repos,
+            repos: named,
+            pattern: glob,
             filter,
             all,
             engine,
@@ -530,7 +559,8 @@ fn run() -> Result<()> {
         } => ship::run_verb(
             &paths,
             ship::HowFar::Ship,
-            repos.as_deref(),
+            &named,
+            glob.as_deref(),
             filter.as_deref(),
             all,
             engine.as_deref(),
