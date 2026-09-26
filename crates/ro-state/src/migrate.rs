@@ -23,29 +23,99 @@ pub fn run(conn: &Connection) -> Result<()> {
     apply(conn, current)
 }
 
+/// One forward-only schema step.
+///
+/// `Sql` covers everything expressible as a single idempotent script — which
+/// is most of it, because `CREATE TABLE IF NOT EXISTS` is naturally
+/// re-runnable. `Guarded` exists because SQLite has **no** `ADD COLUMN IF NOT
+/// EXISTS`: a migration that adds a column cannot be written as plain SQL and
+/// be safe to run twice, and "safe to run twice" is not optional here. If the
+/// process dies between the ALTER and the `_meta` version write, the next run
+/// sees the old version and replays the step — which for a bare `ADD COLUMN`
+/// means `duplicate column name` and ro fails to open its own database.
+enum Migration {
+    Sql(&'static str),
+    Guarded(fn(&Connection) -> Result<()>),
+}
+
 fn apply(conn: &Connection, from: i64) -> Result<()> {
-    let migrations: &[&str] = &[
+    let migrations: &[Migration] = &[
         // v1: full initial schema (PLAN.md §13)
-        V1_INITIAL_SCHEMA,
+        Migration::Sql(V1_INITIAL_SCHEMA),
         // v2: repo_tags (ADDITION.md A2)
-        V2_REPO_TAGS,
+        Migration::Sql(V2_REPO_TAGS),
         // v3: DROP inbox_dismissed (removed inbox feature)
-        V3_DROP_INBOX,
+        Migration::Sql(V3_DROP_INBOX),
         // v4: DROP plans (review lifecycle) + the cached default_branch
-        V4_DROP_PLANS,
+        Migration::Sql(V4_DROP_PLANS),
+        // v5: per-repo config columns
+        Migration::Guarded(v5_add_repo_config),
     ];
 
-    for (i, sql) in migrations.iter().enumerate() {
+    for (i, migration) in migrations.iter().enumerate() {
         let version = (i + 1) as i64;
         if version > from {
             tracing::info!(version, "applying migration");
-            conn.execute_batch(sql)
-                .with_context(|| format!("applying migration v{version}"))?;
+            match migration {
+                Migration::Sql(sql) => conn
+                    .execute_batch(sql)
+                    .with_context(|| format!("applying migration v{version}"))?,
+                Migration::Guarded(step) => {
+                    step(conn).with_context(|| format!("applying migration v{version}"))?
+                }
+            }
             conn.execute(
                 "INSERT OR REPLACE INTO _meta (key, value) VALUES ('version', ?1)",
                 [version.to_string()],
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Does `table` have a column named `column`?
+///
+/// Backed by `PRAGMA table_info`, which is the only statement that answers
+/// this — there is no `information_schema` and no `ALTER TABLE ... IF NOT
+/// EXISTS`. The table name is interpolated because `PRAGMA` does not accept a
+/// bound parameter; every caller passes a literal.
+pub fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    let sql = format!("PRAGMA table_info({table})");
+    let Ok(mut stmt) = conn.prepare(&sql) else {
+        return false;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return false;
+    };
+    while let Ok(Some(row)) = rows.next() {
+        // table_info columns: cid, name, type, notnull, dflt_value, pk
+        let name: String = match row.get(1) {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        if name == column {
+            return true;
+        }
+    }
+    false
+}
+
+/// v5: the four per-repo config columns. This **is** the entire per-repo
+/// config layer — there is no `.ro/config.local.toml`.
+///
+/// Each is NULL by default, and NULL is meaningful throughout: no
+/// `credential_ref` means the global `[auth]` default, no `author_ref` means
+/// `[identity].default`, no `engine` means `[agent].engine`. An existing row
+/// that predates this migration therefore stays on the global configuration,
+/// which is what a user upgrading should get.
+fn v5_add_repo_config(conn: &Connection) -> Result<()> {
+    for column in ["credential_ref", "author_ref", "engine", "engine_args"] {
+        if column_exists(conn, "repos", column) {
+            tracing::debug!(column, "column already present, skipping");
+            continue;
+        }
+        conn.execute_batch(&format!("ALTER TABLE repos ADD COLUMN {column} TEXT;"))
+            .with_context(|| format!("adding repos.{column}"))?;
     }
     Ok(())
 }
@@ -266,7 +336,7 @@ mod tests {
     fn migration_records_version() {
         let conn = fresh();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
     }
 
     #[test]
@@ -275,7 +345,7 @@ mod tests {
         run(&conn).unwrap();
         run(&conn).unwrap();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
     }
 
     /// The upgrade path, which no other test in the workspace exercises.
@@ -327,7 +397,10 @@ mod tests {
 
         run(&conn).unwrap();
 
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        // `run` applies every pending migration, so it carries this fixture
+        // to the current version, not just to 4. The V4-specific assertions
+        // below are what this test is about.
+        assert_eq!(current_version(&conn).unwrap(), 5);
         assert!(
             !table_exists(&conn, "plans"),
             "V4 must drop the plans table"
@@ -345,7 +418,7 @@ mod tests {
 
         // Re-running must not fail on the already-dropped column.
         run(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 4);
+        assert_eq!(current_version(&conn).unwrap(), 5);
     }
 
     fn table_exists(conn: &Connection, name: &str) -> bool {
@@ -357,11 +430,83 @@ mod tests {
         .is_ok()
     }
 
-    fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
-        // A missing column is what we want to detect, so a failed PRAGMA is
-        // the answer rather than a panic.
-        conn.prepare(&format!("SELECT {column} FROM {table} LIMIT 1"))
-            .is_ok()
+    #[test]
+    fn v5_adds_the_four_config_columns() {
+        let conn = fresh();
+        run(&conn).unwrap();
+        for column in ["credential_ref", "author_ref", "engine", "engine_args"] {
+            assert!(
+                column_exists(&conn, "repos", column),
+                "v5 must add repos.{column}"
+            );
+        }
+    }
+
+    /// The trap the `Guarded` variant exists for. `ALTER TABLE ... ADD COLUMN`
+    /// has no `IF NOT EXISTS` in SQLite, so a replayed V5 dies with
+    /// `duplicate column name` — and if the version write is what failed, the
+    /// replay is exactly what the next run attempts. Re-running the step
+    /// against an already-migrated database must be a no-op, not an error.
+    #[test]
+    fn v5_is_idempotent_when_replayed_at_the_same_version() {
+        let conn = fresh();
+        run(&conn).unwrap();
+        // The version gate would skip it; call the step directly to prove the
+        // step itself is re-runnable, which is what the gate does not protect.
+        v5_add_repo_config(&conn).unwrap();
+        v5_add_repo_config(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 5);
+    }
+
+    /// An existing row must land on the global configuration, not on a value
+    /// invented for it. Every one of the four columns is a NULL-means-inherit
+    /// column, so a row that predates V5 has to stay NULL.
+    #[test]
+    fn v4_database_upgrades_to_v5_leaving_existing_rows_on_the_global_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        conn.execute_batch(V1_INITIAL_SCHEMA).unwrap();
+        conn.execute_batch(V2_REPO_TAGS).unwrap();
+        conn.execute_batch(V3_DROP_INBOX).unwrap();
+        conn.execute_batch(V4_DROP_PLANS).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO _meta (key, value) VALUES ('version', '4')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, branch, alias, clone_url, \
+             local_path, visibility, archived, disabled, added_at, updated_at) \
+             VALUES ('r1', 'github.com', 'acme', 'api', 'main', NULL, \
+             'https://github.com/acme/api.git', '/tmp/api', 'public', 0, 0, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        // Precondition: V5 has not run yet.
+        assert!(!column_exists(&conn, "repos", "credential_ref"));
+
+        run(&conn).unwrap();
+
+        assert_eq!(current_version(&conn).unwrap(), 5);
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT credential_ref, author_ref, engine, engine_args FROM repos WHERE id = 'r1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (None, None, None, None),
+            "an upgraded row must inherit the global config, not gain a value"
+        );
     }
 
     #[test]

@@ -29,6 +29,20 @@ pub struct TrackedRepo {
     pub visibility: String,
     pub archived: bool,
     pub disabled: bool,
+    /// The per-repo config layer (schema V5). Every one of these is
+    /// `None`-means-inherit, so a row that predates V5 reads back as
+    /// "configured by the global config" rather than as a blank.
+    ///
+    /// `credential_ref` is a *reference* — `env:VAR` or `keychain:name` —
+    /// never the secret itself. This struct is `Serialize`, so a raw secret
+    /// here would land in `--format json` output and in anything that logs it.
+    pub credential_ref: Option<String>,
+    /// Names a profile from the global `[identity]` table, not an address.
+    pub author_ref: Option<String>,
+    /// `claude` | `codex` | `git`; `None` means use `[agent].engine`.
+    pub engine: Option<String>,
+    /// `None` means use `[agent].command`.
+    pub engine_args: Option<String>,
 }
 
 impl std::fmt::Display for TrackedRepo {
@@ -41,8 +55,16 @@ impl std::fmt::Display for TrackedRepo {
     }
 }
 
+/// Every column `row_to_tracked` reads, in the order it reads them.
+///
+/// Kept in lockstep with `row_to_tracked` and with the `INSERT` in `add`. This
+/// string is the whole reason a schema change needs three edits in one commit:
+/// a stale enumeration is not a compile error, it is a query that succeeds and
+/// leaves the new fields at their defaults — so a repo the user configured
+/// reads back as unconfigured, and nothing anywhere says so.
 const REPO_COLUMNS: &str = "id, host, owner, name, branch, alias, clone_url, local_path, \
-                             visibility, archived, disabled";
+                             visibility, archived, disabled, credential_ref, author_ref, \
+                             engine, engine_args";
 
 fn row_to_tracked(row: &rusqlite::Row<'_>) -> std::result::Result<TrackedRepo, rusqlite::Error> {
     Ok(TrackedRepo {
@@ -57,6 +79,10 @@ fn row_to_tracked(row: &rusqlite::Row<'_>) -> std::result::Result<TrackedRepo, r
         visibility: row.get(8)?,
         archived: row.get::<_, i64>(9)? != 0,
         disabled: row.get::<_, i64>(10)? != 0,
+        credential_ref: row.get(11)?,
+        author_ref: row.get(12)?,
+        engine: row.get(13)?,
+        engine_args: row.get(14)?,
     })
 }
 
@@ -141,6 +167,16 @@ pub fn add(conn: &Connection, spec_str: &str, projects_dir: &Path) -> Result<Tra
         visibility: "unknown".to_string(),
         archived: false,
         disabled: false,
+        // A newly added repo has no per-repo config. NULL here is the whole
+        // point: it means "inherit the global [auth]/[identity]/[agent]", which
+        // is what a fresh repo should do. The INSERT deliberately does not
+        // name these four columns — an omitted column takes its default, and
+        // hard-coding NULL in a VALUES list would be a second place to forget
+        // when the next per-repo setting is added.
+        credential_ref: None,
+        author_ref: None,
+        engine: None,
+        engine_args: None,
     })
 }
 
@@ -441,6 +477,73 @@ mod tests {
         assert_eq!(repos[0].owner, "alice");
     }
 
+    /// The trap V5 had two halves to.
+    ///
+    /// `list` selects the `REPO_COLUMNS` string, and a schema migration adds
+    /// columns to the table. If the two drift, the SELECT still succeeds — it
+    /// just asks for fewer columns than exist — so a repo the user configured
+    /// reads back as unconfigured. Nothing errors, anywhere. Writing the
+    /// columns directly and reading them back is what closes that gap: only a
+    /// `REPO_COLUMNS` that actually names them can pass.
+    #[test]
+    fn per_repo_config_survives_the_list_round_trip() {
+        let (tmp, conn) = setup();
+        let added = add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+
+        conn.execute(
+            "UPDATE repos SET credential_ref = ?1, author_ref = ?2, engine = ?3, engine_args = ?4 \
+             WHERE id = ?5",
+            params!["env:GH_TOKEN", "work", "codex", "--yolo", added.id],
+        )
+        .unwrap();
+
+        let listed = list(&conn, None).unwrap();
+        let row = listed.iter().find(|r| r.id == added.id).unwrap();
+        assert_eq!(row.credential_ref.as_deref(), Some("env:GH_TOKEN"));
+        assert_eq!(row.author_ref.as_deref(), Some("work"));
+        assert_eq!(row.engine.as_deref(), Some("codex"));
+        assert_eq!(row.engine_args.as_deref(), Some("--yolo"));
+    }
+
+    /// The other half of the same trap: writing one repo's config must not
+    /// leak onto its neighbours, which is what would happen if the columns
+    /// were resolved by position rather than by name.
+    #[test]
+    fn per_repo_config_is_per_row() {
+        let (tmp, conn) = setup();
+        let a = add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        let b = add(&conn, "acme/web", &projects_dir(&tmp)).unwrap();
+
+        conn.execute(
+            "UPDATE repos SET engine = 'claude' WHERE id = ?1",
+            params![a.id],
+        )
+        .unwrap();
+
+        let listed = list(&conn, None).unwrap();
+        let row_a = listed.iter().find(|r| r.id == a.id).unwrap();
+        let row_b = listed.iter().find(|r| r.id == b.id).unwrap();
+        assert_eq!(row_a.engine.as_deref(), Some("claude"));
+        assert_eq!(
+            row_b.engine, None,
+            "an unconfigured row must still read as inheriting the global default"
+        );
+    }
+
+    /// A repo added before V5 existed, or added without any config, reads back
+    /// as inheriting rather than as broken. NULL is the encoding for
+    /// "use the global [auth]/[identity]/[agent]", not an absence.
+    #[test]
+    fn a_freshly_added_repo_inherits_everything() {
+        let (tmp, conn) = setup();
+        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        let row = &list(&conn, None).unwrap()[0];
+        assert_eq!(row.credential_ref, None);
+        assert_eq!(row.author_ref, None);
+        assert_eq!(row.engine, None);
+        assert_eq!(row.engine_args, None);
+    }
+
     #[test]
     fn tracked_repo_display() {
         let repo = TrackedRepo {
@@ -455,6 +558,10 @@ mod tests {
             visibility: "unknown".into(),
             archived: false,
             disabled: false,
+            credential_ref: None,
+            author_ref: None,
+            engine: None,
+            engine_args: None,
         };
         assert_eq!(format!("{repo}"), "quangdang46/repo_orchestrator as ro");
     }

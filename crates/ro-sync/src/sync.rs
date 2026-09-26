@@ -415,6 +415,10 @@ mod tests {
             visibility: "unknown".into(),
             archived: false,
             disabled: false,
+            credential_ref: None,
+            author_ref: None,
+            engine: None,
+            engine_args: None,
         };
 
         let opts = SyncOptions::default();
