@@ -13,9 +13,14 @@
 //!   * Capture stdout/stderr.
 //!   * Classify errors (auth, network, conflict, dirty, …).
 //!
-//! Timeout enforcement is the caller's responsibility for now (the
-//! daemon owns long-running concerns). Synchronous API; future work
-//! will wrap these in tokio for the daemon.
+//! Timeouts are the caller's, via [`RunOpts::timeout`], and a breach kills the
+//! whole child tree — see [`GitError::TimedOut`]. This used to say enforcement
+//! belonged to "the daemon", which is being cut, so the deferral had no owner
+//! and a hung git could stall a whole fleet run indefinitely.
+//!
+//! The API stays synchronous. An async wrapper buys nothing here: a git
+//! invocation is a blocking child process, and `tokio` had been a declared
+//! dependency of this crate with zero references to it.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -224,6 +229,8 @@ pub fn run_in(cwd: Option<&Path>, args: &[&str], opts: &RunOpts<'_>) -> Result<G
         None => cmd
             .output()
             .with_context(|| format!("spawning git {}", args.join(" ")))?,
+        // A timeout is a distinct outcome, not a failure, so it travels as its
+        // own error type rather than being flattened into a string.
         Some(limit) => spawn_with_timeout(&mut cmd, args, limit)?,
     };
 
@@ -245,12 +252,113 @@ pub fn run_in(cwd: Option<&Path>, args: &[&str], opts: &RunOpts<'_>) -> Result<G
 /// is not in std and a background killer thread outliving its child is its own
 /// class of bug. The poll interval is short relative to any useful timeout and
 /// long relative to process-spawn cost.
-fn spawn_with_timeout(cmd: &mut Command, args: &[&str], limit: Duration) -> Result<Output> {
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawning git {}", args.join(" ")))?;
+/// Why a git invocation did not simply return.
+///
+/// A timeout is not a failure. Collapsing the two means a hung credential
+/// prompt and a bad flag produce the same message, and the caller cannot tell
+/// "try again" from "this will never work" — or from "you are being rate
+/// limited", which does deserve a retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitError {
+    /// The child exceeded its timeout and was killed, along with everything it
+    /// spawned.
+    TimedOut {
+        after: Duration,
+        /// The command that hung, for the message. Arguments only — a
+        /// credential can be in here on the extraheader path, so the caller
+        /// must not log it blindly.
+        args: Vec<String>,
+    },
+    /// The binary could not be started at all.
+    NotSpawned { program: String, reason: String },
+}
 
-    let deadline = Instant::now() + limit;
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitError::TimedOut { after, args } => write!(
+                f,
+                "git {} did not finish within {after:?} and was killed, along with anything \
+                 it had started. A git that hangs is usually waiting on a credential prompt or \
+                 a network that never answers.",
+                args.join(" ")
+            ),
+            GitError::NotSpawned { program, reason } => {
+                write!(f, "could not start {program}: {reason}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GitError {}
+
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        // `/T` the tree, `/F` force. Without `/F` a process that ignores the
+        // close request survives.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .output();
+    }
+
+    #[cfg(unix)]
+    {
+        // A negative pid targets the process *group*, which is why the child
+        // was spawned into its own.
+        //
+        // SAFETY: `kill` is a syscall wrapper with a stable ABI; the only
+        // hazard is a pid that no longer exists, which returns ESRCH and is
+        // ignored. No memory is shared with the target.
+        unsafe {
+            killpg(child.id() as i32, SIGKILL);
+        }
+        // Also kill the direct child, in case the group call raced.
+        let _ = child.kill();
+    }
+
+    // Reap, so a killed child does not linger as a zombie.
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+const SIGKILL: i32 = 9;
+
+#[cfg(unix)]
+unsafe extern "C" {
+    /// POSIX `killpg`, used to signal an entire process group.
+    ///
+    /// Declared here rather than pulling in libc for one call: the signature is
+    /// part of the stable Unix ABI and has not changed.
+    fn killpg(pgrp: i32, sig: i32) -> i32;
+}
+
+/// Spawn with a deadline, killing the tree on expiry.
+///
+/// Polling rather than a killer thread: a background thread outliving its child
+/// is its own class of bug, and the poll interval is short relative to any
+/// useful timeout while costing nothing measurable per command.
+fn spawn_with_timeout(
+    cmd: &mut Command,
+    args: &[&str],
+    limit: Duration,
+) -> Result<Output, GitError> {
+    // Into its own group, so `kill_tree` can reach the grandchildren. Done
+    // before the spawn because it is a property of the child, not of the
+    // process that already exists.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let mut child = cmd.spawn().map_err(|e| GitError::NotSpawned {
+        program: program.clone(),
+        reason: e.to_string(),
+    })?;
+
+    let started = Instant::now();
     const POLL: Duration = Duration::from_millis(25);
 
     loop {
@@ -258,25 +366,26 @@ fn spawn_with_timeout(cmd: &mut Command, args: &[&str], limit: Duration) -> Resu
             Ok(Some(_status)) => {
                 // `wait_with_output` after `try_wait` reaps the child, so the
                 // pipes are closed and the read cannot block forever.
-                return child
-                    .wait_with_output()
-                    .with_context(|| format!("collecting output of git {}", args.join(" ")));
+                return child.wait_with_output().map_err(|e| GitError::NotSpawned {
+                    program: program.clone(),
+                    reason: e.to_string(),
+                });
             }
             Ok(None) => {}
-            Err(e) => return Err(anyhow::Error::new(e).context("waiting on git")),
+            Err(e) => {
+                return Err(GitError::NotSpawned {
+                    program,
+                    reason: e.to_string(),
+                });
+            }
         }
 
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            // Reap, so the killed child does not become a zombie.
-            let _ = child.wait();
-            bail!(
-                "git {} did not finish within {:?} and was killed. A git that hangs \
-                 here is usually waiting on a credential prompt or a network, and \
-                 both are bounded by the run timeout for a reason.",
-                args.join(" "),
-                limit
-            );
+        if started.elapsed() >= limit {
+            kill_tree(&mut child);
+            return Err(GitError::TimedOut {
+                after: limit,
+                args: args.iter().map(|s| s.to_string()).collect(),
+            });
         }
         std::thread::sleep(POLL);
     }
@@ -710,6 +819,127 @@ echo "PROBE_ARGS=$*"
             std::fs::set_permissions(&shim, perms).expect("the mode is settable");
         }
         shim
+    }
+
+    /// A git that never returns is killed at the timeout, and the outcome says
+    /// so specifically.
+    ///
+    /// The distinction is the point: a kill is not a refusal. Collapsing the two
+    /// means a hung credential prompt and a bad flag produce the same message,
+    /// and the caller cannot tell "try again" from "this will never work".
+    #[test]
+    fn a_hung_git_is_killed_and_reported_as_timed_out() {
+        let tmp = TempDir::new().unwrap();
+        let shim = hanging_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let started = Instant::now();
+        let outcome = run_in(
+            Some(&repo),
+            &["fetch"],
+            &RunOpts {
+                env: &[],
+                timeout: Some(Duration::from_millis(300)),
+                program: Some(shim.to_str().expect("a UTF-8 shim path")),
+            },
+        );
+        let elapsed = started.elapsed();
+
+        let err = outcome.expect_err("a hanging git must not return Ok");
+        match err.downcast_ref::<GitError>() {
+            Some(GitError::TimedOut { after, args }) => {
+                assert_eq!(*after, Duration::from_millis(300));
+                assert_eq!(args, &vec!["fetch".to_string()]);
+            }
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
+        // It really did wait for the timeout rather than returning early or
+        // hanging forever.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the timeout did not fire promptly: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "it returned before the timeout: {elapsed:?}"
+        );
+    }
+
+    /// The child *tree*, not just the child.
+    ///
+    /// `git` spawns `ssh` and credential helpers of its own. Killing only the
+    /// direct child leaves those running, holding the worktree lock and the
+    /// next command's socket, so a timeout that returns while its
+    /// grandchildren live is worse than no timeout: the fleet stalls anyway
+    /// and now also reports success.
+    ///
+    /// Proved by **deferred side effect** rather than by inspecting a pid. The
+    /// grandchild is told to create a file after a delay; if the group kill
+    /// worked, it never appears. Checking a pid is racy across platforms and
+    /// reports on process liveness rather than on the thing that matters,
+    /// which is whether the survivor can still touch the worktree.
+    #[test]
+    fn the_grandchildren_are_killed_too() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("grandchild-survived");
+        let shim = grandchild_shim(&tmp.path().join("bin"), &marker);
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let outcome = run_in(
+            Some(&repo),
+            &["fetch"],
+            &RunOpts {
+                env: &[],
+                timeout: Some(Duration::from_millis(300)),
+                program: Some(shim.to_str().expect("a UTF-8 shim path")),
+            },
+        );
+        assert!(outcome.is_err(), "the shim hangs, so this must time out");
+
+        // Well past when the grandchild would have written, if it were alive.
+        std::thread::sleep(Duration::from_millis(1500));
+
+        assert!(
+            !marker.exists(),
+            "a grandchild outlived the timeout and performed its side effect, so the kill \
+             reached the direct child but not the tree"
+        );
+    }
+
+    /// A shim that never returns.
+    fn hanging_shim(dir: &Path) -> PathBuf {
+        write_executable(&dir.join("git-hang"), "#!/bin/sh\nsleep 600\n")
+    }
+
+    /// A shim that starts a child which writes `marker` after a delay, then
+    /// hangs itself. The marker existing afterwards is the proof of survival.
+    fn grandchild_shim(dir: &Path, marker: &Path) -> PathBuf {
+        write_executable(
+            &dir.join("git-grandchild"),
+            &format!(
+                "#!/bin/sh\n( sleep 1; : > {} ) &\nsleep 600\n",
+                marker.display()
+            ),
+        )
+    }
+
+    /// Write an executable shell script, creating its directory.
+    fn write_executable(path: &Path, body: &str) -> PathBuf {
+        std::fs::create_dir_all(path.parent().expect("a path has a parent"))
+            .expect("the shim dir is creatable");
+        std::fs::write(path, body).expect("the shim is writable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)
+                .expect("the shim exists")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("the mode is settable");
+        }
+        path.to_path_buf()
     }
 
     /// The plumbing, not just the builder.
