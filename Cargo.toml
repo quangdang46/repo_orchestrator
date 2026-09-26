@@ -54,6 +54,10 @@ toml            = "0.8"
 # Preserves comments and unmodelled keys on a surgical edit. `toml` serializes
 # a struct, which is exactly the lossy path `ro config set` must stop using.
 toml_edit       = "0.22"
+# The ONE new runtime dependency in the plan: OS keyring access for
+# credential_ref = "keychain:ENTRY". Optional so a minimal build and a
+# headless runner still compile and work from the environment alone.
+keyring         = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 dirs            = "5.0"
 time             = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 uuid             = { version = "1.16", features = ["v4", "serde"] }

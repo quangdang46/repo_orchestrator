@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod credential;
+pub mod credential_resolve;
 pub mod error;
 pub mod failure;
 pub mod repo_spec;
@@ -12,6 +13,7 @@ pub mod secret;
 
 pub use auth::{AuthPolicy, AuthProvider, CommitIdentity, LoginMismatch};
 pub use credential::{CredentialRef, CredentialSource};
+pub use credential_resolve::{CredentialError, resolve as resolve_credential};
 pub use error::{CoreError, CoreResult};
 pub use failure::FailureClass;
 pub use repo_spec::RepoSpec;
