@@ -1119,26 +1119,69 @@ mod tests {
 
         // The string that `RepoSpec::parse` would happily read as owner=acme,
         // name=api. It must not be taken as one while that directory exists.
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(cwd).unwrap();
-        let classified = classify_add_input("./acme/api");
-        std::env::set_current_dir(previous).unwrap();
-
-        match classified.unwrap() {
+        in_cwd(cwd, || match classify_add_input("./acme/api").unwrap() {
             AddSource::Local { name, .. } => assert_eq!(name, "api"),
             other => panic!("a real checkout must not be read as a coordinate, got {other:?}"),
+        })
+    }
+
+    /// Run `body` with the process's cwd pointed at a fresh temp dir.
+    ///
+    /// Needed because `classify_add_input` resolves a bare `owner/repo`
+    /// against the filesystem, and the test binary's cwd is shared state:
+    /// a sibling test that changes it makes this one see a checkout the
+    /// user never created. That is what made this test fail intermittently
+    /// under `cargo test --workspace`, where the two run concurrently.
+    ///
+    /// The cwd is process-global for the same reason `PATH` is, so it takes
+    /// the testkit's lock — the same one, so a test that mutates either
+    /// cannot interleave with a test that mutates the other.
+    fn in_temp_cwd<R>(body: impl FnOnce() -> R) -> R {
+        let _serialised = ro_testkit::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        // Restore before the value is returned, including on a panic, so a
+        // failure here cannot strand the rest of the suite in a temp dir
+        // that is about to be deleted.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::env::set_current_dir(previous).unwrap();
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Run `body` with the cwd pointed at a dir the caller has set up.
+    fn in_cwd<R>(dir: &std::path::Path, body: impl FnOnce() -> R) -> R {
+        let _serialised = ro_testkit::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        std::env::set_current_dir(previous).unwrap();
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
         }
     }
 
     #[test]
     fn a_bare_owner_repo_is_a_remote_spec() {
-        match classify_add_input("acme/api").unwrap() {
+        // Inside a fresh empty directory, so the relative path `acme/api`
+        // names nothing and the classifier reaches the GitHub-coordinate
+        // branch. The cwd is process-wide and another test in this binary
+        // changes it, so relying on whatever it happens to be is a race.
+        in_temp_cwd(|| match classify_add_input("acme/api").unwrap() {
             AddSource::Remote(s) => {
                 assert_eq!(s.owner, "acme");
                 assert_eq!(s.name, "api");
             }
             other => panic!("expected a remote spec, got {other:?}"),
-        }
+        })
     }
 
     /// The trap V5 had two halves to.

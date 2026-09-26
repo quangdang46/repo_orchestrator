@@ -24,4 +24,7 @@ rusqlite.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# For the sync test: a real bare remote and a real checkout, so a push is
+# observed landing rather than merely observed being called.
+ro-testkit = { path = "../ro-testkit" }
 tempfile.workspace = true

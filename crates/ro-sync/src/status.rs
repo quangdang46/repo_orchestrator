@@ -379,6 +379,48 @@ mod tests {
         assert!(broken_status.unmeasurable_reason.is_some());
     }
 
+    /// The downstream consequence of the ro-rne.10 FK bug, asserted so it
+    /// cannot come back silently.
+    ///
+    /// `last_synced_at` is a `JOIN` across `sync_results` and `runs`. While
+    /// `sync_results` was permanently empty — every insert failed its
+    /// foreign key and the error was discarded — this field was
+    /// permanently `None` for every repo, forever, and nothing said so.
+    /// A status that cannot report when it last synced is a status whose
+    /// `None` a user learns to ignore.
+    #[test]
+    fn a_real_sync_makes_last_synced_at_appear() {
+        use ro_testkit::Worktree;
+
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1 WHERE id = ?2",
+            rusqlite::params![remote.path().to_string_lossy(), repo.id],
+        )
+        .unwrap();
+
+        // Before any sync, there is nothing to report. `None` is correct
+        // here and must not be confused with the broken state below.
+        assert_eq!(status_repo(&conn, &repo.id).unwrap().last_synced_at, None);
+
+        crate::sync::sync_all(&conn, &crate::sync::SyncOptions::default()).unwrap();
+
+        let after = status_repo(&conn, &repo.id).unwrap().last_synced_at;
+        assert!(
+            after.is_some(),
+            "after a real sync, last_synced_at must be populated. It stayed \
+             None forever when sync_results could not be written to."
+        );
+    }
+
     #[test]
     fn status_repo_not_found() {
         let (_, conn) = setup();

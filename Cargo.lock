@@ -2839,6 +2839,7 @@ dependencies = [
  "ro-git",
  "ro-jobs",
  "ro-state",
+ "ro-testkit",
  "rusqlite",
  "serde",
  "serde_json",
