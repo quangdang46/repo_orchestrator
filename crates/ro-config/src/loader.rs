@@ -21,6 +21,13 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
     let config: AppConfig =
         toml::from_str(&raw).with_context(|| format!("parsing config from {}", path.display()))?;
     validate(&config).with_context(|| format!("validating config at {}", path.display()))?;
+    // Loud, not silent. A deprecated key that is merely tolerated is a
+    // deprecated key nobody migrates off, and the whole point of reading the
+    // old table is that the reading stops eventually.
+    if let Some(note) = config.engine_deprecation_note() {
+        tracing::warn!("{note}");
+        eprintln!("warning: {note}");
+    }
     Ok(config)
 }
 

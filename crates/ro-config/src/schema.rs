@@ -26,7 +26,60 @@ pub struct AppConfig {
     #[serde(default)]
     pub providers: ProvidersConfig,
     #[serde(default)]
+    pub agent: AgentConfig,
+    #[serde(default)]
     pub safety: SafetyConfig,
+}
+
+impl AppConfig {
+    /// Which engine this configuration selects, honouring the old table.
+    ///
+    /// The new key wins when both are present. A user who has already written
+    /// `[agent] engine` has expressed the current intent, and letting a stale
+    /// `[providers.claude]` override it would make the new key impossible to
+    /// set.
+    pub fn resolved_engine(&self) -> Option<&str> {
+        self.agent
+            .engine
+            .as_deref()
+            .or_else(|| legacy_provider_and_engine(&self.providers).map(|(_, e)| e))
+    }
+
+    /// A deprecation note, or `None` when the config is already current.
+    ///
+    /// Loud, because the alternative is the failure mode this exists to
+    /// prevent: an unknown table is ignored, the config parses cleanly, the
+    /// setting has zero effect, and nothing says so. The user finds out by
+    /// watching their commits not happen.
+    pub fn engine_deprecation_note(&self) -> Option<String> {
+        // The new key wins, so a config that has both is not deprecated.
+        if self.agent.engine.is_some() {
+            return None;
+        }
+        let (provider, value) = legacy_provider_and_engine(&self.providers)?;
+        Some(format!(
+            "[providers.{provider}] is deprecated and is being read as [agent] engine. \
+             Run `ro config set agent.engine {value}` to write the new form; the old key \
+             will stop being read in a future release."
+        ))
+    }
+}
+
+/// Which engine `[providers.*]` selected, and which key named it.
+///
+/// The old table had one entry per provider rather than one engine setting, so
+/// "which engine is this" was inferred from which entry had a binary in it.
+/// That inference is the whole back-compat surface, and naming the key that
+/// triggered it is what makes the deprecation note actionable.
+fn legacy_provider_and_engine(providers: &ProvidersConfig) -> Option<(&'static str, &'static str)> {
+    let set = |p: &ProviderConfig| !p.bin.is_empty() || !p.default_args.is_empty();
+    if set(&providers.claude) {
+        Some(("claude", "claude"))
+    } else if set(&providers.codex) {
+        Some(("codex", "codex"))
+    } else {
+        None
+    }
 }
 
 /// `[auth]` — the credential **source** for any repo that does not override it.
@@ -193,7 +246,38 @@ impl Default for ReviewConfig {
     }
 }
 
-/// `[providers]` — AI provider configuration.
+/// `[agent]` — which engine commits, and how it is invoked.
+///
+/// Replaces `[providers.claude]` / `[providers.codex]`. The old table is still
+/// read, and see [`AppConfig::engine_deprecation_note`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// `claude` | `codex` | `git` — exactly three built-ins, no plugin
+    /// registry. `git` is the raw backend and the explicit fallback; it cannot
+    /// read a diff or split commits, which is exactly why the agent engines
+    /// exist, and it is not the default.
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// Overrides the binary and its arguments entirely, which is how Gemini /
+    /// Amp / Kiro / a nightly gets used without waiting for a ro release.
+    ///
+    /// This cannot relax the agent-does-not-push boundary: whatever binary is
+    /// named, ro still owns the push.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// A different instruction. `{prompt}` is substituted as ONE argv
+    /// element, never through a shell — the prompt is built from diff text and
+    /// file paths, and passing any of it through a shell is a
+    /// command-injection path into the user's own account.
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// `[providers]` — the pre-`[agent]` table. Read for back-compat only.
+///
+/// It carries no weight of its own. Nothing reads it except the deprecation
+/// path, so a config carrying it is understood rather than ignored, which is
+/// the entire difference between a rename and a silent data loss.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProvidersConfig {
     #[serde(default)]
@@ -284,6 +368,68 @@ fn default_quality_gates() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shipped table that is renamed is a silent data loss, not a rename.
+    /// Unknown tables are ignored, `AppConfig` has no `deny_unknown_fields`,
+    /// so the config parses cleanly, the setting has zero effect, and the user
+    /// finds out by watching their commits not happen. This is the whole
+    /// reason the old key is still read.
+    #[test]
+    fn a_legacy_providers_table_still_resolves_the_engine() {
+        let cfg: AppConfig = toml::from_str(
+            r#"[providers.claude]
+bin = "claude"
+default_args = ["-p", "--output-format", "stream-json"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.resolved_engine(), Some("claude"));
+
+        let codex: AppConfig = toml::from_str(
+            r#"[providers.codex]
+bin = "codex"
+default_args = ["exec"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(codex.resolved_engine(), Some("codex"));
+    }
+
+    /// Loudly, not silently. A deprecated key that is merely tolerated is a
+    /// deprecated key nobody migrates off, and the reading stops eventually —
+    /// which is only fair if the user was told it started.
+    #[test]
+    fn a_legacy_table_produces_a_note_naming_the_old_key() {
+        let cfg: AppConfig = toml::from_str("[providers.claude]\nbin = \"claude\"\n").unwrap();
+        let note = cfg
+            .engine_deprecation_note()
+            .expect("a legacy key must warn");
+        assert!(note.contains("[providers.claude]"), "got: {note}");
+        assert!(note.contains("ro config set agent.engine"), "got: {note}");
+    }
+
+    /// The new key wins when both are present. A user who has already written
+    /// `[agent] engine` has expressed the current intent, and letting a stale
+    /// `[providers.claude]` override it would make the new key unsettable.
+    #[test]
+    fn the_new_key_wins_and_silences_the_note() {
+        let cfg: AppConfig =
+            toml::from_str("[agent]\nengine = \"git\"\n\n[providers.claude]\nbin = \"claude\"\n")
+                .unwrap();
+        assert_eq!(cfg.resolved_engine(), Some("git"));
+        assert_eq!(
+            cfg.engine_deprecation_note(),
+            None,
+            "a config that already names the engine is not deprecated"
+        );
+    }
+
+    #[test]
+    fn a_current_config_produces_no_note() {
+        let cfg: AppConfig = toml::from_str("[agent]\nengine = \"codex\"\n").unwrap();
+        assert_eq!(cfg.resolved_engine(), Some("codex"));
+        assert!(cfg.engine_deprecation_note().is_none());
+    }
 
     /// Path 1 of 3: the global config file.
     ///

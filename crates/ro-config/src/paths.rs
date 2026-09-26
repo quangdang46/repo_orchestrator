@@ -148,7 +148,6 @@ timeout_secs = 30
 [github]
 host = "github.com"
 auth = "auto"              # env | gh | config-token | auto
-
 [git]
 update_strategy = "ff-only" # ff-only | rebase | merge
 autostash = false
@@ -170,13 +169,27 @@ sse_port = 7300
 provider = "claude"        # claude | codex
 quality_gates = "auto"     # auto | on | off
 
-[providers.claude]
-bin = "claude"
-default_args = ["-p", "--output-format", "stream-json"]
-
-[providers.codex]
-bin = "codex"
-default_args = ["exec"]
+# [agent] — which engine commits, and how it is invoked.
+# Exactly three built-ins, no plugin registry: claude | codex | git.
+# `git` is the raw backend and the explicit fallback. It cannot read the diff,
+# split commits, or resolve conflicts, which is exactly why the agent engines
+# exist. It is NOT the default.
+#
+# `command` overrides the binary and its arguments entirely, which is how
+# Gemini / Amp / Kiro / a nightly build gets used without waiting for a ro
+# release. It cannot relax the agent-does-not-push boundary: whatever binary is
+# named, ro still owns the push.
+#
+# {prompt} is substituted as ONE argv element, never through a shell.
+# The prompt is built from diff text and file paths, and passing any of it
+# through a shell is a command-injection path into the user's own account.
+[agent]
+# engine = "claude"
+# command = 'codex exec "{prompt}"'   # optional: a different binary entirely
+# prompt  = "..."                     # optional: a different instruction
+#
+# [providers.claude] and [providers.codex] are the old form. They are still
+# read, with a deprecation warning, and stop being read in a future release.
 
 [safety]
 secret_scan = "block"      # off | warn | block
@@ -240,7 +253,15 @@ mod tests {
         assert!(parsed.get("jobs").is_some());
         assert!(parsed.get("mcp").is_some());
         assert!(parsed.get("review").is_some());
-        assert!(parsed.get("providers").is_some());
+        assert!(parsed.get("agent").is_some());
+        assert!(parsed.get("auth").is_some());
         assert!(parsed.get("safety").is_some());
+        // The default template must NOT ship the deprecated table. If it did,
+        // every new user would open their own config and be told they were
+        // using something deprecated on day zero.
+        assert!(
+            parsed.get("providers").is_none(),
+            "the default config must not ship the deprecated [providers] table"
+        );
     }
 }
