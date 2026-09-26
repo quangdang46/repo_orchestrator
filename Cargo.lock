@@ -2848,6 +2848,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ro-testkit"
+version = "0.2.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "rusqlite"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

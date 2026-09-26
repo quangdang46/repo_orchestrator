@@ -9,6 +9,11 @@ members = [
     "crates/ro-jobs",
     "crates/ro-sync",
     "crates/ro-sweep",
+    # Dev-only. Listed as a workspace member so `cargo test --workspace`
+    # runs its own tests — a fixture nobody exercises is a fixture that
+    # rots. It is a `[dev-dependencies]` entry everywhere it is used, so
+    # it can never reach a shipped binary.
+    "crates/ro-testkit",
 ]
 resolver = "3"
 default-members = ["crates/ro"]

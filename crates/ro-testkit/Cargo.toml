@@ -1,0 +1,20 @@
+[package]
+name = "ro-testkit"
+# Shared test fixtures. Never a dependency of a shipped crate — every
+# consumer lists it under [dev-dependencies], so it cannot reach a binary
+# even by accident.
+description = "Cross-platform test fixtures: fake gh, fake agent engines, bare remotes, log capture"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+# Nothing from the workspace. This crate must be usable from any crate's
+# tests without creating a dependency edge between the thing under test and
+# the thing being faked — a testkit that imports ro-github cannot fake gh
+# for ro-github's own tests.
+tempfile.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
