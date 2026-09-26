@@ -28,8 +28,29 @@ use tempfile::TempDir;
 /// The shim is written into its own directory, which callers put **first on
 /// `PATH`**. Every invocation appends one line to [`log_file`].
 pub struct FakeBinary {
-    dir: TempDir,
+    dir: OwnedDir,
     name: String,
+}
+
+/// The directory a shim lives in.
+///
+/// Two shapes because the two lifetimes differ: a constructor-made shim
+/// cleans up after itself, while a caller-written one must outlive the
+/// test and is leaked by the caller on purpose.
+pub enum OwnedDir {
+    /// Self-cleaning, from `FakeBinary::recording` and friends.
+    Temp(TempDir),
+    /// Caller-owned and deliberately leaked.
+    Kept(PathBuf),
+}
+
+impl OwnedDir {
+    pub fn path(&self) -> &std::path::Path {
+        match self {
+            OwnedDir::Temp(t) => t.path(),
+            OwnedDir::Kept(p) => p.as_path(),
+        }
+    }
 }
 
 impl FakeBinary {
@@ -42,15 +63,16 @@ impl FakeBinary {
         let dir = TempDir::new().expect("the shim dir is creatable");
         let log = dir.path().join("argv.log");
         let body = shim_body(
-            r#"printf '%s\n' "$*" >> "$RO_TESTKIT_LOG""#,
+            r#"printf '%s\036' "$*" >> "$RO_TESTKIT_LOG""#,
             r#"@echo off
-echo %* >> "%RO_TESTKIT_LOG%"
+<nul set /p="%*" >> "%RO_TESTKIT_LOG%"
+<nul set /p="^Z" >> "%RO_TESTKIT_LOG%"
 exit /b 0"#,
             &log,
         );
-        write_shim(&dir, name, &body);
+        write_shim(dir.path(), name, &body);
         Self {
-            dir,
+            dir: OwnedDir::Temp(dir),
             name: name.to_string(),
         }
     }
@@ -67,9 +89,9 @@ exit /b 0"#,
             ),
             &log,
         );
-        write_shim(&dir, name, &body);
+        write_shim(dir.path(), name, &body);
         Self {
-            dir,
+            dir: OwnedDir::Temp(dir),
             name: name.to_string(),
         }
     }
@@ -91,9 +113,9 @@ exit /b 0"#,
             ),
             &log,
         );
-        write_shim(&dir, name, &body);
+        write_shim(dir.path(), name, &body);
         Self {
-            dir,
+            dir: OwnedDir::Temp(dir),
             name: name.to_string(),
         }
     }
@@ -121,9 +143,9 @@ git commit -q -m "shim commit"
 exit /b 0"#,
             &log,
         );
-        write_shim(&dir, name, &body);
+        write_shim(dir.path(), name, &body);
         Self {
-            dir,
+            dir: OwnedDir::Temp(dir),
             name: name.to_string(),
         }
     }
@@ -154,11 +176,40 @@ exit /b 0"#
             ),
             &log,
         );
-        write_shim(&dir, name, &body);
+        write_shim(dir.path(), name, &body);
         Self {
-            dir,
+            dir: OwnedDir::Temp(dir),
             name: name.to_string(),
         }
+    }
+
+    /// A shim from a script the caller wrote, kept alive by a caller-owned
+    /// directory.
+    ///
+    /// For a body that has to be exact — a hang, a specific non-zero exit —
+    /// where the canned constructors are not enough. `keep_alive` is
+    /// leaked by the caller, because a `TempDir` dropped at the end of the
+    /// constructor would delete the script while the fixture still points
+    /// at it.
+    pub fn at(keep_alive: PathBuf, script: PathBuf, name: &str) -> Self {
+        let dir = keep_alive;
+        debug_assert!(
+            script.starts_with(&dir),
+            "the script must live in the directory kept alive, or the \
+             shim is deleted out from under PATH"
+        );
+        Self {
+            dir: OwnedDir::Kept(dir),
+            name: name.to_string(),
+        }
+    }
+
+    /// The directory this shim lives in.
+    ///
+    /// Public so a test can assert on PATH *under the lock* rather than
+    /// guessing what a prepend looked like.
+    pub fn dir_path(&self) -> &std::path::Path {
+        self.dir.path()
     }
 
     /// This shim's name, e.g. `gh`.
@@ -200,8 +251,11 @@ exit /b 0"#
     pub fn invocations(&self) -> Vec<String> {
         let path = self.log_file();
         match std::fs::read_to_string(path) {
+            // Split on the record separator, never on a newline: a prompt
+            // legitimately contains newlines, and a newline-delimited log
+            // would report one spawn as three.
             Ok(text) => text
-                .lines()
+                .split(RECORD_SEP)
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
                 .map(str::to_string)
@@ -218,6 +272,12 @@ exit /b 0"#
         self.invocations().len()
     }
 }
+
+/// Separates one recorded invocation from the next.
+///
+/// ASCII 0x1E (record separator): it cannot appear in an argument, so a
+/// prompt containing any text at all round-trips through the log intact.
+const RECORD_SEP: char = '\x1e';
 
 /// Builds a shim body for this platform.
 ///
@@ -249,11 +309,11 @@ fn shim_body(log_line: &str, windows: &str, log: &Path) -> String {
 /// `Command::new("gh")` resolves it through `PATHEXT`. Writing both
 /// everywhere would mean the Unix file is a stray non-executable, so the
 /// platform decides.
-fn write_shim(dir: &TempDir, name: &str, body: &str) {
+fn write_shim(dir: &std::path::Path, name: &str, body: &str) {
     #[cfg(windows)]
     let file = dir.path().join(format!("{name}.cmd"));
     #[cfg(not(windows))]
-    let file = dir.path().join(name);
+    let file = dir.join(name);
 
     std::fs::write(&file, body).expect("the shim is writable");
 

@@ -112,18 +112,30 @@ fn an_unused_shim_reports_zero_runs() {
 /// unrelated assertions at once. This happened while building the fixture.
 #[test]
 fn path_is_restored_after_the_guard_drops() {
-    let before = std::env::var("PATH").unwrap_or_default();
     let shim = FakeBinary::recording("gh");
+
+    // `before` must be a snapshot of PATH **as it was before the guard**,
+    // so it is read under the lock but outside `with_on_path`. Reading it
+    // inside would capture the already-swapped value and compare it
+    // against an unrelated PATH afterwards — which fails or passes for a
+    // reason that has nothing to do with the restore.
+    let before = {
+        let _l = ro_testkit::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::var("PATH").unwrap_or_default()
+    };
+
     // SAFETY: the body only reads PATH.
-    unsafe {
-        shim.with_on_path(|| {
-            assert_ne!(
-                std::env::var("PATH").unwrap_or_default(),
-                before,
-                "the shim should have been prepended while the call runs"
-            );
-        })
-    }
+    let during = unsafe { shim.with_on_path(|| std::env::var("PATH").unwrap_or_default()) };
+    assert_ne!(
+        during, before,
+        "the shim must be on PATH while the guard is alive"
+    );
+
+    let _l = ro_testkit::path_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         std::env::var("PATH").unwrap_or_default(),
         before,
@@ -141,8 +153,13 @@ fn path_is_restored_after_the_guard_drops() {
 /// is what made this test flaky for reasons unrelated to PATH.
 #[test]
 fn path_is_restored_even_when_the_body_panics() {
-    let before = std::env::var("PATH").unwrap_or_default();
     let shim = FakeBinary::recording("gh");
+    let before = {
+        let _l = ro_testkit::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::var("PATH").unwrap_or_default()
+    };
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -157,6 +174,9 @@ fn path_is_restored_even_when_the_body_panics() {
     std::panic::set_hook(previous_hook);
 
     assert!(result.is_err(), "the body was supposed to panic");
+    let _l = ro_testkit::path_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         std::env::var("PATH").unwrap_or_default(),
         before,

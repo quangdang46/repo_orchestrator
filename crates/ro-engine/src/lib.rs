@@ -16,6 +16,7 @@
 //! that repo. Every outcome is a *fact about one repo*, including the
 //! boring ones.
 
+pub mod agent;
 pub mod env;
 pub mod git_engine;
 
@@ -241,5 +242,6 @@ pub trait Engine: Send + Sync {
     fn checkpoint(&self, ctx: &EngineContext<'_>) -> EngineOutcome;
 }
 
+pub use agent::{AgentEngine, BUILTIN_PROMPT, StreamFormat};
 pub use env::ChildEnv;
 pub use git_engine::GitEngine;

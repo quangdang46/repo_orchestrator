@@ -2759,6 +2759,7 @@ dependencies = [
  "ro-core",
  "ro-git",
  "ro-testkit",
+ "serde_json",
  "tempfile",
 ]
 

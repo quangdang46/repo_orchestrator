@@ -20,6 +20,10 @@ ro-core.workspace = true
 # hardening block, the timeout, and the child-tree kill.
 ro-git.workspace = true
 
+# The Claude stream-json parser. A hand-rolled line scan would be a second
+# format definition that drifts from the one the real output uses.
+serde_json.workspace = true
+
 [dev-dependencies]
 # The trait references FailureClass, so a test that builds a Failed outcome
 # needs the enum itself.
