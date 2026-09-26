@@ -625,7 +625,14 @@ fn run() -> Result<()> {
         Commands::Remove { key } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-            let repo = manage::remove(&conn, &key).context("removing repo")?;
+            // A name that matches nothing is a **usage** error, not a
+            // fatal one. `context` turned "no such repo" into exit 70,
+            // which is the same code as a config file that will not parse
+            // — so a typo read as a broken installation.
+            let repo = manage::remove(&conn, &key).map_err(|e| {
+                eprintln!("error: {e:#}");
+                std::process::exit(exit::EX_USAGE as i32);
+            })?;
             eprintln!("Removed: {}/{}", repo.owner, repo.name);
         }
 
