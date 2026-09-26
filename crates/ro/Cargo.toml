@@ -36,6 +36,9 @@ serde.workspace = true
 time.workspace = true
 toml.workspace = true
 globset.workspace = true
+# For `doctor --fix`, which adds missing sections to an existing config in
+# place rather than re-encoding it — the same reason ro-config needs it.
+toml_edit.workspace = true
 # tempfile is a runtime dependency, not a test-only one: doctor.rs calls
 # tempfile::tempdir() in production, inside the ConfigPaths::discover() fallback.
 tempfile.workspace = true

@@ -2659,6 +2659,7 @@ dependencies = [
  "time",
  "tokio",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2669,11 +2670,13 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
+ "ro-core",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "toml",
+ "toml_edit",
  "tracing",
 ]
 
@@ -2688,6 +2691,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "time",
+ "toml",
  "uuid",
 ]
 

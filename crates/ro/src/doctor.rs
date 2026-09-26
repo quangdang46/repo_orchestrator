@@ -1,7 +1,10 @@
 //! `ro doctor` — diagnose installation health.
 //!
-//! Pure detection by default; mutations only happen when `--fix` is set, and
-//! every mutation backs up the prior state to `<state_dir>/doctor/runs/<run-id>/`.
+//! Pure detection by default. Mutations only happen when `--fix` is set, and
+//! they are **additive**: `--fix` writes missing sections and never deletes
+//! what it did not put there. An earlier version of this file claimed every
+//! mutation backed up the prior state to `<state_dir>/doctor/runs/<run-id>/`.
+//! No such code existed.
 //!
 //! Checks (per rfo-47 spec):
 //!
@@ -197,7 +200,14 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
     checks.push(cfg_check);
 
     checks.push(check_state(&paths, opts.fix));
-    let _ = applied_fix_count; // reserved for future scoring
+
+    // Previously `let _ = applied_fix_count; // reserved for future scoring` —
+    // a count computed, named, and dropped. It is now reported, because a
+    // `--fix` run that silently changed three things and said nothing is the
+    // behaviour users are asked to trust with a repair command.
+    if applied_fix_count > 0 {
+        eprintln!("Applied {applied_fix_count} config fix(es).");
+    }
 
     checks.push(check_provider("claude", opts.binary_lookup_path.as_deref()));
     checks.push(check_provider("codex", opts.binary_lookup_path.as_deref()));
@@ -251,31 +261,130 @@ fn check_github_auth(config_token: Option<&str>) -> CheckResult {
     }
 }
 
-fn check_and_optionally_fix_config(paths: &ConfigPaths, fix: bool) -> (CheckResult, usize) {
-    let cfg_path = paths.config_toml();
-    if cfg_path.exists() {
-        return match load_config(&cfg_path) {
-            Ok(_) => (
-                CheckResult::ok(
-                    "config",
-                    Severity::Required,
-                    format!("config valid at {}", cfg_path.display()),
-                ),
-                0,
+/// Sections the current schema expects. `--fix` adds whichever are missing.
+///
+/// A *section*, not a key: every field inside already defaults, so creating an
+/// empty `[auth]` is enough for the schema to see the table and for the user to
+/// discover it exists by opening their own file.
+const EXPECTED_SECTIONS: &[&str] = &["core", "auth", "git", "safety"];
+
+/// Add the sections a config predating them is missing, leaving everything
+/// else alone.
+///
+/// The asymmetry is deliberate and is the whole point: `--fix` **adds** and
+/// never **removes**. An unknown table is a setting from a newer ro, a leftover
+/// from an older one, or a comment-adjacent note the user put there. Deleting
+/// a user's file contents is not a repair, and a repair command that loses data
+/// is worse than no repair command — so legacy tables stay, and the user is
+/// told which ones were left alone so they can decide.
+fn upgrade_existing_config(cfg_path: &Path) -> (CheckResult, usize) {
+    let Ok(raw) = std::fs::read_to_string(cfg_path) else {
+        return (
+            CheckResult::fail(
+                "config",
+                Severity::Required,
+                format!("cannot read {}", cfg_path.display()),
+                "check the file's permissions".to_string(),
             ),
-            Err(e) => (
+            0,
+        );
+    };
+    let Ok(mut doc) = raw.parse::<toml_edit::DocumentMut>() else {
+        // load_config already rejected it, so this is unreachable in practice;
+        // report the parse problem rather than panicking on it.
+        return (
+            CheckResult::fail(
+                "config",
+                Severity::Required,
+                format!("cannot parse {}", cfg_path.display()),
+                "fix the TOML syntax by hand".to_string(),
+            ),
+            0,
+        );
+    };
+
+    let mut added = 0usize;
+    for section in EXPECTED_SECTIONS {
+        if doc.get(section).is_none() {
+            let mut table = toml_edit::Table::new();
+            table.set_implicit(false);
+            doc[*section] = toml_edit::Item::Table(table);
+            added += 1;
+        }
+    }
+
+    if added > 0 {
+        if let Err(e) = std::fs::write(cfg_path, doc.to_string()) {
+            return (
                 CheckResult::fail(
                     "config",
                     Severity::Required,
-                    format!("invalid config at {}: {e}", cfg_path.display()),
-                    format!(
-                        "edit {} or delete it to regenerate defaults",
-                        cfg_path.display()
-                    ),
+                    format!("could not write {}: {e}", cfg_path.display()),
+                    "check the file's permissions".to_string(),
                 ),
                 0,
-            ),
+            );
+        }
+    }
+
+    // Name the tables left alone. Silent divergence between what is in the file
+    // and what ro reads is the thing a user cannot debug from ro's side.
+    let untouched: Vec<&str> = doc
+        .as_table()
+        .iter()
+        .map(|(k, _)| k)
+        .filter(|k| !EXPECTED_SECTIONS.contains(k))
+        .collect();
+    let mut detail = format!("config valid at {}", cfg_path.display());
+    if added > 0 {
+        detail.push_str(&format!("; added {added} missing section(s)"));
+    }
+    if !untouched.is_empty() {
+        detail.push_str(&format!(
+            "; left unrecognised table(s) in place: {}",
+            untouched.join(", ")
+        ));
+    }
+
+    (CheckResult::ok("config", Severity::Required, detail), added)
+}
+
+fn check_and_optionally_fix_config(paths: &ConfigPaths, fix: bool) -> (CheckResult, usize) {
+    let cfg_path = paths.config_toml();
+    if cfg_path.exists() {
+        let loaded = load_config(&cfg_path);
+        if loaded.is_ok() {
+            // A file that already parses is a candidate for an *upgrade*, not
+            // just for a verdict. Without this, every user keeps dead
+            // `[mcp]`/`[jobs]`/`[review]` config indefinitely and `validate`
+            // keeps checking keys the schema no longer models.
+            if !fix {
+                return (
+                    CheckResult::ok(
+                        "config",
+                        Severity::Required,
+                        format!("config valid at {}", cfg_path.display()),
+                    ),
+                    0,
+                );
+            }
+            return upgrade_existing_config(&cfg_path);
+        }
+        let Err(e) = loaded else {
+            unreachable!("the Ok arm returns above")
         };
+        return (
+            CheckResult::fail(
+                "config",
+                Severity::Required,
+                format!("invalid config at {}: {e}", cfg_path.display()),
+                format!(
+                    "edit {} or delete it to regenerate defaults",
+                    cfg_path.display()
+                ),
+            ),
+            0,
+        );
     }
 
     if !fix {
@@ -455,6 +564,104 @@ mod tests {
             state_dir: root.join(".local/state/ro"),
             cache_dir: root.join(".cache/ro"),
         }
+    }
+
+    /// `--fix` on a config that predates the current schema adds what is
+    /// missing. Without this, every existing user keeps dead `[mcp]`/`[jobs]`/
+    /// `[review]` config indefinitely and `validate` keeps checking keys the
+    /// schema no longer models.
+    #[test]
+    fn fix_adds_a_missing_section_to_an_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let cfg_path = paths.config_toml();
+        fs::write(&cfg_path, "[core]\nlayout = \"flat\"\n").unwrap();
+
+        let (result, added) = check_and_optionally_fix_config(&paths, true);
+        assert_eq!(
+            added, 3,
+            "the fixture has [core] only, so auth, git, safety"
+        );
+        assert_eq!(
+            result.status,
+            Status::Ok,
+            "an upgrade must not report a failure"
+        );
+
+        let after = fs::read_to_string(&cfg_path).unwrap();
+        for section in ["[auth]", "[git]", "[safety]"] {
+            assert!(
+                after.contains(section),
+                "{section} should have been added, got:\n{after}"
+            );
+        }
+        assert!(after.contains("layout = \"flat\""), "got:\n{after}");
+    }
+
+    /// The asymmetry that matters. `--fix` adds; it never removes. An unknown
+    /// table is a setting from a newer ro, a leftover from an older one, or
+    /// something the user put there — and a repair command that deletes a
+    /// user's file contents is worse than no repair command.
+    #[test]
+    fn fix_leaves_a_legacy_table_in_place_and_names_it() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let cfg_path = paths.config_toml();
+        fs::write(
+            &cfg_path,
+            "[core]\nlayout = \"flat\"\n\n[review]\nauto_approve = \"low\"\n",
+        )
+        .unwrap();
+
+        let (result, _) = check_and_optionally_fix_config(&paths, true);
+
+        let after = fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            after.contains("[review]") && after.contains("auto_approve"),
+            "a legacy table must survive --fix, got:\n{after}"
+        );
+        // And it is reported, so the user knows it is being ignored rather
+        // than quietly honoured.
+        assert!(
+            result.message.contains("review"),
+            "the check must name the table it left alone, got: {}",
+            result.message
+        );
+    }
+
+    /// Without `--fix` the file is only judged, never written. A doctor that
+    /// repairs by default is a doctor nobody can run to find out what is wrong.
+    #[test]
+    fn no_fix_never_writes() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let cfg_path = paths.config_toml();
+        let original = "[core]\nlayout = \"flat\"\n";
+        fs::write(&cfg_path, original).unwrap();
+
+        let (result, added) = check_and_optionally_fix_config(&paths, false);
+        assert_eq!(result.status, Status::Ok);
+        assert_eq!(added, 0);
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), original);
+    }
+
+    /// A file that already has every expected section is a no-op, and reports
+    /// a count of zero rather than a fix that changed nothing.
+    #[test]
+    fn fix_on_a_current_config_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let cfg_path = paths.config_toml();
+        fs::write(&cfg_path, ro_config::paths::default_config_toml()).unwrap();
+        let before = fs::read_to_string(&cfg_path).unwrap();
+
+        let (_, added) = check_and_optionally_fix_config(&paths, true);
+        assert_eq!(added, 0);
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), before);
     }
 
     #[test]

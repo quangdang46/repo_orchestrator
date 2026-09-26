@@ -51,6 +51,9 @@ reqwest         = { version = "0.12", default-features = false, features = ["jso
 regex           = "1.11"
 indexmap        = "2.7"
 toml            = "0.8"
+# Preserves comments and unmodelled keys on a surgical edit. `toml` serializes
+# a struct, which is exactly the lossy path `ro config set` must stop using.
+toml_edit       = "0.22"
 dirs            = "5.0"
 time             = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 uuid             = { version = "1.16", features = ["v4", "serde"] }

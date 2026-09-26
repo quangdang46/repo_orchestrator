@@ -231,6 +231,10 @@ pub fn classify_add_input(input: &str) -> Result<AddSource> {
     }
 
     // 2. Anything else that is a git checkout is a local path to adopt.
+    //    This is checked before the bare `owner/repo` form below, because that
+    //    is the only remote form a real directory could also match: a checkout
+    //    sitting at `acme/api` is a path, not a GitHub coordinate, and the
+    //    user is standing right in front of it.
     let path = std::path::Path::new(value);
     if path.join(".git").exists() {
         let canonical = path
@@ -268,7 +272,14 @@ pub fn classify_add_input(input: &str) -> Result<AddSource> {
         });
     }
 
-    // 3. Neither. Name both forms, because the user is one keystroke from
+    // 3. A bare `owner/repo` is a GitHub coordinate, and the way most people
+    //    actually type this. It is tried last of the three accepted forms
+    //    precisely because a directory could also match it.
+    if let Ok(spec) = RepoSpec::parse(value) {
+        return Ok(AddSource::Remote(spec));
+    }
+
+    // 4. Neither. Name both forms, because the user is one keystroke from
     //    either and guessing wrong is the expensive branch.
     bail!(
         "cannot tell what {value:?} is.\n\
@@ -1058,6 +1069,42 @@ mod tests {
         );
         assert_eq!(repo.engine.as_deref(), Some("codex"));
         assert_eq!(repo.author_ref.as_deref(), Some("work"));
+    }
+
+    /// A bare `owner/repo` is the form most people type, and it is also the
+    /// only remote form a real directory can match. `acme/api` relative to the
+    /// cwd is a checkout; the same string is a GitHub coordinate from anywhere
+    /// else. The checkout wins, because the user is standing in front of it.
+    #[test]
+    fn a_local_checkout_wins_over_the_bare_owner_repo_form() {
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let checkout = cwd.join("acme").join("api");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+
+        // The string that `RepoSpec::parse` would happily read as owner=acme,
+        // name=api. It must not be taken as one while that directory exists.
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(cwd).unwrap();
+        let classified = classify_add_input("./acme/api");
+        std::env::set_current_dir(previous).unwrap();
+
+        match classified.unwrap() {
+            AddSource::Local { name, .. } => assert_eq!(name, "api"),
+            other => panic!("a real checkout must not be read as a coordinate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bare_owner_repo_is_a_remote_spec() {
+        match classify_add_input("acme/api").unwrap() {
+            AddSource::Remote(s) => {
+                assert_eq!(s.owner, "acme");
+                assert_eq!(s.name, "api");
+            }
+            other => panic!("expected a remote spec, got {other:?}"),
+        }
     }
 
     /// The trap V5 had two halves to.

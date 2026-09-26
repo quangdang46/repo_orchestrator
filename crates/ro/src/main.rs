@@ -1134,25 +1134,29 @@ fn run() -> Result<()> {
                     let (key, value) = pair
                         .split_once('=')
                         .ok_or_else(|| anyhow::anyhow!("expected KEY=VALUE format"))?;
-                    let mut config = ro_config::load_config(&cfg_path)?;
-                    match key.trim() {
-                        "core.projects_dir" => config.core.projects_dir = value.trim().to_string(),
-                        "core.layout" => config.core.layout = value.trim().to_string(),
-                        "core.parallel" => config.core.parallel = value.trim().parse()?,
-                        "core.timeout_secs" => config.core.timeout_secs = value.trim().parse()?,
-                        "git.update_strategy" => {
-                            config.git.update_strategy = value.trim().to_string()
+                    let key = key.trim();
+                    let value = value.trim();
+
+                    // The registry tier. `repos.<name>.<key>` writes the row in
+                    // state.db, not the file — which is the form most per-repo
+                    // changes should take, because it is queryable, diffable in
+                    // a backup, and does not litter a working tree.
+                    if let Some(rest) = key.strip_prefix("repos.") {
+                        let (repo, config_key) = rest.split_once('.').ok_or_else(|| {
+                            anyhow::anyhow!("expected repos.<name>.<key>, got: {key}")
+                        })?;
+                        if repo.is_empty() || config_key.is_empty() {
+                            anyhow::bail!("expected repos.<name>.<key>, got: {key}");
                         }
-                        "git.autostash" => config.git.autostash = value.trim().parse()?,
-                        "safety.secret_scan" => {
-                            config.safety.secret_scan = value.trim().to_string()
-                        }
-                        other => anyhow::bail!("unknown config key: {other}"),
+                        let conn = ro_state::open_db(&db_path).context("opening state database")?;
+                        manage::set_repo_config(&conn, repo, config_key, value)
+                            .with_context(|| format!("setting {key}"))?;
+                        eprintln!("Set {key} = {value} in the registry");
+                    } else {
+                        ro_config::set_key_in_file(&cfg_path, key, value)
+                            .with_context(|| format!("setting {key}"))?;
+                        eprintln!("Set {key} = {value}");
                     }
-                    ro_config::validate(&config)?;
-                    let toml_str = toml::to_string_pretty(&config)?;
-                    std::fs::write(&cfg_path, &toml_str)?;
-                    eprintln!("Set {key} = {}", value.trim());
                 }
             }
         }
