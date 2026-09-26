@@ -508,6 +508,26 @@ pub fn ensure_repo(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The branch a remote's `HEAD` points at — `origin/main` and nothing else.
+///
+/// Read from the repository rather than from config, because a cached
+/// branch name goes stale on a `main` -> `trunk` rename and there is no
+/// event that would tell a cache it had.
+pub fn symbolic_ref(repo: &Path, refname: &str) -> Result<Option<String>> {
+    let out = run_in(
+        Some(repo),
+        &["symbolic-ref", "--short", refname],
+        &RunOpts::none(),
+    )?;
+    if !out.ok() {
+        // Exit 1 is "not a symbolic ref", which is a real answer: a clone
+        // with no remote, or a remote whose HEAD was never set.
+        return Ok(None);
+    }
+    let s = out.stdout.trim().to_string();
+    if s.is_empty() { Ok(None) } else { Ok(Some(s)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

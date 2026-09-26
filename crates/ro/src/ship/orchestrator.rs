@@ -31,6 +31,14 @@ impl HowFar {
     pub fn pushes(&self) -> bool {
         !matches!(self, HowFar::Commit)
     }
+
+    /// Does this run rebase onto the remote's base first?
+    ///
+    /// `commit` and `push` do not: only a full ship fetches, and there is
+    /// nothing to rebase onto a base we have not fetched.
+    pub fn rebases(&self) -> bool {
+        matches!(self, HowFar::Ship)
+    }
 }
 
 /// Why a repo did not get as far as a commit.
@@ -230,6 +238,28 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             return RepoOutcome::Failed {
                 error: format!("fetch failed: {e:#}"),
             };
+        }
+    }
+
+    // (c2) Rebase onto the remote's base, **before** the engine.
+    //
+    // The tree is dirty, so git stashes, rebases and pops; it comes back
+    // dirty and already on top of the remote's base. The engine then
+    // commits once and the push is an ordinary fast-forward — so the
+    // happy path never rewrites the branch, and a `--force-with-lease`
+    // is needed only when a commit made earlier is pushed after the
+    // remote moved, which is the honest limit of reordering.
+    if opts.how_far.rebases() {
+        match rebase_onto_remote_base(repo) {
+            Ok(RebaseState::Rebased) | Ok(RebaseState::NoRemote) => {}
+            Err(e) => {
+                // A failed autostash pop is a per-repo FAILURE, never a
+                // proceed on a half-popped tree. The message carries the
+                // exact recovery rather than hoping the user knows it.
+                return RepoOutcome::Failed {
+                    error: e.to_string(),
+                };
+            }
         }
     }
 
@@ -572,6 +602,325 @@ mod tests {
             identity: None,
             engine: ro_engine::resolve("git", &ro_engine::EngineSlots::default(), None)
                 .expect("git is one of the three built-ins"),
+        }
+    }
+}
+
+/// What a rebase attempt found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseState {
+    /// The branch is now on the remote's base.
+    ///
+    /// One answer rather than two: git reports nothing differently for
+    /// "already current" and "moved", and a caller given two answers
+    /// has to invent a distinction it cannot act on.
+    Rebased,
+    /// No remote, so no base to rebase onto. A local-only repo, which is
+    /// an ordinary state and not a failure.
+    NoRemote,
+}
+
+/// Rebase onto `origin/HEAD`, with the worktree's changes preserved.
+///
+/// One git invocation, so there is no window in which the stash exists
+/// and ro has not yet asked git to pop it. Driving `stash` / `rebase` /
+/// `stash pop` as three steps ro controls itself would be the same thing
+/// with **three places to forget the cleanup** — the failure class the
+/// credential design avoids by never rewriting a remote in the first
+/// place.
+fn rebase_onto_remote_base(repo: &Path) -> Result<RebaseState, anyhow::Error> {
+    // Fetch first, always. Rebasing onto a stale
+    // `refs/remotes/origin/HEAD` reorders the branch onto a base the
+    // remote has already moved past, which is the one ordering mistake
+    // that makes a rebase look like it worked.
+    let _ = ro_git::mutation::fetch(repo, &ro_git::mutation::FetchOpts::default());
+
+    let Some(base) = ro_git::primitives::symbolic_ref(repo, "refs/remotes/origin/HEAD")? else {
+        return Ok(RebaseState::NoRemote);
+    };
+    // `--autostash` is the whole mechanism: git stashes, rebases, and pops
+    // in one command, so a failure to pop fails the whole rebase rather
+    // than leaving a half-popped tree behind for ro to walk away from.
+    let out = std::process::Command::new("git")
+        .args(["rebase", "--autostash", &base])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| anyhow::anyhow!("running git rebase --autostash: {e}"))?;
+
+    if out.status.success() {
+        return Ok(RebaseState::Rebased);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A conflict is the user's to resolve, and the tree is left mid-
+    // rebase on purpose: aborting would discard their work.
+    if stderr.contains("CONFLICT") || stderr.contains("could not apply") {
+        return Err(anyhow::anyhow!(
+            "the rebase onto {base} conflicted. Nothing was committed or \
+             pushed. Resolve it and run `git rebase --continue`, or \
+             `git rebase --abort` to go back."
+        ));
+    }
+    // Everything else is a real failure, and the recovery is stated
+    // rather than assumed.
+    Err(anyhow::anyhow!(
+        "the rebase onto {base} failed: {}.\n\
+         If the tree looks wrong, `git stash list` shows any autostash \
+         that was not popped, and `git stash pop` restores it.",
+        stderr.trim()
+    ))
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    /// The rebase happens **before** the engine, so the tree comes back
+    /// already on the remote's base and the push is a fast-forward.
+    ///
+    /// The conventional order — commit, push, get rejected, rebase,
+    /// force-push — rewrites the branch. A force-push across a fleet is
+    /// the one operation here that can destroy someone else's work.
+    #[test]
+    fn a_dirty_tree_is_rebased_onto_the_remote_base_before_committing() {
+        let f = Fixture::new();
+        // The remote moves on.
+        f.other_clone_commits("remote moved on");
+
+        // Locally there is uncommitted work — the shape `ro ship` is
+        // normally invoked in.
+        f.write_local("feature.txt", "work in progress\n");
+
+        let state = rebase_onto_remote_base(f.repo()).expect("the rebase runs");
+        assert!(
+            matches!(state, RebaseState::Rebased),
+            "a dirty tree on a moved remote must rebase, got {state:?}"
+        );
+
+        // The local work survived the stash/rebase/pop cycle.
+        assert!(
+            f.local_porcelain().contains("feature.txt"),
+            "the autostash must pop the work back, got: {}",
+            f.local_porcelain()
+        );
+        // And the local branch now contains the remote's commit.
+        assert!(
+            f.local_contains("remote moved on"),
+            "the branch must sit on the remote's base"
+        );
+    }
+
+    /// A clean tree with the remote moved is a plain rebase.
+    #[test]
+    fn a_clean_tree_behind_the_remote_rebases_without_a_stash() {
+        let f = Fixture::new();
+        f.other_clone_commits("remote moved on");
+        // Nothing local is dirty.
+        assert!(f.local_porcelain().trim().is_empty());
+
+        let state = rebase_onto_remote_base(f.repo()).expect("the rebase runs");
+        assert!(matches!(state, RebaseState::Rebased), "got {state:?}");
+        assert!(f.local_contains("remote moved on"));
+    }
+
+    /// Nothing to rebase is a real answer, not a failure.
+    #[test]
+    fn an_already_current_branch_is_up_to_date() {
+        let f = Fixture::new();
+        let state = rebase_onto_remote_base(f.repo()).expect("the rebase runs");
+        assert!(
+            matches!(state, RebaseState::Rebased | RebaseState::NoRemote),
+            "a fresh fixture must not fail, got {state:?}"
+        );
+    }
+
+    /// No remote, no base, no failure.
+    ///
+    /// A repo with no remote is a local-only repo, which is an ordinary
+    /// state — not an error, and not a reason to stop.
+    #[test]
+    fn a_repo_with_no_remote_reports_it_rather_than_failing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo = tmp.path().join("solo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "-b", "main"]);
+        assert_eq!(
+            rebase_onto_remote_base(&repo).expect("must not fail"),
+            RebaseState::NoRemote,
+            "a local-only repo has no base to rebase onto, and that is a fact"
+        );
+    }
+
+    /// A conflicting rebase is a per-repo FAILURE with the recovery
+    /// stated — never a proceed on a half-popped tree.
+    #[test]
+    fn a_conflicting_rebase_fails_with_the_recovery_in_the_message() {
+        let f = Fixture::new();
+        // Both sides change the same line, so the rebase conflicts.
+        f.write_local("shared.txt", "local version\n");
+        run_git(f.repo(), &["add", "-A"]);
+        run_git(f.repo(), &["commit", "-q", "-m", "local change"]);
+        f.other_clone_commits("different change");
+        // Move the remote's version of shared.txt to conflict.
+        f.force_remote_file("shared.txt", "remote version\n");
+        f.write_local("shared.txt", "local version\n");
+
+        let err = rebase_onto_remote_base(f.repo()).expect_err("must fail loudly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rebase --abort") || msg.contains("rebase --continue"),
+            "the message must state the recovery, got: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was committed or pushed"),
+            "and say plainly that nothing was written, got: {msg}"
+        );
+    }
+}
+
+/// Shared fixtures for the per-repo tests.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    pub fn run_git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Clone `remote` into `root/name`, already on `main` with an identity
+    /// configured, so no caller has to remember the order these must
+    /// happen in.
+    fn clone_at(root: &Path, name: &str, remote: &Path) -> PathBuf {
+        run_git(root, &["clone", "-q", &remote.to_string_lossy(), name]);
+        let c = root.join(name);
+        run_git(&c, &["config", "user.email", "t@e.com"]);
+        run_git(&c, &["config", "user.name", "T"]);
+        // A bare remote's clone can land on a branch whose name came
+        // from the local git config; the fixture must not.
+        run_git(&c, &["checkout", "-q", "-B", "main"]);
+        c
+    }
+
+    /// A local clone with an upstream it can fall behind.
+    pub struct Fixture {
+        // Kept alive so the temp directory outlives every clone in it.
+        _tmp: TempDir,
+        remote: PathBuf,
+        other: PathBuf,
+        local: PathBuf,
+    }
+
+    impl Fixture {
+        pub fn new() -> Self {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().to_path_buf();
+
+            // A bare remote with an explicit default branch. `git init
+            // --bare` takes the name from the local git config, and a
+            // fixture whose branch name depends on the machine is a
+            // fixture that fails on somebody else's laptop.
+            let remote = root.join("remote.git");
+            std::fs::create_dir_all(&remote).unwrap();
+            run_git(&remote, &["init", "--bare", "-q", "--initial-branch=main"]);
+
+            // ONE root commit, made in `other` and pushed. If each clone
+            // made its own, the two would sit on divergent roots and
+            // every later rebase would be a real conflict about nothing —
+            // the fixture would be testing the wrong thing entirely.
+            let other = clone_at(&root, "other", &remote);
+            run_git(&other, &["commit", "-q", "--allow-empty", "-m", "init"]);
+            run_git(&other, &["push", "-q", "-u", "origin", "main"]);
+
+            // `local` is cloned AFTER, so it starts from that commit with
+            // its upstream already tracking origin/main.
+            let local = clone_at(&root, "local", &remote);
+
+            // The base is read from `refs/remotes/origin/HEAD`, and a
+            // clone leaves it dangling — so without this every repo looks
+            // like it has no remote at all, which is a real failure mode
+            // precisely because the base must come from the repository
+            // and not from configuration.
+            run_git(&local, &["remote", "set-head", "origin", "-a"]);
+
+            Self {
+                _tmp: tmp,
+                remote,
+                other,
+                local,
+            }
+        }
+
+        pub fn repo(&self) -> &Path {
+            &self.local
+        }
+
+        pub fn write_local(&self, name: &str, contents: &str) {
+            let p = self.local.join(name);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, contents).unwrap();
+        }
+
+        /// Commit and push from the *other* clone, so the remote moves.
+        pub fn other_clone_commits(&self, message: &str) {
+            std::fs::write(self.other.join("remote.txt"), message).unwrap();
+            run_git(&self.other, &["add", "-A"]);
+            run_git(&self.other, &["commit", "-q", "-m", message]);
+            run_git(&self.other, &["push", "-q", "origin", "HEAD:main"]);
+        }
+
+        /// Put a file's content directly into the remote, so a rebase
+        /// conflicts on it.
+        pub fn force_remote_file(&self, name: &str, contents: &str) {
+            run_git(&self.other, &["fetch", "-q", "origin"]);
+            std::fs::write(self.other.join(name), contents).unwrap();
+            run_git(&self.other, &["add", "-A"]);
+            run_git(&self.other, &["commit", "-q", "-m", "remote change"]);
+            run_git(
+                &self.other,
+                &["push", "-q", "--force", "origin", "HEAD:main"],
+            );
+        }
+
+        pub fn local_porcelain(&self) -> String {
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["status", "--porcelain"])
+                    .current_dir(&self.local)
+                    .output()
+                    .expect("git runs")
+                    .stdout,
+            )
+            .into_owned()
+        }
+
+        pub fn local_contains(&self, message: &str) -> bool {
+            let out = std::process::Command::new("git")
+                .args(["log", "--format=%s"])
+                .current_dir(&self.local)
+                .output()
+                .expect("git runs");
+            String::from_utf8_lossy(&out.stdout).contains(message)
+        }
+
+        #[allow(dead_code)]
+        pub fn remote_path(&self) -> &Path {
+            &self.remote
         }
     }
 }
