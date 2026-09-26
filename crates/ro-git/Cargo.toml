@@ -10,6 +10,8 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# For SecretString, so a push can carry one credential without persisting it.
+ro-core.workspace = true
 gix.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

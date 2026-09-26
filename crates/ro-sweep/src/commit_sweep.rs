@@ -481,6 +481,10 @@ pub fn apply_repo(repo: &Path, plan: &RepoPlan, opts: &SweepOptions) -> RepoOutc
                     force_with_lease: opts.force_with_lease,
                     set_upstream: false,
                     tags: false,
+                    // The sweep pushes with the machine's own credential, so
+                    // no per-invocation header is attached here. The
+                    // per-repo credential path lands with `ro push` in Phase 5.
+                    host: None,
                 };
                 match mutation::push(repo, &popts) {
                     Ok(res) if res.status == 0 => outcome.pushed = true,

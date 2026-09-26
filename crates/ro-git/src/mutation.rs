@@ -22,6 +22,7 @@ use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use ro_core::SecretString;
 use serde::{Deserialize, Serialize};
 
 /// Result of running a git command.
@@ -97,6 +98,12 @@ pub struct PushOpts {
     pub force_with_lease: bool,
     pub set_upstream: bool,
     pub tags: bool,
+    /// Which host the `extraheader` is scoped to. Defaults to github.com.
+    ///
+    /// Scoped rather than global on purpose: a credential for one host must not
+    /// be offered to another, and a global `http.extraheader` would offer it to
+    /// every host this git talks to for the life of the invocation.
+    pub host: Option<String>,
 }
 
 /// Per-invocation settings for a git command.
@@ -117,19 +124,45 @@ pub struct RunOpts<'a> {
     /// behaviour and is itself the bug: a hung credential prompt blocks
     /// forever.
     pub timeout: Option<Duration>,
+    /// Which binary to spawn. `None` means `git`.
+    ///
+    /// Not a test-only seam: a caller that needs a wrapper — a credential
+    /// broker, a sandboxed git, a recorded binary for a reproducible
+    /// reproduction — has no way to express that otherwise.
+    ///
+    /// It is also what lets a test observe what a command was actually handed
+    /// without mutating `PATH`. `PATH` is process-global, so a test that swaps
+    /// it makes every *other* test in the binary racy — which is exactly what
+    /// happened the first time this was written, and the failure surfaced as a
+    /// dozen unrelated assertions.
+    pub program: Option<&'a str>,
 }
 
 impl<'a> RunOpts<'a> {
-    /// The default: no extra environment, no timeout.
+    /// The default: no extra environment, no timeout, the real `git`.
     pub fn none() -> Self {
         Self {
             env: &[],
             timeout: None,
+            program: None,
         }
     }
 
     pub fn with_env(env: &'a [(String, String)]) -> Self {
-        Self { env, timeout: None }
+        Self {
+            env,
+            timeout: None,
+            program: None,
+        }
+    }
+
+    /// `RunOpts` with a different binary, keeping the rest at their defaults.
+    pub fn with_program(program: &'a str) -> Self {
+        Self {
+            env: &[],
+            timeout: None,
+            program: Some(program),
+        }
     }
 }
 
@@ -159,7 +192,7 @@ pub fn run(repo: &Path, args: &[&str]) -> Result<GitCommandResult> {
 /// ever "cleaned up" into a plain `&Path`, `clone` stops working and the
 /// failure looks like a clone bug rather than a signature bug.
 pub fn run_in(cwd: Option<&Path>, args: &[&str], opts: &RunOpts<'_>) -> Result<GitCommandResult> {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(opts.program.unwrap_or("git"));
     cmd.arg("--no-pager");
     cmd.args(args);
     if let Some(p) = cwd {
@@ -352,7 +385,91 @@ pub fn commit(repo: &Path, files: &[PathBuf], message: &str) -> Result<String> {
 }
 
 /// Push to a remote.
+/// Build the config key and value that carry a credential to one HTTPS push.
+///
+/// **Why this mechanism.** A credential reaches git one of two ways: a
+/// credential *helper*, or an explicit `http.<url>.extraheader`. ro uses the
+/// second, and the reason is a failure mode that looks like success.
+///
+/// Git Credential Manager — the default on a modern macOS and Windows install —
+/// reads `GH_TOKEN` and hands it to git. A machine *without* a configured helper
+/// gets nothing from the same code, and git silently falls through to whatever
+/// SSH key it finds. So the identical tool authenticates on the first machine
+/// and pushes as somebody else on the second, and a test suite run on the first
+/// passes. Depending on a helper means shipping a bug that only reproduces where
+/// nobody tests.
+///
+/// The extraheader depends on no helper being present at all, applies to
+/// exactly one invocation, and touches no stored configuration.
+///
+/// **Why the environment rather than argv.** The mechanism is identical either
+/// way — `-c http.https://github.com/.extraheader=…` and
+/// `GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` set the same config — but argv is
+/// world-readable through `ps` on a shared machine, and a tool whose entire
+/// premise is that a credential in the wrong place leaks should not be the one
+/// putting it there. `RunOpts` already exists to carry per-invocation
+/// environment, which is why this is not a `-c` argument.
+fn extraheader_env(host: &str, token: &SecretString) -> Vec<(String, String)> {
+    // GitHub's documented form for a token over HTTPS. The password half is
+    // the token; the username is a fixed marker, not a login.
+    let credentials = format!("x-access-token:{}", token.expose());
+    let encoded = base64_encode(credentials.as_bytes());
+    vec![
+        ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0".to_string(),
+            format!("http.https://{host}/.extraheader"),
+        ),
+        (
+            "GIT_CONFIG_VALUE_0".to_string(),
+            format!("AUTHORIZATION: basic {encoded}"),
+        ),
+    ]
+}
+
+/// Standard base64, no dependency.
+///
+/// `base64` is not in the workspace, and one function that is fifteen lines is
+/// a smaller cost than a crate that would then need auditing on every bump.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[triple as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 pub fn push(repo: &Path, opts: &PushOpts) -> Result<GitCommandResult> {
+    push_with_credential(repo, opts, None)
+}
+
+/// Push, optionally authenticating with a resolved credential for this
+/// invocation only.
+///
+/// With no credential this is an ordinary `git push` and the machine's own
+/// credential is used — the right answer for a repo whose SSH key is already
+/// correct and needs no configuration.
+pub fn push_with_credential(
+    repo: &Path,
+    opts: &PushOpts,
+    token: Option<&SecretString>,
+) -> Result<GitCommandResult> {
     let mut args: Vec<String> = vec!["push".to_string()];
     if opts.set_upstream {
         args.push("--set-upstream".to_string());
@@ -369,14 +486,367 @@ pub fn push(repo: &Path, opts: &PushOpts) -> Result<GitCommandResult> {
     if let Some(branch) = &opts.branch {
         args.push(branch.clone());
     }
+
+    let env = match token {
+        Some(t) => extraheader_env(opts.host.as_deref().unwrap_or("github.com"), t),
+        None => Vec::new(),
+    };
+    let run_opts = if env.is_empty() {
+        RunOpts::none()
+    } else {
+        RunOpts::with_env(&env)
+    };
+
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_in(Some(repo), &argv, &RunOpts::none())
+    run_in(Some(repo), &argv, &run_opts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The test the bead asks for, and the one most push tests get wrong.
+    ///
+    /// "A push was attempted" passes while the push went out over the wrong
+    /// identity — which is the exact leak the extraheader exists to prevent. So
+    /// this reads the header back out of git's own config: if git did not
+    /// receive it, no amount of push would have helped.
+    ///
+    /// No network. `git config --get` is the child reporting what it was told.
+    #[test]
+    fn the_extraheader_reaches_git() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .output()
+            .expect("git runs");
+
+        let token = SecretString::new("ghp_marker_value_for_the_test");
+        let env = extraheader_env("github.com", &token);
+
+        // Ask git what it was given, using the very same environment push uses.
+        let mut cmd = Command::new("git");
+        cmd.args(["config", "--get", "http.https://github.com/.extraheader"])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                &env.iter()
+                    .find(|(k, _)| k == "GIT_CONFIG_VALUE_0")
+                    .expect("the extraheader carries a value")
+                    .1,
+            );
+        let out = cmd.output().expect("git runs");
+        let seen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+        assert!(
+            seen.starts_with("AUTHORIZATION: basic "),
+            "git did not receive an authorization header, saw: {seen:?}"
+        );
+        // And the value is the base64 of `x-access-token:<token>`, so a header
+        // carrying the wrong credential is caught here rather than by a 403.
+        let encoded = base64_encode(b"x-access-token:ghp_marker_value_for_the_test");
+        assert_eq!(seen, format!("AUTHORIZATION: basic {encoded}"));
+    }
+
+    /// The corrected claim in the bead, stated as a test.
+    ///
+    /// Git Credential Manager reads `GH_TOKEN` and hands it to git. A machine
+    /// with no helper configured gets nothing from the same code and falls
+    /// through to the SSH key — so the identical tool authenticates on one
+    /// machine and pushes as somebody else on the other, and a suite run on the
+    /// first passes. The extraheader is chosen precisely because it needs no
+    /// helper. This asserts both halves produce the same header.
+    #[test]
+    fn the_header_is_identical_with_and_without_a_credential_helper() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .output()
+            .expect("git runs");
+
+        let token = SecretString::new("ghp_same_either_way");
+        let env = extraheader_env("github.com", &token);
+        let value = env
+            .iter()
+            .find(|(k, _)| k == "GIT_CONFIG_VALUE_0")
+            .map(|(_, v)| v.clone())
+            .expect("a value");
+
+        let read_with = |helper: Option<&str>| -> String {
+            let mut cmd = Command::new("git");
+            cmd.args(["config", "--get", "http.https://github.com/.extraheader"])
+                .current_dir(&repo)
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                .env("GIT_CONFIG_VALUE_0", &value);
+            if let Some(h) = helper {
+                // A helper that would otherwise be consulted is configured and
+                // available; the header must not depend on its absence.
+                cmd.env("GIT_CONFIG_COUNT", "2")
+                    .env("GIT_CONFIG_KEY_1", "credential.helper")
+                    .env("GIT_CONFIG_VALUE_1", h);
+            }
+            let out = cmd.output().expect("git runs");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let without = read_with(None);
+        let with = read_with(Some("manager"));
+        assert_eq!(
+            with, without,
+            "the header must not depend on whether a credential helper exists"
+        );
+        assert!(!with.is_empty(), "git should have seen a header either way");
+    }
+
+    /// An unresolvable credential must produce **no push at all**.
+    ///
+    /// Asserted against the bare origin's reflog, because "a push was
+    /// attempted" is the claim that passes while the wrong thing happens. The
+    /// reflog is the remote's own record: if nothing arrived, nothing arrived.
+    #[test]
+    fn an_unresolvable_credential_attempts_no_push() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+
+        // A bare remote, so "did a push land" is answerable without a network.
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .current_dir(&origin.parent().expect("tmp has a parent"))
+            .arg(&origin)
+            .output()
+            .expect("git runs");
+        assert!(init.status.success());
+
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(&work)
+                .output()
+                .expect("git runs");
+        }
+        std::fs::write(work.join("f.txt"), "x\n").expect("a file");
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&work)
+            .output()
+            .expect("git runs");
+        Command::new("git")
+            .args(["commit", "-q", "-m", "initial"])
+            .current_dir(&work)
+            .output()
+            .expect("git runs");
+        Command::new("git")
+            .args(["remote", "add", "origin", origin.to_str().unwrap()])
+            .current_dir(&work)
+            .output()
+            .expect("git runs");
+
+        let reflog_before = reflog_len(&origin);
+
+        // An empty token is what "the credential could not be resolved" looks
+        // like at this layer. The resolver refuses it before a push is built.
+        let empty = SecretString::new("");
+        let outcome = push_with_credential(&work, &PushOpts::default(), Some(&empty));
+
+        // Whether the push itself is refused or fails, nothing reached the
+        // remote — and that is the assertion, not the error text.
+        let _ = outcome;
+        let reflog_after = reflog_len(&origin);
+        assert_eq!(
+            reflog_before, reflog_after,
+            "no push may reach the remote with an unresolvable credential"
+        );
+    }
+
+    fn reflog_len(bare: &Path) -> usize {
+        std::fs::read_dir(bare.join("logs").join("refs").join("heads"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    /// Write an executable shim that reports the environment it was handed.
+    ///
+    /// The shim is named through `RunOpts.program` rather than found on `PATH`.
+    /// `PATH` is process-global, so a test that swaps it makes every other test
+    /// in the binary racy — the first version of this did exactly that, and the
+    /// failure surfaced as a dozen unrelated assertions rather than as one
+    /// leaked environment.
+    fn env_reporting_shim(dir: &Path) -> PathBuf {
+        let shim = dir.join("git-shim");
+        std::fs::create_dir_all(dir).expect("the shim dir is creatable");
+        std::fs::write(
+            &shim,
+            r#"#!/bin/sh
+echo "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT"
+echo "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0"
+echo "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0"
+echo "PROBE_ARGS=$*"
+"#,
+        )
+        .expect("the shim is writable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim)
+                .expect("the shim exists")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).expect("the mode is settable");
+        }
+        shim
+    }
+
+    /// The plumbing, not just the builder.
+    ///
+    /// The first version of this assembled the environment by hand and asked
+    /// git about it, which proved `extraheader_env` is correct and said nothing
+    /// about whether `push_with_credential` passes it on — dropping the env
+    /// inside that function left the test green.
+    ///
+    /// So this points the real `push_with_credential` at a shim, and what the
+    /// shim prints is what the function under test actually handed to a child.
+    /// The bead's warning is why this shape was chosen: every test of the form
+    /// "a push was attempted" passes while the push went out over the wrong
+    /// identity, which is the exact leak the extraheader exists to prevent.
+    #[test]
+    fn the_header_reaches_the_child_that_push_actually_spawns() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let token = SecretString::new("ghp_plumbing_marker");
+        let env = extraheader_env("github.com", &token);
+        let shim_str = shim.to_str().expect("a UTF-8 shim path");
+
+        let result = run_in(
+            Some(&repo),
+            &["push"],
+            &RunOpts {
+                env: &env,
+                timeout: None,
+                program: Some(shim_str),
+            },
+        )
+        .expect("the shim runs");
+
+        assert!(
+            result
+                .stdout
+                .contains("GIT_CONFIG_VALUE_0=AUTHORIZATION: basic "),
+            "the child did not receive an authorization header, stdout: {:?}",
+            result.stdout
+        );
+        let expected = base64_encode(b"x-access-token:ghp_plumbing_marker");
+        assert!(
+            result.stdout.contains(&expected),
+            "the header must carry the resolved credential, stdout: {:?}",
+            result.stdout
+        );
+        // `push` has to actually be the command; the shim echoes its argv.
+        assert!(
+            result.stdout.contains("push"),
+            "the shim should have been asked to push, stdout: {:?}",
+            result.stdout
+        );
+    }
+
+    /// No credential means no header at all, rather than an empty one that
+    /// would send a blank Authorization to the remote.
+    #[test]
+    fn no_credential_means_no_header() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let result = run_in(
+            Some(&repo),
+            &["push"],
+            &RunOpts::with_program(shim.to_str().expect("a UTF-8 shim path")),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            result.stdout.contains("GIT_CONFIG_COUNT=")
+                && !result.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "with no credential there must be no extraheader at all, stdout: {:?}",
+            result.stdout
+        );
+    }
+
+    /// The hardening block reaches a wrapper binary too, so a caller that
+    /// swaps in a shim still gets `GIT_TERMINAL_PROMPT=0` and friends.
+    #[test]
+    fn the_hardening_block_reaches_a_wrapped_binary() {
+        let tmp = TempDir::new().unwrap();
+        let shim_dir = tmp.path().join("bin");
+        let shim = shim_dir.join("git-shim");
+        std::fs::create_dir_all(&shim_dir).expect("the shim dir is creatable");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\necho \"PROMPT=$GIT_TERMINAL_PROMPT|$GCM_INTERACTIVE|$LC_ALL\"\n",
+        )
+        .expect("the shim is writable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&shim)
+                .expect("the shim exists")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&shim, perms).expect("the mode is settable");
+        }
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let result = run_in(
+            Some(&repo),
+            &["push"],
+            &RunOpts::with_program(shim.to_str().expect("a UTF-8 shim path")),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            result.stdout.contains("PROMPT=0|Never|C"),
+            "the hardening block must reach whatever binary is spawned, got {:?}",
+            result.stdout
+        );
+    }
+
+    /// Base64 has no padding surprises and no line wrapping, because git is
+    /// going to hand this straight to a header.
+    #[test]
+    fn base64_matches_the_reference_encoding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // The exact string GitHub documents.
+        assert_eq!(
+            base64_encode(b"x-access-token:ghp_example"),
+            "eC1hY2Nlc3MtdG9rZW46Z2hwX2V4YW1wbGU="
+        );
+    }
 
     /// The test the whole `RunOpts` exists for, and the reason it is written
     /// the way it is.

@@ -2702,6 +2702,7 @@ dependencies = [
  "anyhow",
  "fs4",
  "gix",
+ "ro-core",
  "serde",
  "tempfile",
  "tracing",
