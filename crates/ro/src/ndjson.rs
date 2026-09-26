@@ -9,6 +9,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// RFC 3339 with a **fixed-width** nanosecond field.
+///
+/// `time`'s well-known `Rfc3339` trims trailing zeros off the fractional
+/// second, so `.7893Z` (789300 ns) and `.789342Z` (789342 ns) are both legal
+/// output. That breaks the property an NDJSON consumer actually relies on:
+/// lexicographic order over the `ts` string stops matching chronological
+/// order, because `"…07.7893Z" > "…07.789342Z"` compares `'Z'` against `'4'`.
+/// A stream that sorts or range-scans by `ts` then returns events in the
+/// wrong order. Padding to nine digits makes the two orders identical.
+const TS_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
+);
+
 /// Every event written to the NDJSON stream carries this envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NdjsonEvent {
@@ -122,7 +135,7 @@ impl<W: std::io::Write> NdjsonWriter<W> {
         use anyhow::Context;
         if event.ts.is_none() {
             let ts = time::OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
+                .format(&TS_FORMAT)
                 .unwrap_or_else(|_| "unknown".into());
             event.ts = Some(ts);
         }
@@ -171,6 +184,33 @@ mod tests {
         assert!(
             parsed["ts"].as_str().unwrap().contains('T'),
             "timestamp should be RFC 3339-like"
+        );
+    }
+
+    /// The pair that broke string ordering under `Rfc3339`: 789300 ns trimmed
+    /// to `.7893Z`, and 789342 ns written in full. Numerically the first is
+    /// earlier; lexicographically `"…07.7893Z"` is *greater* than
+    /// `"…07.789342Z"` because `'Z'` outranks `'4'`. Fixed-width padding is
+    /// what makes `sort` on `ts` return events in the order they happened.
+    #[test]
+    fn subsecond_is_padded_so_string_order_matches_time_order() {
+        let day = time::Date::from_calendar_date(2026, time::Month::September, 26).unwrap();
+        let earlier =
+            time::PrimitiveDateTime::new(day, time::Time::from_hms_nano(3, 9, 7, 789_300).unwrap())
+                .assume_utc()
+                .format(&TS_FORMAT)
+                .unwrap();
+        let later =
+            time::PrimitiveDateTime::new(day, time::Time::from_hms_nano(3, 9, 7, 789_342).unwrap())
+                .assume_utc()
+                .format(&TS_FORMAT)
+                .unwrap();
+
+        assert!(earlier < later, "{earlier} should sort before {later}");
+        assert_eq!(
+            earlier.len(),
+            later.len(),
+            "fixed-width formatting means equal length: {earlier} vs {later}"
         );
     }
 
