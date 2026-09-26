@@ -22,6 +22,7 @@ serde_json.workspace = true
 clap.workspace = true
 rusqlite.workspace = true
 uuid.workspace = true
+globset.workspace = true
 
 [dev-dependencies]
 # For the sync test: a real bare remote and a real checkout, so a push is

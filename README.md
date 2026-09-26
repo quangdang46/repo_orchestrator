@@ -82,7 +82,7 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 | **Fleet inventory** | One SQLite DB for all tracked repos |
 | **First-class sync** | ff-only / rebase / merge, parallel, resume, autostash |
 | **Ranked attention** | Health scores instead of tab soup |
-| **Plan-then-apply** | Review/sweep flows produce plans before mutation |
+| **Plan-then-apply** | The preflight reports before it mutates |
 | **Agent-ready JSON** | Structured reads for coding agents and MCP |
 | **Doctor** | Diagnose and repair the local environment |
 
@@ -106,7 +106,7 @@ ro doctor
    Remote is GitHub; authority for *what we track and did* is local SQLite.
 
 2. **Plan before mutate.**  
-   Review, sweep, and train-style flows should produce an inspectable plan before apply.
+   Every mutation reports what it will do before doing it.
 
 3. **Agents get JSON, not scraped TUI.**  
    Prefer `--format json` and `ro schema` over parsing human text.
@@ -214,7 +214,6 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 | Runs | `run list/show/timeline` | Inspect past runs |
 | Conflicts | `conflict list/explain/abort/mark-resolved` | Merge/rebase recovery |
 | Review | `review plan` (+ apply/rollback flows) | Plan-then-apply |
-| Sweep | `sweep …` | Commit / agent sweep helpers |
 | Config | `config` | Show / set configuration |
 | Meta | `schema` | Machine-readable CLI reference |
 
@@ -246,7 +245,7 @@ Run `ro --help` / `ro <cmd> --help` for full flags.
 | Secret scan | On before risky apply |
 | Denylist paths | Blocks dangerous globs |
 | Quality checks | Configurable |
-| Plan-first | Review/sweep produce plans before mutation |
+| Plan-first | The preflight reports before it mutates |
 | Non-interactive | `--non-interactive` never prompts |
 
 Absent tools degrade cleanly where the design allows — never silent half-applies.
@@ -294,11 +293,11 @@ ro doctor
                             │
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼
-        ro-review    ro-jobs/sweep   output       
+        ro-jobs       ro-engine       safety      
         plan/apply    run timeline     agent surfaces
 ```
 
-Workspace highlights: `ro-core`, `ro-config`, `ro-state`, `ro-git`, `ro-github`, `ro-sync`, `ro-review`, `ro-sweep`, `ro-jobs`, `ro-output`, …
+Workspace highlights: `ro-core`, `ro-config`, `ro-state`, `ro-git`, `ro-github`, `ro-sync`, `ro-engine`, `ro-sweep`, `ro-jobs`, …
 
 ---
 

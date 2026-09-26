@@ -1,6 +1,6 @@
 [package]
 name = "ro-sweep"
-description = "Sweep commit and sweep agent for AI-driven automation"
+description = "The safety net: denylist, secret scan and quality gates, checked before ro writes"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
@@ -10,21 +10,25 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-# For the single redaction rule, shared with the identity guard.
+# For the single redaction rule, shared with the identity guard: two
+# implementations of "what does a secret look like in a log" is one too
+# many, and the two would drift.
 ro-core.workspace = true
-# For CheckpointConfig, so the preflight reads the configured mode instead of
-# the hardcoded Warn that made BlockedBySecrets unreachable.
-ro-config.workspace = true
-ro-sync.workspace = true
-ro-state.workspace = true
-ro-git.workspace = true
+
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-rusqlite.workspace = true
 globset.workspace = true
 regex.workspace = true
 
+# Dropped in the Phase 4 cut, all now unreferenced: ro-config, ro-sync,
+# ro-state, ro-git, rusqlite, serde_json. ro-config went with
+# `commit.rs`, which was the only reader of `[checkpoint]`; the preflight
+# itself now lives in ro-engine, which reads the config at the CLI edge.
+
 [dev-dependencies]
+# `serde_json` is here because a test round-trips a GateResult through JSON
+# to prove it serialises; that is a test claim, not a runtime one, so it
+# does not belong in the published dependency set.
 tempfile.workspace = true
+serde_json.workspace = true

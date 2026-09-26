@@ -11,17 +11,18 @@ copies in sync, and automates the boring parts of working across a fleet.
 
 ---
 
-## The one command you will use most
+## The commands you will use most
 
 ```bash
-ro sweep commit-sweep --all              # dry run: show the plan
-ro sweep commit-sweep --all --execute    # create the commits
-ro sweep commit-sweep --all --execute --push
+ro add owner/repo          # track a repository
+ro status                  # what state is each one in
+ro sync                    # bring each one up to date
+ro doctor                  # is this machine set up correctly
 ```
 
-Groups every dirty file across every tracked repo into **logical buckets** and
-makes one conventional commit per bucket, instead of one catch-all commit per
-repo:
+> The `ro sweep` namespace was removed in Phase 4. Its commit grouping and
+> the agent entry point are being rebuilt on top of the engine trait as
+> `ro commit`, `ro push` and `ro ship`.
 
 | Bucket | Prefix | Example message |
 |---|---|---|
@@ -132,20 +133,29 @@ subdirectories are not mistaken for separate repos.
 
 ---
 
-## Sweep
+## Safety net
 
-### `ro sweep commit-sweep`
-See the top of this document — the multi-repo conventional-commit sweep.
+The three checks below are no longer behind a `ro sweep` subcommand; they
+run inside `ro commit`, which is being built now.
 
-### `ro sweep commit --path <DIR> --message <MSG>`
-Single repo, single commit. Runs denylist, then quality gates, then a secret
-scan on the dirty files, and only stages if all three pass. Useful when you want
-to control the message yourself.
+### Denylist
+Paths that are never committed: `.env`, `*.pem`, `*.key`, `id_rsa`,
+`**/target/**` and friends. Checked **before** staging, so a denied file is
+never even in the index.
 
-### `ro sweep agent`
-Runs quality gates, a secret scan and a denylist check across one or many repos
-and reports whether each is sweepable. It creates **no commits** — it is a
-readiness check.
+### Secret scan
+Scans the dirty files for credential-shaped text. A file containing
+something that looks like a GitHub token **blocks** the commit, names the
+file and the rule, and redacts the matched value — printing what matched
+would repeat the leak in the message reporting it. Set
+`checkpoint.secret_scan = "warn"` to commit anyway; the default is
+`"block"`.
+
+### Quality gates
+**Off by default.** When on, they run the ecosystem's own checks before
+anything is written. They are opt-in because the check invokes
+`cargo test --workspace` over the *whole* tree, so a pre-existing failure
+in an untouched crate would block a one-file commit.
 
 | Flag | Effect |
 |---|---|
@@ -247,8 +257,8 @@ progress across many repos.
 
 ## Quality gates
 
-`ro sweep commit` and `ro sweep agent` run the ecosystem's own checks before
-touching anything, so a commit cannot land on top of a broken build. Detected
+When enabled, the gates run the ecosystem's own checks before anything is
+written, so a commit cannot land on top of a broken build. Detected
 automatically from the repo: **Rust**, **Node**, **Python**, **Go**.
 
 ---

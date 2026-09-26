@@ -171,21 +171,12 @@ impl<'a> RunOpts<'a> {
     }
 }
 
-/// Run an arbitrary git subcommand inside `repo`.
-///
-/// Use one of the typed helpers when possible; this is the escape hatch for a
-/// caller that needs flags none of them expose.
-#[deprecated(
-    since = "0.2.0",
-    note = "no per-invocation settings are reachable through this. Callers that need \
-            an env var — which is every caller that hands a credential to git — must go \
-            through run_in with RunOpts. This shim exists so the sixteen existing call \
-            sites do not all churn at once; delete it when the sweep namespace goes in \
-            Phase 4."
-)]
-pub fn run(repo: &Path, args: &[&str]) -> Result<GitCommandResult> {
-    run_in(Some(repo), args, &RunOpts::none())
-}
+// The two-argument `run` shim is gone. It existed so the sixteen callers in
+// `commit_sweep.rs` would not all churn at once, and the sweep namespace went
+// in Phase 4 — so it has zero callers and its deprecation note said to
+// delete it at exactly this point. `run_in` is the only way to reach a
+// subprocess now, which is what makes "every credential path sets RunOpts"
+// a property of the API rather than a convention.
 
 /// Run git in `cwd` with `opts`.
 ///

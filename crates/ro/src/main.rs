@@ -9,7 +9,6 @@
 //! - 64: usage error
 
 mod doctor;
-mod ndjson;
 
 use std::path::PathBuf;
 
@@ -24,6 +23,13 @@ enum OutputFormat {
     #[default]
     Text,
     Json,
+    /// One JSON object per line, for a consumer that reads a stream.
+    ///
+    /// Not a second machine format: it is the same objects `json` emits,
+    /// framed so a reader can process twenty repos without holding all
+    /// twenty in memory. That framing is the only difference, and it is
+    /// only worth a variant where there is more than one row.
+    Ndjson,
 }
 
 #[derive(Debug, Parser)]
@@ -182,14 +188,6 @@ enum Commands {
         #[command(subcommand)]
         sub: ConflictCommands,
     },
-
-    // ── Sweep ────────────────────────────────────────────────────────
-    /// Sweep commands (commit, agent)
-    Sweep {
-        #[command(subcommand)]
-        sub: SweepCommands,
-    },
-
     // ── Doctor ───────────────────────────────────────────────────────
     /// Diagnose installation health
     Doctor {
@@ -236,76 +234,6 @@ enum ConflictCommands {
     Abort { repo: String },
     /// Mark a conflict as resolved
     MarkResolved { repo: String },
-}
-
-#[derive(Debug, Subcommand)]
-enum SweepCommands {
-    /// Sweep commit with safety checks
-    Commit {
-        /// Repo path
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Commit message
-        #[arg(long)]
-        message: String,
-    },
-    /// Run sweep agent on a repo (or multiple repos)
-    Agent {
-        /// Repo path
-        #[arg(long, default_value = ".")]
-        path: PathBuf,
-        /// Repo id for tracking
-        #[arg(long)]
-        repo_id: Option<String>,
-        /// Target repos by pattern (e.g. "owner/*")
-        #[arg(long)]
-        repos: Option<String>,
-        /// Target repos by filter (e.g. "tag:needs-fmt", "health:<50")
-        #[arg(long)]
-        filter: Option<String>,
-        /// Target all managed repos
-        #[arg(long)]
-        all: bool,
-        /// Preview without changes
-        #[arg(long)]
-        dry_run: bool,
-        /// NDJSON event stream output
-        #[arg(long)]
-        output: Option<String>,
-    },
-    /// Group dirty worktrees into logical conventional commits across repos
-    CommitSweep {
-        /// Target all managed repos
-        #[arg(long)]
-        all: bool,
-        /// Target repos by pattern (e.g. "owner/*")
-        #[arg(long)]
-        repos: Option<String>,
-        /// Target repos by filter (e.g. "tag:needs-fmt", "health:<50")
-        #[arg(long)]
-        filter: Option<String>,
-        /// Target a single repo by path instead of the tracked inventory
-        #[arg(long)]
-        path: Option<PathBuf>,
-        /// Actually create the commits (default: dry run)
-        #[arg(long)]
-        execute: bool,
-        /// Push each branch after a successful commit
-        #[arg(long)]
-        push: bool,
-        /// Remote to push to (default: origin)
-        #[arg(long)]
-        push_remote: Option<String>,
-        /// Use --force-with-lease instead of a plain push
-        #[arg(long)]
-        force_with_lease: bool,
-        /// Keep manually staged files as a separate `wip` commit
-        #[arg(long)]
-        respect_staging: bool,
-        /// Also commit on protected branches (main, master, release/*, ...)
-        #[arg(long)]
-        allow_protected: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -462,65 +390,6 @@ fn schema_json() -> serde_json::Value {
 }
 
 /// Resolve multi-repo targets from --repos/--filter/--all flags.
-fn resolve_multi_repo_targets(
-    conn: &ro_state::Connection,
-    repos_pattern: Option<&str>,
-    filter: Option<&str>,
-    all: bool,
-    paths: &ConfigPaths,
-) -> Result<Vec<(String, PathBuf)>> {
-    use ro_sync::manage;
-
-    if !all && repos_pattern.is_none() && filter.is_none() {
-        return Ok(Vec::new());
-    }
-
-    let tracked = manage::list(conn, None)?;
-    let mut targets: Vec<(String, PathBuf)> = Vec::new();
-
-    for repo in &tracked {
-        let label = format!("{}/{}", repo.owner, repo.name);
-        let matches = if all {
-            true
-        } else if let Some(pattern) = repos_pattern {
-            let glob =
-                globset::Glob::new(pattern).unwrap_or_else(|_| globset::Glob::new("*").unwrap());
-            let matcher = glob.compile_matcher();
-            matcher.is_match(&label)
-        } else if let Some(filt) = filter {
-            if let Some(rest) = filt.strip_prefix("health:<") {
-                if let Ok(threshold) = rest.parse::<i64>() {
-                    let snap = ro_state::queries::score_repo_health(conn, &repo.id).ok();
-                    snap.is_some_and(|s| s.score < threshold)
-                } else {
-                    false
-                }
-            } else if let Some(rest) = filt.strip_prefix("tag:") {
-                label.contains(rest)
-            } else {
-                filt.starts_with("has:")
-            }
-        } else {
-            false
-        };
-
-        if matches {
-            let local = if repo.local_path.is_empty() {
-                paths
-                    .state_dir
-                    .join("projects")
-                    .join(&repo.owner)
-                    .join(&repo.name)
-            } else {
-                PathBuf::from(&repo.local_path)
-            };
-            targets.push((repo.id.clone(), local));
-        }
-    }
-
-    Ok(targets)
-}
-
 fn run() -> Result<()> {
     use ro_sync::manage;
     use ro_sync::prune;
@@ -530,12 +399,6 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = resolve_paths(&cli)?;
     let db_path = paths.state_db();
-    // Loaded once and threaded into the preflights, which use to have no
-    // configuration at all. `unwrap_or_default` because a command that
-    // never reaches a preflight should not fail on a config it never read.
-    let checkpoint_config = ro_config::load_config(&paths.config_toml())
-        .unwrap_or_default()
-        .checkpoint;
     let non_interactive = cli.non_interactive;
     let _quiet = cli.quiet;
 
@@ -594,7 +457,9 @@ fn run() -> Result<()> {
                 for repo in repos {
                     match format {
                         OutputFormat::Text => println!("{}", repo),
-                        OutputFormat::Json => {
+                        // One object per line, so a consumer can read the
+                        // first repo without waiting for the last.
+                        OutputFormat::Json | OutputFormat::Ndjson => {
                             println!("{}", serde_json::to_string(&repo)?);
                         }
                     }
@@ -637,7 +502,7 @@ fn run() -> Result<()> {
                             .unwrap_or_else(|| r.repo_id.clone());
                         println!("{} action={} status={}", label, r.action, r.status);
                     }
-                    OutputFormat::Json => {
+                    OutputFormat::Json | OutputFormat::Ndjson => {
                         println!("{}", serde_json::to_string(r)?);
                     }
                 }
@@ -684,6 +549,13 @@ fn run() -> Result<()> {
                         }
                     }
                     OutputFormat::Json => {
+                        println!("{}", serde_json::to_string(s)?);
+                    }
+                    // One object per line, no wrapping array. The point
+                    // is that a consumer can start reading before the
+                    // last repo has been walked, which a JSON array of
+                    // twenty rows cannot offer.
+                    OutputFormat::Ndjson => {
                         println!("{}", serde_json::to_string(s)?);
                     }
                 }
@@ -857,311 +729,6 @@ fn run() -> Result<()> {
             }
         }
 
-        // ── Sweep ──
-        Commands::Sweep { sub } => match sub {
-            SweepCommands::Commit { path, message } => {
-                // The preflight's settings come from `[checkpoint]`. They
-                // used to be hardcoded, which is what made the secret-scan
-                // block unreachable — a user could not have turned it on,
-                // because there was nothing to turn.
-                let config = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
-                let result = ro_sweep::commit::sweep_commit(&path, &message, &config.checkpoint)?;
-                // Decided before the match: the arms below move fields out
-                // of `result`, so checking afterwards would read a partially
-                // moved value.
-                //
-                // A block is a failure, and a script driving `ro` cannot see
-                // the message on stderr — only the exit code. Exiting 0 after
-                // refusing to commit reports success for a run that did
-                // nothing, which is how a credential scan gets disabled
-                // "temporarily" and then forgotten.
-                let blocked = !matches!(
-                    result,
-                    ro_sweep::commit::CommitOutcome::Committed { .. }
-                        | ro_sweep::commit::CommitOutcome::NothingToCommit
-                );
-                match result {
-                    ro_sweep::commit::CommitOutcome::Committed { oid, .. } => {
-                        eprintln!("Committed: {oid}");
-                    }
-                    ro_sweep::commit::CommitOutcome::NothingToCommit => {
-                        eprintln!("Nothing to commit.");
-                    }
-                    ro_sweep::commit::CommitOutcome::BlockedByGates { failures } => {
-                        eprintln!("Blocked by quality gates: {}", failures.join(", "));
-                        eprintln!(
-                            "  these run `cargo test --workspace` over the whole tree, so a \
-                             pre-existing failure in an untouched crate can block a one-file \
-                             commit. Set `checkpoint.quality_gates = \"off\"` (the default) to \
-                             skip them, or \"on\" to keep this check."
-                        );
-                    }
-                    ro_sweep::commit::CommitOutcome::BlockedBySecrets { files } => {
-                        eprintln!("Blocked: possible secret in {}", files.join(", "));
-                        eprintln!(
-                            "  the matched text is redacted. Remove the secret, or set \
-                             `checkpoint.secret_scan = \"warn\"` to commit anyway (the \
-                             default is \"block\")."
-                        );
-                    }
-                    ro_sweep::commit::CommitOutcome::BlockedByDenylist { files } => {
-                        eprintln!("Blocked by denylist: {}", files.join(", "));
-                        eprintln!(
-                            "  these paths are never committed. Add to .gitignore to stop seeing this."
-                        );
-                    }
-                }
-                if blocked {
-                    std::process::exit(1);
-                }
-            }
-            SweepCommands::Agent {
-                path,
-                repo_id,
-                repos,
-                filter,
-                all,
-                dry_run,
-                output,
-            } => {
-                let use_ndjson = output.as_deref() == Some("json");
-                // Every NDJSON line goes through the writer, which is what
-                // populates `ts`. The handler used to print
-                // `serde_json::to_string(&event)` directly, so the writer was
-                // dead code in a separate crate where nothing could see it —
-                // and every production line shipped `"ts": null`. Moving the
-                // module into this crate made the compiler point at it.
-                let mut ndjson_out = ndjson::NdjsonWriter::new(std::io::stdout().lock());
-
-                if repos.is_some() || filter.is_some() || all {
-                    let conn = ro_state::open_db(&db_path).context("opening state database")?;
-                    let targets = resolve_multi_repo_targets(
-                        &conn,
-                        repos.as_deref(),
-                        filter.as_deref(),
-                        all,
-                        &paths,
-                    )?;
-                    if use_ndjson {
-                        let event = ndjson::NdjsonEvent::batch_start(
-                            targets.len() as u32,
-                            "sweep-agent",
-                            dry_run,
-                        );
-                        ndjson_out.write_event(event)?;
-                    }
-                    let mut applied = 0u32;
-                    let mut skipped = 0u32;
-                    let mut failed = 0u32;
-                    for (rid, repo_path) in &targets {
-                        if use_ndjson {
-                            let event = ndjson::NdjsonEvent::repo_start(rid);
-                            ndjson_out.write_event(event)?;
-                        }
-                        if dry_run {
-                            eprintln!("[dry-run] would sweep {rid}");
-                            skipped += 1;
-                            if use_ndjson {
-                                let event = ndjson::NdjsonEvent::repo_done(rid, "skipped");
-                                ndjson_out.write_event(event)?;
-                            }
-                            continue;
-                        }
-                        let summary =
-                            ro_sweep::agent::sweep_repo(repo_path, rid, &checkpoint_config)?;
-                        if summary.plan_created {
-                            if use_ndjson {
-                                let event = ndjson::NdjsonEvent::gates_passed(rid, "plan");
-                                ndjson_out.write_event(event)?;
-                            }
-                            // `None` = the gates were off, so they did not
-                            // block. Reporting that as a skip would make
-                            // every repo look blocked by default.
-                            if summary.gates_passed.unwrap_or(true) {
-                                applied += 1;
-                                if use_ndjson {
-                                    let event = ndjson::NdjsonEvent::repo_done(rid, "ok");
-                                    ndjson_out.write_event(event)?;
-                                }
-                            } else {
-                                skipped += 1;
-                                if use_ndjson {
-                                    let event =
-                                        ndjson::NdjsonEvent::repo_done(rid, "needs-approval");
-                                    ndjson_out.write_event(event)?;
-                                }
-                            }
-                        } else {
-                            failed += 1;
-                            if use_ndjson {
-                                let reason = summary.error.as_deref().unwrap_or("gates failed");
-                                let event = ndjson::NdjsonEvent::gates_failed(rid, reason);
-                                ndjson_out.write_event(event)?;
-                                let event = ndjson::NdjsonEvent::repo_done(rid, "failed");
-                                ndjson_out.write_event(event)?;
-                            }
-                        }
-                    }
-                    if use_ndjson {
-                        let event = ndjson::NdjsonEvent::batch_done(applied, skipped, failed);
-                        ndjson_out.write_event(event)?;
-                    } else {
-                        eprintln!(
-                            "Sweep complete: {applied} applied, {skipped} skipped, {failed} failed"
-                        );
-                    }
-                    if use_ndjson {
-                        ndjson_out.flush()?;
-                    }
-                } else {
-                    let id = repo_id.as_deref().unwrap_or("unknown");
-                    let summary = ro_sweep::agent::sweep_repo(&path, id, &checkpoint_config)?;
-                    println!("{}", serde_json::to_string_pretty(&summary)?);
-                }
-            }
-            SweepCommands::CommitSweep {
-                all,
-                repos,
-                filter,
-                path,
-                execute,
-                push,
-                push_remote,
-                force_with_lease,
-                respect_staging,
-                allow_protected,
-            } => {
-                use ro_sweep::commit_sweep::{
-                    RepoOutcome, SkipReason, SweepOptions, apply_repo, plan_repo,
-                };
-
-                let opts = SweepOptions {
-                    execute,
-                    respect_staging,
-                    push,
-                    push_remote,
-                    force_with_lease,
-                    allow_protected,
-                };
-
-                // A --path targets one working copy directly; otherwise the
-                // tracked inventory is resolved, same as sweep agent.
-                let targets: Vec<(String, PathBuf)> = match path {
-                    Some(p) => vec![(p.display().to_string(), p)],
-                    None => {
-                        let conn = ro_state::open_db(&db_path).context("opening state database")?;
-                        resolve_multi_repo_targets(
-                            &conn,
-                            repos.as_deref(),
-                            filter.as_deref(),
-                            all,
-                            &paths,
-                        )?
-                    }
-                };
-
-                if targets.is_empty() {
-                    eprintln!("No repos selected. Use --all, --repos, --filter, or --path.");
-                    return Ok(());
-                }
-
-                if !execute {
-                    eprintln!("Dry run — pass --execute to create commits.\n");
-                }
-
-                let mut plans = Vec::new();
-                for (rid, repo_path) in &targets {
-                    if !repo_path.join(".git").exists() {
-                        eprintln!("{rid}: not a git repo, skipping");
-                        continue;
-                    }
-                    match plan_repo(repo_path, rid, &opts) {
-                        Ok(plan) => plans.push((repo_path.clone(), plan)),
-                        Err(e) => eprintln!("{rid}: {e}"),
-                    }
-                }
-
-                for (_repo_path, plan) in &plans {
-                    if let Some(reason) = &plan.skipped {
-                        match reason {
-                            SkipReason::Clean => continue,
-                            other => {
-                                let detail = match other {
-                                    SkipReason::ProtectedBranch { branch } => {
-                                        format!("protected branch '{branch}'")
-                                    }
-                                    _ => "nothing committable".to_string(),
-                                };
-                                eprintln!("{}: skipped — {detail}", plan.repo_id);
-                                continue;
-                            }
-                        }
-                    }
-                    println!("── {} [{}]", plan.repo_id, plan.branch);
-                    for w in &plan.warnings {
-                        eprintln!("   ⚠ {w}");
-                    }
-                    for c in &plan.commits {
-                        println!("   {}  ({} file(s))", c.message, c.files.len());
-                        for f in &c.files {
-                            println!("      {f}");
-                        }
-                    }
-                }
-
-                if !execute {
-                    let total: usize = plans
-                        .iter()
-                        .filter(|(_, p)| p.skipped.is_none())
-                        .map(|(_, p)| p.commits.len())
-                        .sum();
-                    eprintln!(
-                        "\nPlanned {total} commit(s) across {} repo(s). Pass --execute to apply.",
-                        plans.iter().filter(|(_, p)| p.skipped.is_none()).count()
-                    );
-                    return Ok(());
-                }
-
-                let mut outcomes: Vec<RepoOutcome> = Vec::new();
-                for (repo_path, plan) in &plans {
-                    if plan.skipped.is_some() {
-                        continue;
-                    }
-                    let outcome = apply_repo(repo_path, plan, &opts);
-                    if outcome.failed > 0 {
-                        eprintln!(
-                            "{}: {} committed, {} failed",
-                            outcome.repo_id, outcome.committed, outcome.failed
-                        );
-                    } else {
-                        match &outcome.push_error {
-                            Some(err) => eprintln!(
-                                "{}: {} commit(s), {err}",
-                                outcome.repo_id, outcome.committed
-                            ),
-                            None => eprintln!(
-                                "{}: {} commit(s){}",
-                                outcome.repo_id,
-                                outcome.committed,
-                                if outcome.pushed { ", pushed" } else { "" }
-                            ),
-                        }
-                    }
-                    outcomes.push(outcome);
-                }
-
-                let committed: u32 = outcomes.iter().map(|o| o.committed).sum();
-                let failed: u32 = outcomes.iter().map(|o| o.failed).sum();
-                let pushed = outcomes.iter().filter(|o| o.pushed).count();
-                eprintln!(
-                    "\nSweep complete: {committed} committed, {failed} failed, {pushed} pushed."
-                );
-                if failed > 0 {
-                    std::process::exit(1);
-                }
-            }
-        },
-
         // ── Doctor ──
         Commands::Doctor { fix, format } => {
             let opts = doctor::DoctorOptions {
@@ -1173,7 +740,10 @@ fn run() -> Result<()> {
             let report = doctor::run(opts);
             match format {
                 OutputFormat::Text => println!("{}", doctor::render_text(&report)),
-                OutputFormat::Json => {
+                OutputFormat::Json | OutputFormat::Ndjson => {
+                    // A doctor report is one object, so the two machine
+                    // formats serialise identically here. The variant is
+                    // accepted so the spelling is not command-specific.
                     let json =
                         serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into());
                     println!("{json}");
