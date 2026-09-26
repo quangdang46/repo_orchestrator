@@ -7,6 +7,7 @@
 pub mod conflict;
 pub mod lock;
 pub mod mutation;
+pub mod primitives;
 pub mod read;
 pub mod status;
 
