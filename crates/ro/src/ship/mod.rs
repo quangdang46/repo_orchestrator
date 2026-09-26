@@ -33,6 +33,7 @@
 
 pub mod emit;
 pub mod orchestrator;
+pub mod resolve;
 pub mod summary;
 
 pub use emit::{plan_for, run};
@@ -61,6 +62,7 @@ pub fn run_verb(
     engine: Option<&str>,
     engine_bin: Option<&str>,
     onto: Option<&str>,
+    resolve: bool,
     dry_run: bool,
 ) -> ! {
     // The engine the user named, else the config, else an error naming
@@ -155,6 +157,7 @@ pub fn run_verb(
     let opts = RunOptions {
         how_far,
         state_dir: paths.state_dir.clone(),
+        resolve_conflicts: resolve,
         ..Default::default()
     };
     let summary = if dry_run {

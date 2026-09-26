@@ -210,10 +210,8 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 |-------|---------|--------------|
 | Setup | `init` · `doctor [--fix]` | Config + SQLite; diagnose/repair |
 | Repos | `add` · `remove` · `list` · `import` · `prune --orphans --archive` | Track inventory |
-| Sync | `sync` · `status` · `health` | Working copies + attention |
-| Runs | `run list/show/timeline` | Inspect past runs |
-| Conflicts | `conflict list/explain/abort/mark-resolved` | Merge/rebase recovery |
-| Review | `review plan` (+ apply/rollback flows) | Plan-then-apply |
+| Sync | `sync` · `status` | Working copies + attention |
+| Commit | `commit` · `push` · `ship` | Engine, then commit, then push |
 | Config | `config` | Show / set configuration |
 | Meta | `schema` | Machine-readable CLI reference |
 
@@ -321,16 +319,25 @@ ro doctor
 ro doctor --fix
 ```
 
-### Sync conflicts
+### Conflicts
+
+There is no `ro conflict` verb. A conflict is a **stage** inside
+`ro ship`:
 
 ```bash
-ro conflict list
-ro conflict explain <id>
-# resolve in the working tree, then:
-ro conflict mark-resolved <id>
-# or abort:
-ro conflict abort <id>
+ro ship                       # rebases; on a conflict, reports and hands over
+ro ship --resolve             # asks the engine to resolve it, then verifies
 ```
+
+The engine edits the conflicted files and `git add`s them, and **stops**.
+Then ro checks the index is free of unmerged entries, runs
+`rebase --continue`, and pushes. An agent that did all of that would be a
+tool where every identity guarantee is advice given to a process free to
+ignore it.
+
+`--resolve` is off by default. It is the one step where a model edits
+files mid-rebase, and the overwhelmingly common cause of a rejected push
+is a stale branch — three git commands that need no model at all.
 
 ### Interrupted parallel sync
 

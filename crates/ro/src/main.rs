@@ -185,11 +185,6 @@ enum Commands {
     },
 
     // ── Conflict ─────────────────────────────────────────────────────
-    /// Conflict resolver commands
-    Conflict {
-        #[command(subcommand)]
-        sub: ConflictCommands,
-    },
     /// Commit what the engine finds, and stop
     Commit {
         /// Repos to act on, by name or alias: `ro sync cass voice-ai-agent`
@@ -218,6 +213,14 @@ enum Commands {
         /// The branch the work should land on, when it is not the current one
         #[arg(long)]
         onto: Option<String>,
+        /// Let the engine resolve a merge conflict, then verify and
+        /// continue the rebase ro owns.
+        ///
+        /// Off by default: it is the one step where a model edits files
+        /// mid-rebase. The common cause of a rejected push is a stale
+        /// branch, which is three git commands and no model.
+        #[arg(long)]
+        resolve: bool,
         /// Preview without writing
         #[arg(long)]
         dry_run: bool,
@@ -245,6 +248,14 @@ enum Commands {
         /// The branch the work should land on, when it is not the current one
         #[arg(long)]
         onto: Option<String>,
+        /// Let the engine resolve a merge conflict, then verify and
+        /// continue the rebase ro owns.
+        ///
+        /// Off by default: it is the one step where a model edits files
+        /// mid-rebase. The common cause of a rejected push is a stale
+        /// branch, which is three git commands and no model.
+        #[arg(long)]
+        resolve: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -271,6 +282,14 @@ enum Commands {
         /// The branch the work should land on, when it is not the current one
         #[arg(long)]
         onto: Option<String>,
+        /// Let the engine resolve a merge conflict, then verify and
+        /// continue the rebase ro owns.
+        ///
+        /// Off by default: it is the one step where a model edits files
+        /// mid-rebase. The common cause of a rejected push is a stale
+        /// branch, which is three git commands and no model.
+        #[arg(long)]
+        resolve: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -309,18 +328,6 @@ enum RunCommands {
     Show { run_id: String },
     /// Show timeline for a run
     Timeline { run_id: String },
-}
-
-#[derive(Debug, Subcommand)]
-enum ConflictCommands {
-    /// List conflicted repos
-    List,
-    /// Explain a conflict
-    Explain { repo: String },
-    /// Abort a conflict
-    Abort { repo: String },
-    /// Mark a conflict as resolved
-    MarkResolved { repo: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -513,6 +520,7 @@ fn run() -> Result<()> {
             engine,
             engine_bin,
             onto,
+            resolve,
             dry_run,
         } => ship::run_verb(
             &paths,
@@ -524,6 +532,7 @@ fn run() -> Result<()> {
             engine.as_deref(),
             engine_bin.as_deref(),
             onto.as_deref(),
+            resolve,
             dry_run,
         ),
         Commands::Push {
@@ -534,6 +543,7 @@ fn run() -> Result<()> {
             engine,
             engine_bin,
             onto,
+            resolve,
             dry_run,
         } => ship::run_verb(
             &paths,
@@ -545,6 +555,7 @@ fn run() -> Result<()> {
             engine.as_deref(),
             engine_bin.as_deref(),
             onto.as_deref(),
+            resolve,
             dry_run,
         ),
         Commands::Ship {
@@ -555,6 +566,7 @@ fn run() -> Result<()> {
             engine,
             engine_bin,
             onto,
+            resolve,
             dry_run,
         } => ship::run_verb(
             &paths,
@@ -566,6 +578,7 @@ fn run() -> Result<()> {
             engine.as_deref(),
             engine_bin.as_deref(),
             onto.as_deref(),
+            resolve,
             dry_run,
         ),
 
@@ -847,61 +860,6 @@ fn run() -> Result<()> {
         }
 
         // ── Conflict ──
-        Commands::Conflict { sub } => {
-            let conn = ro_state::open_db(&db_path)
-                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-            match sub {
-                ConflictCommands::List => {
-                    let repos = manage::list(&conn, None)?;
-                    let paths: Vec<PathBuf> =
-                        repos.iter().map(|r| PathBuf::from(&r.local_path)).collect();
-                    let conflicts = ro_git::conflict::list_conflicts(&paths);
-                    if conflicts.is_empty() {
-                        eprintln!("No conflicts.");
-                    }
-                    for (path, state) in &conflicts {
-                        let explanation = ro_git::conflict::explain(state);
-                        println!("{}: {}", path.display(), explanation);
-                    }
-                }
-                ConflictCommands::Explain { repo } => {
-                    let found = manage::find_repo(&conn, &repo)?;
-                    let path = PathBuf::from(&found.local_path);
-                    if let Some(state) = ro_git::conflict::detect(&path)? {
-                        println!("{}", ro_git::conflict::explain(&state));
-                    } else {
-                        eprintln!("No conflict in {repo}.");
-                    }
-                }
-                ConflictCommands::Abort { repo } => {
-                    let found = manage::find_repo(&conn, &repo)?;
-                    let path = PathBuf::from(&found.local_path);
-                    ro_git::conflict::abort(&path)?;
-                    eprintln!("Aborted conflict in {repo}.");
-                }
-                ConflictCommands::MarkResolved { repo } => {
-                    let found = manage::find_repo(&conn, &repo)?;
-                    let path = PathBuf::from(&found.local_path);
-                    // First check if user already staged resolution (no conflict markers, no unmerged)
-                    let already_resolved = match ro_git::conflict::verify_resolved(&path) {
-                        Ok(()) => true,
-                        // Ignore "still in progress" — that's expected if user `git add`'d but hasn't finished merge
-                        Err(ro_git::conflict::MarkResolvedError::OperationStillInProgress(_)) => {
-                            false
-                        }
-                        Err(e) => anyhow::bail!("cannot mark {repo} resolved: {e}"),
-                    };
-                    if already_resolved {
-                        eprintln!("{repo} already resolved.");
-                    } else {
-                        // User resolved files & staged them; finish the merge
-                        ro_git::conflict::finish(&path)
-                            .context("finishing merge after resolution")?;
-                        eprintln!("Marked {repo} as resolved.");
-                    }
-                }
-            }
-        }
 
         // ── Doctor ──
         Commands::Doctor { fix, format } => {

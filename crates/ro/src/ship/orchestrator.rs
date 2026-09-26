@@ -59,6 +59,14 @@ pub enum RepoOutcome {
         reason: String,
         detail: String,
     },
+    /// A conflict the user has to resolve.
+    ///
+    /// Not a failure: nothing is broken, and a run that exits 1 because one
+    /// repo needs a human would train people to ignore the exit code. Not
+    /// a success either — the work did not land — so the summary says so.
+    HandedOver {
+        detail: String,
+    },
     /// Refused before any push was attempted.
     ///
     /// Distinct from `Blocked` and from `Failed`: nothing was wrong with
@@ -94,6 +102,7 @@ impl RepoOutcome {
             RepoOutcome::SkippedConflict { .. } => "skipped: mid-conflict".into(),
             RepoOutcome::Blocked { reason, .. } => format!("blocked: {reason}"),
             RepoOutcome::Refused { branch, .. } => format!("refused: {branch} is protected"),
+            RepoOutcome::HandedOver { detail } => format!("needs you: {detail}"),
             RepoOutcome::Pushed { oid } => format!("pushed {oid}"),
             RepoOutcome::Failed { error } => format!("failed: {error}"),
         }
@@ -168,6 +177,12 @@ pub struct RunOptions {
     /// repository, which is the TOCTOU the lock exists to prevent,
     /// reintroduced through a different door.
     pub state_dir: PathBuf,
+    /// Dispatch the engine on a conflict.
+    ///
+    /// Off by default. It is the only step where a model edits files
+    /// mid-rebase, and the overwhelmingly common cause of a rejected push
+    /// is a stale branch — three git commands that need no model at all.
+    pub resolve_conflicts: bool,
 }
 
 impl Default for RunOptions {
@@ -178,6 +193,7 @@ impl Default for RunOptions {
             parallel: 4,
             dry_run: false,
             state_dir: std::env::temp_dir(),
+            resolve_conflicts: false,
         }
     }
 }
@@ -274,6 +290,49 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                 // exact recovery rather than hoping the user knows it.
                 return RepoOutcome::Failed {
                     error: e.to_string(),
+                };
+            }
+        }
+
+        // (c3) A conflict is a **stage**, not a dead end — but only when
+        // the user asked for it. `--resolve` is off by default because it
+        // is the one step where a model edits files mid-rebase, and a model
+        // resolving a conflict nobody had is worse than a stop.
+        // `?` is not available: `run_one` returns a value, on purpose. A
+        // failed read is a failure for that repo, not for the run.
+        let conflicted = ro_git::conflict::detect(repo)
+            .map_err(|e| RepoOutcome::Failed {
+                error: format!("could not read the conflict state: {e:#}"),
+            })
+            .is_ok_and(|c| c.is_some());
+        if conflicted {
+            let base = base_for(repo);
+            let resolution = crate::ship::resolve::resolve_after_rebase(
+                repo,
+                &base,
+                &plan.engine,
+                crate::ship::resolve::ResolveOptions {
+                    resolve: opts.resolve_conflicts,
+                },
+            );
+            // The stage decides, and the pipeline asks two questions of
+            // it: may the run continue, and if not, what does the user
+            // need. Both are the enum's own answer rather than a match
+            // repeated here.
+            if !resolution.can_push() {
+                let summary = resolution.render();
+                return match resolution {
+                    crate::ship::resolve::Resolution::NeedsUser { files } => {
+                        RepoOutcome::HandedOver {
+                            detail: format!("{summary}: {}", files.join(", ")),
+                        }
+                    }
+                    crate::ship::resolve::Resolution::Failed { error } => {
+                        RepoOutcome::Failed { error }
+                    }
+                    _ => RepoOutcome::Failed {
+                        error: "the rebase did not finish".to_string(),
+                    },
                 };
             }
         }
@@ -1141,4 +1200,13 @@ mod protected_tests {
                 .expect("git is one of the three built-ins"),
         }
     }
+}
+
+/// The branch to rebase onto: the remote's own HEAD, or `main` when there
+/// is no remote.
+fn base_for(repo: &Path) -> String {
+    ro_git::primitives::symbolic_ref(repo, "refs/remotes/origin/HEAD")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "main".to_string())
 }
