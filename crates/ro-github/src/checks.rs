@@ -5,8 +5,9 @@
 //! - **Check runs** — `/repos/{o}/{r}/commits/{sha}/check-runs` (Checks API)
 //! - **Workflow runs** — `/repos/{o}/{r}/actions/runs` (Actions API)
 //!
-//! Both are reduced to [`CheckResult`] rows used by `inbox`, `health`, and
-//! `ci autopsy`.
+//! Both are reduced to [`CheckResult`] rows. The `ro inbox`, `ro health`, and
+//! `ro ci autopsy` commands that used to read them were cut in the Phase 1
+//! repositioning.
 
 use anyhow::{Context, Result};
 use octocrab::Octocrab;
@@ -53,7 +54,7 @@ pub enum CheckSource {
     WorkflowRun,
 }
 
-/// Normalized CI row used by the inbox/health/autopsy commands.
+/// Normalized CI row over GitHub's two CI surfaces.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
     pub source: CheckSource,

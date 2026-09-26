@@ -38,7 +38,6 @@ impl GitCommandResult {
     }
 }
 
-
 /// Options for `fetch`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FetchOpts {

@@ -65,7 +65,10 @@ fn every_ndjson_line_carries_a_real_timestamp() {
     // structurally valid, and every one had `"ts": null` — because the test
     // suite only ever exercised the writer, and the writer was never used.
     let events = Cli::new().sweep_ndjson();
-    assert!(!events.is_empty(), "sweep agent should emit at least a batch_start");
+    assert!(
+        !events.is_empty(),
+        "sweep agent should emit at least a batch_start"
+    );
 
     for ev in &events {
         let kind = ev["event"].as_str().unwrap_or("<none>");
@@ -87,13 +90,18 @@ fn every_ndjson_line_carries_a_real_timestamp() {
 #[test]
 fn the_batch_is_opened_and_closed() {
     let events = Cli::new().sweep_ndjson();
-    let kinds: Vec<&str> = events
-        .iter()
-        .filter_map(|e| e["event"].as_str())
-        .collect();
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["event"].as_str()).collect();
 
-    assert_eq!(kinds.first(), Some(&"batch_start"), "a run must open a batch");
-    assert_eq!(kinds.last(), Some(&"batch_done"), "a run must close a batch");
+    assert_eq!(
+        kinds.first(),
+        Some(&"batch_start"),
+        "a run must open a batch"
+    );
+    assert_eq!(
+        kinds.last(),
+        Some(&"batch_done"),
+        "a run must close a batch"
+    );
     assert!(
         events[0]["repos"].as_u64() == Some(0),
         "an empty registry should report zero repos, got {:?}",

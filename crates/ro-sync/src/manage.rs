@@ -368,7 +368,12 @@ mod tests {
     #[test]
     fn remove_by_alias() {
         let (tmp, conn) = setup();
-        add(&conn, "quangdang46/repo_orchestrator as ro", &projects_dir(&tmp)).unwrap();
+        add(
+            &conn,
+            "quangdang46/repo_orchestrator as ro",
+            &projects_dir(&tmp),
+        )
+        .unwrap();
         let removed = remove(&conn, "ro").unwrap();
         assert_eq!(removed.name, "repo_orchestrator");
     }

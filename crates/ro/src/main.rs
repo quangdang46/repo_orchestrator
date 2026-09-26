@@ -26,7 +26,6 @@ enum OutputFormat {
     Json,
 }
 
-
 #[derive(Debug, Parser)]
 #[command(name = "ro", about = "GitHub-first repo orchestration CLI", version, long_about = None)]
 struct Cli {
@@ -142,9 +141,6 @@ enum Commands {
         delete: bool,
     },
 
-    // ── Health ───────────────────────────────────────────────────────
-    /// Show health score for repos
-
     // ── Runs / Timeline ──────────────────────────────────────────────
     /// Run management commands
     Run {
@@ -158,9 +154,6 @@ enum Commands {
         #[command(subcommand)]
         sub: ConflictCommands,
     },
-
-    // ── Review ───────────────────────────────────────────────────────
-    /// Review plan/apply commands
 
     // ── Sweep ────────────────────────────────────────────────────────
     /// Sweep commands (commit, agent)
@@ -190,7 +183,6 @@ enum Commands {
     // ── Schema ───────────────────────────────────────────────────────
     /// Machine-readable CLI reference, generated from the live command tree
     Schema,
-
 }
 
 #[derive(Debug, Subcommand)]
@@ -298,7 +290,6 @@ enum ConfigCommands {
         pair: String,
     },
 }
-
 
 /// Build a `repo.id -> "owner/name"` map for friendlier text rendering.
 fn repo_labels_by_id(conn: &ro_state::Connection) -> std::collections::HashMap<String, String> {
@@ -430,7 +421,10 @@ fn schema_json() -> serde_json::Value {
     let root = Cli::command();
     let mut o = serde_json::Map::new();
     o.insert("name".into(), root.get_name().into());
-    o.insert("version".into(), root.get_version().unwrap_or_default().into());
+    o.insert(
+        "version".into(),
+        root.get_version().unwrap_or_default().into(),
+    );
     if let Some(about) = root.get_about() {
         o.insert("about".into(), about.to_string().into());
     }
@@ -639,7 +633,9 @@ fn run() -> Result<()> {
             if orphans || archive || delete {
                 use ro_sync::prune::{OrphanAction, find_orphans, handle_orphans};
 
-                if delete && !non_interactive && !std::io::IsTerminal::is_terminal(&std::io::stdin())
+                if delete
+                    && !non_interactive
+                    && !std::io::IsTerminal::is_terminal(&std::io::stdin())
                 {
                     eprintln!(
                         "prune --delete needs an interactive terminal, or pass --non-interactive."
@@ -704,8 +700,6 @@ fn run() -> Result<()> {
                 }
             }
         }
-
-        // ── Health / Inbox ──
 
         // ── Runs / Timeline ──
         Commands::Run { sub } => {
@@ -794,8 +788,6 @@ fn run() -> Result<()> {
             }
         }
 
-        // ── Review ──
-
         // ── Sweep ──
         Commands::Sweep { sub } => match sub {
             SweepCommands::Commit { path, message } => {
@@ -834,8 +826,7 @@ fn run() -> Result<()> {
                 // dead code in a separate crate where nothing could see it —
                 // and every production line shipped `"ts": null`. Moving the
                 // module into this crate made the compiler point at it.
-                let mut ndjson_out =
-                    ndjson::NdjsonWriter::new(std::io::stdout().lock());
+                let mut ndjson_out = ndjson::NdjsonWriter::new(std::io::stdout().lock());
 
                 if repos.is_some() || filter.is_some() || all {
                     let conn = ro_state::open_db(&db_path).context("opening state database")?;
@@ -866,8 +857,7 @@ fn run() -> Result<()> {
                             eprintln!("[dry-run] would sweep {rid}");
                             skipped += 1;
                             if use_ndjson {
-                                let event =
-                                    ndjson::NdjsonEvent::repo_done(rid, "skipped");
+                                let event = ndjson::NdjsonEvent::repo_done(rid, "skipped");
                                 ndjson_out.write_event(event)?;
                             }
                             continue;
@@ -875,24 +865,20 @@ fn run() -> Result<()> {
                         let summary = ro_sweep::agent::sweep_repo(repo_path, rid)?;
                         if summary.plan_created {
                             if use_ndjson {
-                                let event =
-                                    ndjson::NdjsonEvent::gates_passed(rid, "plan");
+                                let event = ndjson::NdjsonEvent::gates_passed(rid, "plan");
                                 ndjson_out.write_event(event)?;
                             }
                             if summary.gates_passed {
                                 applied += 1;
                                 if use_ndjson {
-                                    let event =
-                                        ndjson::NdjsonEvent::repo_done(rid, "ok");
+                                    let event = ndjson::NdjsonEvent::repo_done(rid, "ok");
                                     ndjson_out.write_event(event)?;
                                 }
                             } else {
                                 skipped += 1;
                                 if use_ndjson {
-                                    let event = ndjson::NdjsonEvent::repo_done(
-                                        rid,
-                                        "needs-approval",
-                                    );
+                                    let event =
+                                        ndjson::NdjsonEvent::repo_done(rid, "needs-approval");
                                     ndjson_out.write_event(event)?;
                                 }
                             }
@@ -900,18 +886,15 @@ fn run() -> Result<()> {
                             failed += 1;
                             if use_ndjson {
                                 let reason = summary.error.as_deref().unwrap_or("gates failed");
-                                let event =
-                                    ndjson::NdjsonEvent::gates_failed(rid, reason);
+                                let event = ndjson::NdjsonEvent::gates_failed(rid, reason);
                                 ndjson_out.write_event(event)?;
-                                let event =
-                                    ndjson::NdjsonEvent::repo_done(rid, "failed");
+                                let event = ndjson::NdjsonEvent::repo_done(rid, "failed");
                                 ndjson_out.write_event(event)?;
                             }
                         }
                     }
                     if use_ndjson {
-                        let event =
-                            ndjson::NdjsonEvent::batch_done(applied, skipped, failed);
+                        let event = ndjson::NdjsonEvent::batch_done(applied, skipped, failed);
                         ndjson_out.write_event(event)?;
                     } else {
                         eprintln!(
@@ -957,8 +940,7 @@ fn run() -> Result<()> {
                 let targets: Vec<(String, PathBuf)> = match path {
                     Some(p) => vec![(p.display().to_string(), p)],
                     None => {
-                        let conn =
-                            ro_state::open_db(&db_path).context("opening state database")?;
+                        let conn = ro_state::open_db(&db_path).context("opening state database")?;
                         resolve_multi_repo_targets(
                             &conn,
                             repos.as_deref(),
@@ -1044,7 +1026,10 @@ fn run() -> Result<()> {
                         );
                     } else {
                         match &outcome.push_error {
-                            Some(err) => eprintln!("{}: {} commit(s), {err}", outcome.repo_id, outcome.committed),
+                            Some(err) => eprintln!(
+                                "{}: {} commit(s), {err}",
+                                outcome.repo_id, outcome.committed
+                            ),
                             None => eprintln!(
                                 "{}: {} commit(s){}",
                                 outcome.repo_id,

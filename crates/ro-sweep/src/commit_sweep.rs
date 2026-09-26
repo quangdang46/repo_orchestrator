@@ -81,9 +81,7 @@ fn is_test(path: &str, base: &str) -> bool {
     if base.starts_with("test_") {
         return true;
     }
-    const BASE_SUFFIXES: [&str; 5] = [
-        "_test.rs", "_test.go", "_test.py", "_test.js", "_test.ts",
-    ];
+    const BASE_SUFFIXES: [&str; 5] = ["_test.rs", "_test.go", "_test.py", "_test.js", "_test.ts"];
     BASE_SUFFIXES.iter().any(|s| base.ends_with(s))
 }
 
@@ -96,10 +94,7 @@ fn is_doc(path: &str, base: &str) -> bool {
     if EXTENSIONS.iter().any(|e| base.ends_with(e)) {
         return true;
     }
-    matches!(
-        base,
-        "CHANGELOG" | "CHANGES" | "AUTHORS" | "CONTRIBUTORS"
-    )
+    matches!(base, "CHANGELOG" | "CHANGES" | "AUTHORS" | "CONTRIBUTORS")
 }
 
 fn is_config(path: &str, base: &str) -> bool {
@@ -124,10 +119,7 @@ fn is_config(path: &str, base: &str) -> bool {
         return true;
     }
     base.ends_with(".conf")
-        || matches!(
-            base,
-            ".gitignore" | ".editorconfig"
-        )
+        || matches!(base, ".gitignore" | ".editorconfig")
         || base.starts_with(".prettierrc")
         || base.starts_with(".eslintrc")
 }
@@ -151,9 +143,7 @@ fn task_id_of(branch: &str) -> Option<String> {
         return Some(m[1].to_string());
     }
     let re_ticket = regex::Regex::new(r"([A-Z]+-[0-9]+)").ok()?;
-    re_ticket
-        .captures(branch)
-        .map(|m| m[1].to_string())
+    re_ticket.captures(branch).map(|m| m[1].to_string())
 }
 
 /// True when the branch must not be committed to or pushed by a sweep.
@@ -379,7 +369,13 @@ pub fn plan_repo(repo: &Path, repo_id: &str, opts: &SweepOptions) -> Result<Repo
             continue;
         }
         let scope = scope_of(&files[0]);
-        let mut message = format!("{}({}): update {} {}", bucket.prefix(&code), scope, scope, bucket_name(bucket));
+        let mut message = format!(
+            "{}({}): update {} {}",
+            bucket.prefix(&code),
+            scope,
+            scope,
+            bucket_name(bucket)
+        );
         if let Some(t) = &task {
             message.push_str(&format!(" ({t})"));
         }
@@ -477,10 +473,8 @@ pub fn apply_repo(repo: &Path, plan: &RepoPlan, opts: &SweepOptions) -> RepoOutc
                 match mutation::push(repo, &popts) {
                     Ok(res) if res.status == 0 => outcome.pushed = true,
                     Ok(res) => {
-                        outcome.push_error = Some(format!(
-                            "push rejected: {}",
-                            first_line(&res.stderr)
-                        ));
+                        outcome.push_error =
+                            Some(format!("push rejected: {}", first_line(&res.stderr)));
                     }
                     Err(e) => outcome.push_error = Some(format!("push failed: {e}")),
                 }
@@ -615,7 +609,11 @@ mod tests {
             .iter()
             .find(|c| c.bucket == Bucket::Source)
             .unwrap();
-        assert!(source.message.starts_with("feat(src):"), "{}", source.message);
+        assert!(
+            source.message.starts_with("feat(src):"),
+            "{}",
+            source.message
+        );
     }
 
     #[test]

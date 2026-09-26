@@ -1,7 +1,9 @@
 //! GitHub issue and PR listing.
 //!
 //! Fetches open issues and open pull requests for a repository, normalizing
-//! the relevant subset of fields used by `ro inbox` and `ro health`.
+//! the relevant subset of fields. The `ro inbox` and `ro health` commands that
+//! used to consume this were cut in the Phase 1 repositioning; the rows are
+//! still what a caller gets from this module.
 
 use anyhow::{Context, Result};
 use octocrab::Octocrab;

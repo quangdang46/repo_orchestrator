@@ -160,7 +160,11 @@ fn paths_equivalent(a: &str, b: &str) -> bool {
 fn normalize_separators(p: &str) -> String {
     let unified = p.replace('\\', "/");
     let trimmed = unified.trim_end_matches('/');
-    if trimmed.is_empty() { "/".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 pub fn find_orphans(conn: &Connection, root: &Path) -> Result<Vec<Orphan>> {
@@ -553,7 +557,10 @@ mod tests {
              exactly the case the fallback exists for"
         );
         assert!(
-            !paths_equivalent(&with_trailing, &root.join("bob").join("other").to_string_lossy()),
+            !paths_equivalent(
+                &with_trailing,
+                &root.join("bob").join("other").to_string_lossy()
+            ),
             "the fallback must still distinguish genuinely different paths"
         );
     }

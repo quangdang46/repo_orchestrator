@@ -38,7 +38,9 @@ fn schema() -> Value {
         .arg("--state-dir")
         .arg(state_dir.path())
         .arg("schema");
-    cmd.assert().success().stdout(predicate::str::is_empty().not());
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::is_empty().not());
 
     let out = cmd.output().expect("ro schema should run");
     serde_json::from_slice(&out.stdout).expect("ro schema must emit valid JSON")
@@ -52,7 +54,10 @@ fn schema_emits_valid_json_with_an_identity() {
         !s["version"].as_str().unwrap_or_default().is_empty(),
         "schema should carry a version, so a consumer can tell what it is reading"
     );
-    assert!(s.get("commands").is_some(), "schema should have a commands array");
+    assert!(
+        s.get("commands").is_some(),
+        "schema should have a commands array"
+    );
 }
 
 #[test]
@@ -105,9 +110,7 @@ fn schema_arguments_use_the_flat_stable_shape() {
         .iter()
         .find(|c| c["name"] == "add")
         .expect("add should exist");
-    let spec = &add["args"]
-        .as_array()
-        .expect("add should take arguments")[0];
+    let spec = &add["args"].as_array().expect("add should take arguments")[0];
 
     // The point of flattening: a consumer reads these keys without knowing
     // anything about clap's Arg type.
@@ -177,7 +180,14 @@ fn schema_documents_nothing_that_was_removed() {
     // the test is that the machine-readable surface cannot keep advertising a
     // command the binary no longer has — the failure that took three commits
     // and a hand-written JSON literal to notice.
-    for gone in ["import", "fork", "self-update", "robot-docs", "health", "review"] {
+    for gone in [
+        "import",
+        "fork",
+        "self-update",
+        "robot-docs",
+        "health",
+        "review",
+    ] {
         assert!(
             !reported.contains(&gone),
             "`{gone}` was removed but `ro schema` still advertises it"

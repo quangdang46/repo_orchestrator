@@ -106,10 +106,7 @@ fn every_command_named_in_the_docs_exists() {
         }
     }
 
-    let mut missing: Vec<String> = claimed
-        .into_iter()
-        .filter(|w| !live.contains(w))
-        .collect();
+    let mut missing: Vec<String> = claimed.into_iter().filter(|w| !live.contains(w)).collect();
     missing.sort();
 
     assert!(
