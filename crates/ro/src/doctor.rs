@@ -160,6 +160,11 @@ impl DoctorReport {
 /// Inputs to the doctor.  Allows tests to override paths and env lookups.
 #[derive(Debug, Clone, Default)]
 pub struct DoctorOptions {
+    /// A token supplied on the command line, for a one-off run.
+    ///
+    /// Deliberately not stored and not a config layer: a token on argv is
+    /// visible to every process on the machine via ps.
+    #[allow(dead_code)]
     pub config_token: Option<String>,
     pub fix: bool,
     /// Override `PATH`-based binary discovery (for tests). When `None`, use the
@@ -182,7 +187,7 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
 
     let mut checks = Vec::new();
     checks.push(check_git());
-    checks.push(check_github_auth(opts.config_token.as_deref()));
+    checks.push(check_github_auth());
 
     let paths = opts.paths.clone().unwrap_or_else(|| {
         ConfigPaths::discover().unwrap_or_else(|_| {
@@ -245,18 +250,39 @@ fn check_git() -> CheckResult {
     }
 }
 
-fn check_github_auth(config_token: Option<&str>) -> CheckResult {
-    match discover_token("auto", config_token) {
-        Ok(_token) => CheckResult::ok(
+/// Report whether a GitHub token is available, and where it came from.
+///
+/// Both sources are probed and named rather than one being tried until
+/// something works. `auto` used to do exactly that, with every error
+/// swallowed — so a run could push with a credential nobody chose and the only
+/// evidence was that it worked. Naming the source is what turns "it found a
+/// token" into something a user can check against what they expected.
+fn check_github_auth() -> CheckResult {
+    let env_result = discover_token("env");
+    let gh_result = if env_result.is_err() {
+        discover_token("gh").err()
+    } else {
+        None
+    };
+
+    match (env_result, gh_result) {
+        (Ok(_), _) => CheckResult::ok(
             "github_auth",
             Severity::Required,
-            "GitHub token discovered via env/config/gh",
+            "GitHub token found: GH_TOKEN or GITHUB_TOKEN in the environment",
         ),
-        Err(e) => CheckResult::fail(
+        (Err(_), None) => CheckResult::ok(
+            "github_auth",
+            Severity::Optional,
+            "no token in the environment, but `gh auth token` works — ro will use it",
+        ),
+        (Err(e), Some(_)) => CheckResult::fail(
             "github_auth",
             Severity::Required,
             format!("no GitHub token available: {e}"),
-            "set GITHUB_TOKEN env var, run `gh auth login`, or set [github].token in config.toml",
+            "set GH_TOKEN (preferred) or GITHUB_TOKEN, or run `gh auth login`. \
+             For a per-repo credential, set `credential_ref` on the row to \
+             'env:VAR_NAME' so the variable is named for that repo specifically.",
         ),
     }
 }

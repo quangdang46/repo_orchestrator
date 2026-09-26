@@ -55,28 +55,66 @@ impl AuthToken {
 }
 
 /// Discover a GitHub token using the given strategy.
-///
 /// Strategies (per PLAN.md §12.6):
-/// - `"env"`: read `GITHUB_TOKEN` env var only.
-/// - `"gh"`: shell out to `gh auth token` only.
-/// - `"config-token"`: caller must supply a token; this method validates it's non-empty.
-/// - `"auto"`: try env → config token (if supplied) → gh CLI, in order.
-pub fn discover_token(strategy: &str, config_token: Option<&str>) -> Result<AuthToken> {
+/// - `"env"`: read `GH_TOKEN`, then `GITHUB_TOKEN`, from the environment.
+/// - `"gh"`: shell out to `gh auth token`.
+///
+/// The two that used to be here are **deleted**, not deprecated:
+///
+/// - `auto` was `from_env().or_else(from_config).or_else(from_gh_cli)` with
+///   every error swallowed. That is precisely the silent fallback the design
+///   forbids: a run can push via a credential nobody chose, and the only
+///   trace is that it worked. The caller now names the source it wants.
+/// - `config-token` could never succeed. It required the caller to supply a
+///   token, and the config key that would have held one (`token`) does not
+///   exist — there is no `token` key, in any layer, in any version after the
+///   credential reference landed. It was reachable and always empty.
+pub fn discover_token(strategy: &str) -> Result<AuthToken> {
     match strategy {
         "env" => from_env(),
         "gh" => from_gh_cli(),
-        "config-token" => from_config(config_token),
-        "auto" => auto(config_token),
-        _ => bail!("unknown auth strategy: {strategy}"),
+        other => bail!(
+            "unknown auth strategy: {other}\n\
+             expected 'env' (read GH_TOKEN or GITHUB_TOKEN) or 'gh' (run \
+             `gh auth token`). There is no 'auto': a strategy that falls back \
+             silently can push with a credential nobody chose."
+        ),
     }
 }
 
+/// `GH_TOKEN` before `GITHUB_TOKEN`, matching gh CLI precedence.
+///
+/// The order is not cosmetic. When both are set they are usually *different*
+/// accounts — an exported work token plus a shell-level personal one — and
+/// picking the other one produces a push as the wrong person with no error
+/// anywhere. gh itself prefers `GH_TOKEN`, so a user who has both set is
+/// already living with gh's answer.
+///
+/// `var_os`, not `var`: a token is bytes, and `var` fails on a non-UTF-8 value
+/// with an error that reads like the variable is missing. `AuthToken` holds a
+/// `String`, so a non-UTF-8 value cannot be used — but it must be reported as
+/// *this variable is not valid UTF-8*, not as *not set*, or the two are
+/// indistinguishable from the outside and the fallback path gets taken.
 fn from_env() -> Result<AuthToken> {
-    let token = env::var("GITHUB_TOKEN").context("GITHUB_TOKEN env var not set")?;
-    if token.is_empty() {
-        bail!("GITHUB_TOKEN env var is empty");
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        match env::var_os(name) {
+            None => continue,
+            Some(value) => {
+                let Some(token) = value.to_str() else {
+                    bail!("{name} is set but is not valid UTF-8");
+                };
+                if token.is_empty() {
+                    bail!("{name} is set but empty");
+                }
+                return Ok(AuthToken::new(token));
+            }
+        }
     }
-    Ok(AuthToken::new(token))
+    bail!(
+        "no token in the environment: set GH_TOKEN (preferred) or GITHUB_TOKEN.\n\
+         For a per-repo credential, set `credential_ref` on the row to \
+         'env:VAR_NAME' so the variable is named for that repo specifically."
+    )
 }
 
 fn from_gh_cli() -> Result<AuthToken> {
@@ -96,23 +134,6 @@ fn from_gh_cli() -> Result<AuthToken> {
         bail!("`gh auth token` returned empty output — are you logged in?");
     }
     Ok(AuthToken::new(token))
-}
-
-fn from_config(token: Option<&str>) -> Result<AuthToken> {
-    let Some(token) = token else {
-        bail!("no config token provided for 'config-token' strategy");
-    };
-    if token.is_empty() {
-        bail!("config token is empty");
-    }
-    Ok(AuthToken::new(token))
-}
-
-fn auto(config_token: Option<&str>) -> Result<AuthToken> {
-    from_env()
-        .or_else(|_| from_config(config_token))
-        .or_else(|_| from_gh_cli())
-        .context("tried GITHUB_TOKEN, config token, and `gh auth token`; all failed")
 }
 
 /// Build an octocrab client with the given token and optional host.
@@ -219,36 +240,92 @@ mod tests {
         assert_eq!(t.redact(), "****");
     }
 
+    /// Every `GH_TOKEN` / `GITHUB_TOKEN` case, in one test.
+    ///
+    /// Consolidated deliberately. These are process-global variables and Rust
+    /// runs tests in parallel threads, so four separate tests each setting
+    /// them interfere with each other — the first version of this passed
+    /// `GH_TOKEN`/`GITHUB_TOKEN` as separate tests and `gh_token_wins` read the
+    /// value another test had just written. One test, one thread, restored
+    /// between cases.
     #[test]
-    fn config_token_happy() {
-        let t = discover_token("config-token", Some("my-secret")).unwrap();
-        assert_eq!(t.as_str(), "my-secret");
+    fn env_precedence_and_absence() {
+        // SAFETY: single test body, no other thread in this binary touches
+        // these variables, and each case restores what it set.
+        unsafe {
+            env::remove_var("GH_TOKEN");
+            env::remove_var("GITHUB_TOKEN");
+
+            // 1. Both set, and they are different accounts. GH_TOKEN wins,
+            //    matching gh CLI. The order is load-bearing: picking the other
+            //    one pushes as the wrong person with no error anywhere.
+            env::set_var("GH_TOKEN", "gh-token-value");
+            env::set_var("GITHUB_TOKEN", "github-token-value");
+            assert_eq!(
+                discover_token("env").unwrap().as_str(),
+                "gh-token-value",
+                "GH_TOKEN must win over GITHUB_TOKEN"
+            );
+
+            // 2. GITHUB_TOKEN alone.
+            env::remove_var("GH_TOKEN");
+            assert_eq!(
+                discover_token("env").unwrap().as_str(),
+                "github-token-value",
+                "GITHUB_TOKEN is the fallback"
+            );
+
+            // 3. An empty GH_TOKEN is an error, not a fall-through. Skipping
+            //    it would silently promote GITHUB_TOKEN — a different
+            //    account — over what was almost certainly a typo.
+            env::set_var("GH_TOKEN", "");
+            let err = discover_token("env").unwrap_err();
+            assert!(
+                format!("{err}").contains("GH_TOKEN is set but empty"),
+                "an empty variable must be reported, not skipped: {err}"
+            );
+
+            // 4. Neither. The message names both, and the per-repo form,
+            //    because that is the answer for a fleet.
+            env::remove_var("GH_TOKEN");
+            env::remove_var("GITHUB_TOKEN");
+            let err = discover_token("env").unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("GH_TOKEN"), "must name the preferred: {msg}");
+            assert!(
+                msg.contains("GITHUB_TOKEN"),
+                "must name the fallback: {msg}"
+            );
+            assert!(
+                msg.contains("env:VAR_NAME"),
+                "must point at the per-repo form: {msg}"
+            );
+        }
     }
 
+    /// The two deleted strategies must stay deleted. A test that asserts a
+    /// removal is the only thing that stops it creeping back in as a
+    /// "compatibility" default.
     #[test]
-    fn config_token_missing() {
-        let err = discover_token("config-token", None).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("no config token"), "msg: {msg}");
-    }
-
-    #[test]
-    fn config_token_empty() {
-        let err = discover_token("config-token", Some("")).unwrap_err();
-        let msg = format!("{err}");
-        assert!(msg.contains("config token is empty"), "msg: {msg}");
+    fn auto_and_config_token_are_rejected_with_a_reason() {
+        for strategy in ["auto", "config-token"] {
+            let err = discover_token(strategy).unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("unknown auth strategy"),
+                "{strategy} must not be accepted, got: {msg}"
+            );
+            assert!(
+                msg.contains("no 'auto'"),
+                "the error must say why, so nobody re-adds it: {msg}"
+            );
+        }
     }
 
     #[test]
     fn unknown_strategy() {
-        let err = discover_token("nope", None).unwrap_err();
+        let err = discover_token("nope").unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("unknown auth strategy: nope"), "msg: {msg}");
-    }
-
-    #[test]
-    fn auto_with_config_token() {
-        let t = discover_token("auto", Some("fallback-token")).unwrap();
-        assert_eq!(t.as_str(), "fallback-token");
     }
 }
