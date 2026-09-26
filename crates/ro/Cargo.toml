@@ -47,5 +47,9 @@ toml_edit.workspace = true
 tempfile.workspace = true
 
 [dev-dependencies]
+# The end-to-end credential test needs a fake engine that tries to observe its
+# environment and a real bare remote, so the guarantee is checked against a
+# real chain rather than a unit test of one link.
+ro-testkit = { path = "../ro-testkit" }
 assert_cmd.workspace = true
 predicates.workspace = true
