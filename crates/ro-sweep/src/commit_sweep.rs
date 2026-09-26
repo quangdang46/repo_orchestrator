@@ -191,7 +191,11 @@ fn parse_porcelain(raw: &str) -> Vec<StatusEntry> {
 /// git collapses an untracked directory into a single `dir/` entry, which
 /// would commit the whole tree in one opaque step.
 fn read_status(repo: &Path) -> Result<Vec<StatusEntry>> {
-    let out = mutation::run(repo, &["status", "--porcelain=v1", "-z", "-uall"])?;
+    let out = ro_git::mutation::run_in(
+        Some(repo),
+        &["status", "--porcelain=v1", "-z", "-uall"],
+        &ro_git::mutation::RunOpts::none(),
+    )?;
     if out.status != 0 {
         anyhow::bail!("git status failed: {}", out.stderr.trim());
     }
@@ -201,7 +205,11 @@ fn read_status(repo: &Path) -> Result<Vec<StatusEntry>> {
 /// Files already staged by the user, kept as their own group when
 /// `respect_staging` is set.
 fn read_staged(repo: &Path) -> Result<Vec<String>> {
-    let out = mutation::run(repo, &["diff", "--cached", "--name-only", "-z"])?;
+    let out = ro_git::mutation::run_in(
+        Some(repo),
+        &["diff", "--cached", "--name-only", "-z"],
+        &ro_git::mutation::RunOpts::none(),
+    )?;
     if out.status != 0 {
         return Ok(Vec::new());
     }
@@ -429,7 +437,11 @@ pub fn verify_push_safe(repo: &Path, branch: &str, remote: &str) -> Result<()> {
     if is_protected_branch(branch) {
         anyhow::bail!("refusing to push protected branch '{branch}'");
     }
-    let out = mutation::run(repo, &["remote", "get-url", remote])?;
+    let out = ro_git::mutation::run_in(
+        Some(repo),
+        &["remote", "get-url", remote],
+        &ro_git::mutation::RunOpts::none(),
+    )?;
     if out.status != 0 {
         anyhow::bail!("remote '{remote}' not configured");
     }
@@ -496,7 +508,11 @@ fn first_line(s: &str) -> String {
 
 /// Current branch name, or `HEAD` when detached.
 pub fn current_branch(repo: &Path) -> Result<String> {
-    let out = mutation::run(repo, &["symbolic-ref", "--short", "HEAD"])?;
+    let out = ro_git::mutation::run_in(
+        Some(repo),
+        &["symbolic-ref", "--short", "HEAD"],
+        &ro_git::mutation::RunOpts::none(),
+    )?;
     if out.status == 0 {
         let b = out.stdout.trim();
         if !b.is_empty() {
@@ -583,10 +599,30 @@ mod tests {
     fn plan_is_dry_run_and_groups_buckets() {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = dir.path();
-        mutation::run(repo, &["init", "-q", "-b", "feature/x"]).unwrap();
-        mutation::run(repo, &["config", "user.email", "t@example.com"]).unwrap();
-        mutation::run(repo, &["config", "user.name", "T"]).unwrap();
-        mutation::run(repo, &["config", "commit.gpgSign", "false"]).unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["init", "-q", "-b", "feature/x"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["config", "user.email", "t@example.com"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["config", "user.name", "T"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["config", "commit.gpgSign", "false"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
 
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::create_dir_all(repo.join("tests")).unwrap();
@@ -601,7 +637,12 @@ mod tests {
         assert_eq!(plan.commits.len(), 3, "source + test + doc");
 
         // dry run must not have created any commit
-        let log = mutation::run(repo, &["rev-list", "--count", "HEAD"]).unwrap();
+        let log = ro_git::mutation::run_in(
+            Some(repo),
+            &["rev-list", "--count", "HEAD"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
         assert_ne!(log.status, 0, "no commit should exist after planning");
 
         let source = plan
@@ -620,7 +661,12 @@ mod tests {
     fn protected_branch_yields_no_commits() {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = dir.path();
-        mutation::run(repo, &["init", "-q", "-b", "main"]).unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["init", "-q", "-b", "main"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
         std::fs::write(repo.join("a.txt"), b"x\n").unwrap();
 
         let plan = plan_repo(repo, "o/r", &SweepOptions::default()).unwrap();
@@ -635,7 +681,12 @@ mod tests {
     fn clean_repo_is_skipped() {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = dir.path();
-        mutation::run(repo, &["init", "-q", "-b", "feature/x"]).unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["init", "-q", "-b", "feature/x"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
 
         let plan = plan_repo(repo, "o/r", &SweepOptions::default()).unwrap();
         assert!(matches!(plan.skipped, Some(SkipReason::Clean)));
@@ -645,10 +696,30 @@ mod tests {
     fn apply_creates_one_commit_per_bucket() {
         let dir = tempfile::TempDir::new().unwrap();
         let repo = dir.path();
-        mutation::run(repo, &["init", "-q", "-b", "feature/x"]).unwrap();
-        mutation::run(repo, &["config", "user.email", "t@example.com"]).unwrap();
-        mutation::run(repo, &["config", "user.name", "T"]).unwrap();
-        mutation::run(repo, &["config", "commit.gpgSign", "false"]).unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["init", "-q", "-b", "feature/x"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["config", "user.email", "t@example.com"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["config", "user.name", "T"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
+        ro_git::mutation::run_in(
+            Some(repo),
+            &["config", "commit.gpgSign", "false"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
 
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::create_dir_all(repo.join("tests")).unwrap();
@@ -666,7 +737,12 @@ mod tests {
         assert_eq!(outcome.failed, 0);
         assert!(!outcome.pushed, "no push requested");
 
-        let count = mutation::run(repo, &["rev-list", "--count", "HEAD"]).unwrap();
+        let count = ro_git::mutation::run_in(
+            Some(repo),
+            &["rev-list", "--count", "HEAD"],
+            &ro_git::mutation::RunOpts::none(),
+        )
+        .unwrap();
         assert_eq!(count.stdout.trim(), "2");
     }
 }

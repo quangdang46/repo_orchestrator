@@ -14,6 +14,6 @@ pub use conflict::{ConflictOp, ConflictState, ConflictedFile};
 pub use lock::RepoLock;
 pub use mutation::{
     CloneOpts, CloneOutcome, FetchOpts, GitCommandResult, PullOpts, PullOutcome, PullStrategy,
-    PushOpts,
+    PushOpts, RunOpts, run_in,
 };
 pub use status::{AheadBehind, RepoStatus};
