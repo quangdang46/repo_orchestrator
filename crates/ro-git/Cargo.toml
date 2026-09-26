@@ -10,15 +10,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-ro-core.workspace = true
 gix.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
 fs4.workspace = true
-regex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

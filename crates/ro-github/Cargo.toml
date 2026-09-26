@@ -17,8 +17,6 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-reqwest.workspace = true
-time.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]

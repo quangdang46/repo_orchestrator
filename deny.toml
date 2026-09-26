@@ -33,17 +33,16 @@ feature-depth = 1
 version = 2
 yanked = "deny"
 # Tracked exceptions:
-# RUSTSEC-2025-0119 — `number_prefix` is unmaintained but only enters via
-# `indicatif` <= 0.17.x; revisit when upstream switches to `unit-prefix`.
 # RUSTSEC-2025-0140 — `gix-date` <= 0.9.x is yanked/unmaintained, transitive
 # via `gix 0.71.x`. Revisit when gix bumps to a release that pulls in
 # gix-date >= 0.12.0.
-# RUSTSEC-2024-0436 was removed here: both `paste` and `rmcp` left the lockfile
-# when the AI sidecar was cut, so the advisory no longer names anything in the
-# graph. Leaving it is at best noise and at worst a cargo-deny hard failure on
-# the next version bump.
+# Two advisories are no longer listed because nothing in the graph names them:
+#   - RUSTSEC-2024-0436 (`paste`) left with `rmcp` when the AI sidecar was cut.
+#   - RUSTSEC-2025-0119 (`number_prefix`) left with `indicatif` when the unused
+#     progress-bar dependencies were dropped from `ro-sync`.
+# An ignore naming nothing in the graph is at best noise and at worst a hard
+# failure on the next cargo-deny version bump, so both were removed.
 ignore = [
-    "RUSTSEC-2025-0119",
     "RUSTSEC-2025-0140",
 ]
 

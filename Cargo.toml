@@ -44,20 +44,15 @@ tracing         = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap            = { version = "4.5", features = ["derive", "env", "string"] }
 rusqlite        = { version = "0.34", features = ["bundled", "modern_sqlite"] }
-gix             = { version = "0.71", features = ["max-performance"] }
+gix             = { version = "0.71" }
 octocrab        = { version = "0.44", features = ["retry"] }
 fs4             = "0.13"
 reqwest         = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sha2            = "0.10"
 regex           = "1.11"
 indexmap        = "2.7"
 toml            = "0.8"
 dirs            = "5.0"
-indicatif       = "0.17"
-console          = "0.15"
-owo-colors      = "4.1"
-comfy-table     = "7.1"
-time             = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+time             = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 uuid             = { version = "1.16", features = ["v4", "serde"] }
 chrono          = { version = "0.4", features = ["serde"] }
 humantime        = "2.1"
