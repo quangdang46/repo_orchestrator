@@ -137,17 +137,54 @@ fn from_gh_cli() -> Result<AuthToken> {
 }
 
 /// Build an octocrab client with the given token and optional host.
+/// Build a client against github.com, or against a named host.
+///
+/// Resolution order:
+/// 1. `GITHUB_API_URL`, verbatim. The operator who set it knows where their API
+///    root is — an Enterprise instance, a proxy, a mirror — and guessing at a
+///    path on top of it is how a correct setting gets overridden into a wrong
+///    one. This is the same variable `gh` honours.
+/// 2. A GitHub Enterprise host, which serves its API under `/api/v3`, not at
+///    the root. Omitting that suffix produces a client whose every call 404s,
+///    which reads as "the token is wrong" and sends the user to re-login when
+///    re-login cannot help. That was the behaviour before.
+/// 3. `github.com` and `api.github.com`, which are at the root.
 pub fn build_client(token: &AuthToken, host: Option<&str>) -> Result<octocrab::Octocrab> {
     let builder = octocrab::Octocrab::builder().personal_token(token.as_str().to_string());
+
+    if let Some(explicit) = env::var("GITHUB_API_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        return build_client_with_base_uri(token, &explicit);
+    }
+
     let builder = match host {
-        Some(h) if h != "github.com" => {
-            let base_url = format!("https://{h}");
+        Some(h) if h != "github.com" && h != "api.github.com" => {
+            let base_url = format!("https://{h}/api/v3");
             let msg = format!("setting GitHub base URI to {base_url}");
             builder.base_uri(base_url).context(msg)?
         }
         _ => builder,
     };
     builder.build().context("building octocrab client")
+}
+
+/// Build a client against an explicit base URI, scheme and all.
+///
+/// Separate from [`build_client`] because two callers need different things:
+/// production wants a host name and the Enterprise `/api/v3` suffix, while a
+/// test wants to point at a plain-HTTP loopback server it controls. Folding
+/// the two together would mean either special-casing `localhost` in the
+/// production path or making the test speak TLS.
+pub fn build_client_with_base_uri(token: &AuthToken, base_uri: &str) -> Result<octocrab::Octocrab> {
+    let base_uri = base_uri.trim_end_matches('/');
+    octocrab::Octocrab::builder()
+        .personal_token(token.as_str().to_string())
+        .base_uri(base_uri)
+        .context("setting GitHub base URI")?
+        .build()
+        .context("building octocrab client")
 }
 
 #[cfg(test)]

@@ -188,7 +188,6 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(check_git());
     checks.push(check_github_auth());
-
     let paths = opts.paths.clone().unwrap_or_else(|| {
         ConfigPaths::discover().unwrap_or_else(|_| {
             // fallback to tmp dir for testability - in real usage this should not fail
@@ -205,6 +204,13 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
     checks.push(cfg_check);
 
     checks.push(check_state(&paths, opts.fix));
+
+    // Per-repository write access, one row each. This is the check that turns a
+    // 403 discovered at the push step — after four other repos have already
+    // been pushed — into a warning before any of them were touched.
+    if let Ok(conn) = ro_state::open_db(&paths.state_dir.join("state.db")) {
+        checks.extend(check_repo_write_access(&conn));
+    }
 
     // Previously `let _ = applied_fix_count; // reserved for future scoring` —
     // a count computed, named, and dropped. It is now reported, because a
@@ -248,6 +254,90 @@ fn check_git() -> CheckResult {
             "install git from https://git-scm.com/downloads",
         ),
     }
+}
+
+/// Probe write access for every tracked repo.
+///
+/// One [`CheckResult`] per repo rather than a single rolled-up verdict,
+/// because the whole point is to say *which* repository will fail. A doctor
+/// that stops at the first bad row tells the user one thing when there are
+/// three, and the three have nothing to do with each other.
+///
+/// A repo that cannot be probed is reported, not skipped: "unresolvable" and
+/// "resolved but forbidden" both make a push fail and need different fixes, so
+/// neither is allowed to disappear.
+///
+/// No token means no probes at all — there is nothing to probe *with*, and
+/// reporting twenty `Unresolvable` rows would bury the single fact that
+/// matters.
+fn check_repo_write_access(conn: &ro_state::Connection) -> Vec<CheckResult> {
+    let Ok(token) = ro_github::auth::discover_token("env") else {
+        return vec![CheckResult::warn(
+            "github_auth",
+            Severity::Optional,
+            "skipping the per-repository write check: no token in the environment",
+            None,
+        )];
+    };
+
+    let repos = match ro_sync::manage::list(conn, None) {
+        Ok(r) => r,
+        Err(e) => {
+            return vec![CheckResult::fail(
+                "repos",
+                Severity::Required,
+                format!("could not read the registry: {e}"),
+                "run `ro list` to see whether the state database is readable".to_string(),
+            )];
+        }
+    };
+    if repos.is_empty() {
+        return vec![CheckResult::ok(
+            "repos",
+            Severity::Optional,
+            "no repos tracked yet — run `ro add` first",
+        )];
+    }
+
+    repos
+        .iter()
+        .map(|repo| {
+            // `owner/name`, not `Display`, which appends " as <alias>" — a
+            // string that belongs in a listing, not in a sentence about a URL.
+            let slug = format!("{}/{}", repo.owner, repo.name);
+            let access =
+                ro_github::permissions::probe_write_access(&token, &repo.owner, &repo.name, None);
+            let name = format!("repo:{slug}");
+            match &access {
+                ro_github::permissions::WriteAccess::Granted { .. } => {
+                    CheckResult::ok(&name, Severity::Optional, access.render())
+                }
+                ro_github::permissions::WriteAccess::Forbidden { login, .. } => CheckResult::fail(
+                    &name,
+                    Severity::Required,
+                    format!("{} — a push to this repo will be refused", access.render()),
+                    format!(
+                        "the credential is {login}; ask a repository admin for write access, \
+                             or point this repo at another account with \
+                             `ro config set repos.{}.credential_ref env:OTHER_VAR`",
+                        slug
+                    ),
+                ),
+                ro_github::permissions::WriteAccess::Unresolvable { reason } => {
+                    // A distinct verdict from Forbidden on purpose. "The token
+                    // did not work" and "the token worked and was still
+                    // refused" look the same from the outside and are fixed by
+                    // opposite actions.
+                    CheckResult::fail(
+                        &name,
+                        Severity::Required,
+                        format!("{} — could not determine write access", access.render()),
+                        format!("{reason}; this is a credential problem, not a permission one"),
+                    )
+                }
+            }
+        })
+        .collect()
 }
 
 /// Report whether a GitHub token is available, and where it came from.
