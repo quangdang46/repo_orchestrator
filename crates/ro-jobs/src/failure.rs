@@ -1,95 +1,39 @@
-//! Failure classification.
+//! Failure classification - persistence for it.
 //!
-//! When a run exits non-zero, we classify the root cause so the
-//! orchestrator can decide whether to retry, escalate, or auto-rollback.
+//! The `FailureClass` taxonomy itself lives in `ro-core` and is re-exported
+//! here, so `ro_jobs::FailureClass` and `ro_core::FailureClass` are the same
+//! type rather than two that happen to have the same name.
 //!
-//! Classes per PLAN.md §14: auth_error, rate_limited, merge_conflict,
-//! dirty_worktree, network_timeout, missing_git, missing_provider,
-//! quality_gate_failed, secret_scan_blocked, github_permission_denied.
+//! What stays here is the genuinely jobs-shaped part: the SQLite `failures`
+//! table, the fingerprinting that lets one cause be counted across runs, and
+//! the exit-code-aware entry point.
 
+// `pub use` rather than a plain `use`: this both brings the type into scope for
+// the SQLite half below and re-exports it, so `ro_jobs::FailureClass` and
+// `ro_core::FailureClass` are the same type rather than two that happen to
+// share a name and a shape.
+pub use ro_core::FailureClass;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
-/// Classification of a run failure. Each variant maps to a specific
-/// recovery strategy in the orchestrator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FailureClass {
-    AuthError,
-    RateLimited,
-    MergeConflict,
-    DirtyWorktree,
-    NetworkTimeout,
-    MissingGit,
-    MissingProvider,
-    QualityGateFailed,
-    SecretScanBlocked,
-    GithubPermissionDenied,
-}
-
-impl fmt::Display for FailureClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = serde_json::to_value(self)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{self:?}"));
-        f.write_str(&s)
-    }
-}
-
-/// Whether a failure class is retryable (transient) or not (permanent).
-impl FailureClass {
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            FailureClass::RateLimited | FailureClass::NetworkTimeout | FailureClass::MergeConflict
-        )
-    }
-
-    pub fn is_fatal(&self) -> bool {
-        !self.is_retryable()
-    }
-}
-
-/// Classify a non-zero exit code + stderr heuristics into a failure class.
+/// Classify a process exit code plus its stderr.
 ///
-/// This mirrors the git heuristic in `ro_git::mutation::GitErrorKind` but
-/// operates at the job level so it can also capture quality-gate and
-/// secret-scan failures.
-pub fn classify(exit_code: i32, stderr: &str) -> FailureClass {
-    let s = stderr.to_ascii_lowercase();
-    if s.contains("authentication") || s.contains("permission denied") || s.contains("403") {
-        if s.contains("github") || s.contains("api.github.com") {
-            FailureClass::GithubPermissionDenied
-        } else {
-            FailureClass::AuthError
-        }
-    } else if s.contains("rate limit") || s.contains("429") {
-        FailureClass::RateLimited
-    } else if s.contains("merge conflict") || s.contains("conflict in") {
-        FailureClass::MergeConflict
-    } else if s.contains("dirty")
-        || s.contains("uncommitted changes")
-        || s.contains("your local changes")
-    {
-        FailureClass::DirtyWorktree
-    } else if s.contains("timed out") || s.contains("connection refused") || s.contains("network") {
-        FailureClass::NetworkTimeout
-    } else if s.contains("git: not found") || s.contains("'git' is not recognized") {
-        FailureClass::MissingGit
-    } else if s.contains("quality gate") || s.contains("clippy") || s.contains("test failed") {
-        FailureClass::QualityGateFailed
-    } else if s.contains("secret") || s.contains("blocked by secret scan") {
-        FailureClass::SecretScanBlocked
-    } else if s.contains("provider") && (s.contains("not found") || s.contains("missing")) {
-        FailureClass::MissingProvider
-    } else {
-        // Fallback: use exit code heuristics
-        match exit_code {
-            1 => FailureClass::AuthError,
-            2 => FailureClass::NetworkTimeout,
-            _ => FailureClass::AuthError,
-        }
+/// The exit code is consulted **first** for the one thing only it can say: 126
+/// and 127 are "could not execute", which is [`FailureClass::MissingGit`]
+/// when the child was the VCS binary. Everything else defers to the text,
+/// because the tools overlap exit codes for causes that need opposite
+/// responses - 1 is both "auth failed" and "network flaked", and only the text
+/// separates them.
+pub fn classify_exit(exit_code: i32, stderr: &str) -> FailureClass {
+    if exit_code == 126 || exit_code == 127 {
+        return FailureClass::MissingGit;
+    }
+    if !stderr.trim().is_empty() {
+        return FailureClass::classify(stderr);
+    }
+    // No output at all. The code is all there is.
+    match exit_code {
+        2 => FailureClass::NetworkTimeout,
+        _ => FailureClass::AuthError,
     }
 }
 
@@ -242,7 +186,7 @@ mod tests {
     #[test]
     fn classify_auth_error() {
         assert_eq!(
-            classify(1, "Authentication failed for repository"),
+            classify_exit(1, "Authentication failed for repository"),
             FailureClass::AuthError
         );
     }
@@ -250,7 +194,7 @@ mod tests {
     #[test]
     fn classify_github_permission_denied() {
         assert_eq!(
-            classify(1, "github: Permission denied to api.github.com"),
+            classify_exit(1, "github: Permission denied to api.github.com"),
             FailureClass::GithubPermissionDenied
         );
     }
@@ -258,7 +202,7 @@ mod tests {
     #[test]
     fn classify_rate_limited() {
         assert_eq!(
-            classify(1, "rate limit exceeded, retry after 60s"),
+            classify_exit(1, "rate limit exceeded, retry after 60s"),
             FailureClass::RateLimited
         );
     }
@@ -266,7 +210,7 @@ mod tests {
     #[test]
     fn classify_merge_conflict() {
         assert_eq!(
-            classify(1, "CONFLICT (content): Merge conflict in src/main.rs"),
+            classify_exit(1, "CONFLICT (content): Merge conflict in src/main.rs"),
             FailureClass::MergeConflict
         );
     }
@@ -274,7 +218,7 @@ mod tests {
     #[test]
     fn classify_dirty_worktree() {
         assert_eq!(
-            classify(1, "your local changes would be overwritten"),
+            classify_exit(1, "your local changes would be overwritten"),
             FailureClass::DirtyWorktree
         );
     }
@@ -282,20 +226,23 @@ mod tests {
     #[test]
     fn classify_network_timeout() {
         assert_eq!(
-            classify(1, "fatal: connection timed out"),
+            classify_exit(1, "fatal: connection timed out"),
             FailureClass::NetworkTimeout
         );
     }
 
     #[test]
     fn classify_missing_git() {
-        assert_eq!(classify(127, "git: not found"), FailureClass::MissingGit);
+        assert_eq!(
+            classify_exit(127, "git: not found"),
+            FailureClass::MissingGit
+        );
     }
 
     #[test]
     fn classify_quality_gate() {
         assert_eq!(
-            classify(1, "quality gate failed: clippy reported errors"),
+            classify_exit(1, "quality gate failed: clippy reported errors"),
             FailureClass::QualityGateFailed
         );
     }
@@ -303,7 +250,7 @@ mod tests {
     #[test]
     fn classify_secret_scan() {
         assert_eq!(
-            classify(1, "blocked by secret scan: AWS key found"),
+            classify_exit(1, "blocked by secret scan: AWS key found"),
             FailureClass::SecretScanBlocked
         );
     }
@@ -311,7 +258,7 @@ mod tests {
     #[test]
     fn classify_missing_provider() {
         assert_eq!(
-            classify(1, "provider not found: claude"),
+            classify_exit(1, "provider not found: claude"),
             FailureClass::MissingProvider
         );
     }

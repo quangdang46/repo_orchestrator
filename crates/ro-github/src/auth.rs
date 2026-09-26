@@ -6,6 +6,13 @@
 use anyhow::{Context, Result, bail};
 use std::env;
 
+// The auth vocabulary lives in ro-core, which both this crate and ro-config
+// depend on. An earlier draft had `AuthPolicy` defined here as well as in
+// ro-config, which required the two crates to depend on each other. Re-exported
+// rather than redefined so existing callers of `ro_github::auth::*` keep
+// working and keep getting the one definition.
+pub use ro_core::{AuthPolicy, AuthProvider, CommitIdentity, CredentialRef};
+
 /// A GitHub token, never displayed in full.
 #[derive(Clone, Debug)]
 pub struct AuthToken(String);
