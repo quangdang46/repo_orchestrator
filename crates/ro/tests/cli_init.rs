@@ -260,3 +260,71 @@ fn ship_dry_run_changes_nothing() {
         "a dry run must not commit, log was: {subjects}"
     );
 }
+
+/// The removed names still work, for one release.
+///
+/// A script that breaks on a rename is a script the user has to read the
+/// release notes to fix. This asserts the alias reaches the **same** place
+/// as the real command, not merely that it parses — an alias that printed
+/// a deprecation and then said "unrecognized" would pass a weaker test.
+#[test]
+fn the_removed_names_still_work() {
+    let t = Test::initialised();
+
+    // `ro robot-docs` -> `ro schema`
+    let old = t.cmd().arg("robot-docs").output().unwrap();
+    assert!(
+        old.status.success(),
+        "ro robot-docs must still resolve: {}",
+        String::from_utf8_lossy(&old.stderr)
+    );
+    let current = t.cmd().arg("schema").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&old.stdout),
+        String::from_utf8_lossy(&current.stdout),
+        "the alias must reach the same output as the command it stands for"
+    );
+
+    // `ro health` -> `ro list`
+    let old = t.cmd().arg("health").output().unwrap();
+    assert!(
+        old.status.success(),
+        "ro health must still resolve: {}",
+        String::from_utf8_lossy(&old.stderr)
+    );
+    let current = t.cmd().arg("list").output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&old.stdout),
+        String::from_utf8_lossy(&current.stdout)
+    );
+}
+
+/// And the deprecation says what to type instead.
+///
+/// Printing "deprecated" without the replacement is a message that sends
+/// the reader to the docs, which is the thing that moved.
+#[test]
+fn the_legacy_spelling_names_its_replacement() {
+    let t = Test::initialised();
+    let out = t
+        .cmd()
+        .args([
+            "ship",
+            "--commit-sweep",
+            "--execute",
+            "--engine",
+            "git",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ro ship"),
+        "the message must name the replacement, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("removed"),
+        "and say when it goes away, got: {stderr}"
+    );
+}

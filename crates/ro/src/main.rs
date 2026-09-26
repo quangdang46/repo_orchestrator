@@ -108,6 +108,10 @@ enum Commands {
     },
 
     /// List tracked repos
+    ///
+    /// `ro health` was this command. A hidden alias for one release,
+    /// so an existing script keeps working.
+    #[command(alias = "health")]
     List {
         /// Filter by owner
         #[arg(long)]
@@ -292,6 +296,19 @@ enum Commands {
         resolve: bool,
         #[arg(long)]
         dry_run: bool,
+        /// The old `ro sweep commit-sweep`, for one release.
+        ///
+        /// A flag rather than a hidden subcommand: clap's optional
+        /// subcommands have to be enums, and an enum whose only
+        /// purpose is to survive one release earns less than the flag
+        /// it would replace. The translation is mechanical:
+        /// `--execute` becomes the default, since the new verb opts
+        /// out with `--dry-run` rather than in.
+        #[arg(long, hide = true)]
+        commit_sweep: bool,
+        /// The old opt-in switch. Now the default.
+        #[arg(long, hide = true)]
+        execute: bool,
     },
 
     // ── Doctor ───────────────────────────────────────────────────────
@@ -314,6 +331,9 @@ enum Commands {
 
     // ── Schema ───────────────────────────────────────────────────────
     /// Machine-readable CLI reference, generated from the live command tree
+    ///
+    /// `ro robot-docs` was this command. Hidden alias, one release.
+    #[command(alias = "robot-docs")]
     Schema,
 }
 
@@ -566,21 +586,47 @@ fn run() -> Result<()> {
             engine,
             engine_bin,
             onto,
+            commit_sweep,
+            execute,
             resolve,
             dry_run,
-        } => ship::run_verb(
-            &paths,
-            ship::HowFar::Ship,
-            &named,
-            glob.as_deref(),
-            filter.as_deref(),
-            all,
-            engine.as_deref(),
-            engine_bin.as_deref(),
-            onto.as_deref(),
-            resolve,
-            dry_run,
-        ),
+        } => {
+            // The old `ro sweep commit-sweep` spelling, for one release.
+            // A script that breaks on a rename is a script the user has to
+            // read the release notes to fix.
+            if commit_sweep {
+                eprintln!(
+                    "warning: ro sweep commit-sweep is now ro ship, and is removed \
+                     in the next release. This spelling still works for one release."
+                );
+                ship::run_verb(
+                    &paths,
+                    ship::HowFar::Ship,
+                    /* named */ &[],
+                    /* pattern */ None,
+                    /* filter */ None,
+                    /* all */ true,
+                    /* engine */ None,
+                    /* engine_bin */ None,
+                    /* onto */ None,
+                    /* resolve */ false,
+                    /* dry_run */ !execute,
+                );
+            }
+            ship::run_verb(
+                &paths,
+                ship::HowFar::Ship,
+                &named,
+                glob.as_deref(),
+                filter.as_deref(),
+                all,
+                engine.as_deref(),
+                engine_bin.as_deref(),
+                onto.as_deref(),
+                resolve,
+                dry_run,
+            );
+        }
 
         // ── Repo management ──
         Commands::Init => {
