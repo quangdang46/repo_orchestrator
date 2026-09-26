@@ -118,6 +118,31 @@ pub fn ahead_behind(repo_path: &Path, upstream: &str) -> Result<AheadBehind> {
     Ok(AheadBehind { ahead, behind })
 }
 
+/// The URL of a named remote, if it has one.
+///
+/// Separate from `has_remote` because "does it have one" and "what is it" are
+/// different questions, and the second is needed to adopt a checkout: a row
+/// needs a `clone_url`, and there is no honest way to invent one when the
+/// answer is available for the cost of one git call.
+///
+/// Returns `None` for a non-repo, a missing remote, or a query failure — the
+/// last deliberately not distinguished, because every caller's correct
+/// response to all three is the same.
+pub fn remote_url(repo_path: &Path, remote: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["remote", "get-url", remote])
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() { None } else { Some(url) }
+}
+
 /// Return true if the repository has a remote with the given name.
 ///
 /// Returns false if the path is not a git repo or the remote query fails.

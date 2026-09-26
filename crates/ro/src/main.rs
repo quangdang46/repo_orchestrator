@@ -61,8 +61,36 @@ enum Commands {
 
     /// Add a repo to tracking
     Add {
-        /// Repo spec: owner/repo, github.com/owner/repo, https://..., etc.
+        /// A remote spec (owner/repo, github.com/owner/repo, https://…, git@…)
+        /// to clone, or a path to an existing checkout to adopt in place.
+        ///
+        /// The two are told apart structurally: a recognised host prefix is a
+        /// spec, anything else that is a git checkout is a path, and anything
+        /// else is refused by name.
         spec: String,
+        /// Display and lookup alias.
+        #[arg(long)]
+        name: Option<String>,
+        /// Where a remote clone lands.
+        #[arg(long)]
+        clone_to: Option<PathBuf>,
+        /// Branch to clone. A clone parameter with no lifetime — it is
+        /// deliberately not cached on the row.
+        #[arg(long)]
+        branch: Option<String>,
+        /// Per-repo credential *reference*, `env:VAR` or `keychain:ENTRY`.
+        /// A pasted token is an error, not a value.
+        #[arg(long)]
+        credential: Option<String>,
+        /// Per-repo engine for this row.
+        #[arg(long)]
+        engine: Option<String>,
+        /// Which `[identity.*]` profile commits this repo.
+        #[arg(long)]
+        author: Option<String>,
+        /// Tag this repo. Repeatable.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
     },
 
     /// Remove a repo from tracking
@@ -518,11 +546,31 @@ fn run() -> Result<()> {
             }
         }
 
-        Commands::Add { spec } => {
+        Commands::Add {
+            spec,
+            name,
+            clone_to,
+            branch,
+            credential,
+            engine,
+            author,
+            tags,
+        } => {
             let conn = ro_state::open_db(&db_path).context("opening state database")?;
             let projects_dir = paths.state_dir.join("projects");
-            let repo = manage::add(&conn, &spec, &projects_dir).context("adding repo")?;
+            let opts = manage::AddOptions {
+                name,
+                clone_to,
+                branch,
+                credential_ref: credential,
+                engine,
+                author_ref: author,
+                tags,
+            };
+            let repo = manage::add_from_input(&conn, &spec, &projects_dir, &opts)
+                .context("adding repo")?;
             eprintln!("Added: {}/{} (id={})", repo.owner, repo.name, repo.id);
+            eprintln!("  path: {}", repo.local_path);
         }
 
         Commands::Remove { key } => {
