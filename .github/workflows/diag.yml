@@ -1,0 +1,12 @@
+name: Windows diagnostic
+on:
+  push:
+    branches: ["worktree-diagnostic"]
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the three failing tests
+        run: cargo test -p ro-engine --test agent_engines -- --nocapture 2>&1 | Select-String -Pattern "FAILED|panicked|left:|right:|assertion"
