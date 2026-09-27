@@ -65,7 +65,13 @@ fn a_failing_shim_exits_with_its_code() {
     let out =
         // SAFETY: the body only spawns a process and reads its output.
         unsafe {
-            shim.with_on_path(|| Command::new("gh").arg("pr").arg("list").output().unwrap())
+            shim.with_on_path(|| {
+                Command::new(shim.program())
+                    .arg("pr")
+                    .arg("list")
+                    .output()
+                    .unwrap()
+            })
         };
 
     assert!(
@@ -274,7 +280,7 @@ fn the_engine_shim_makes_a_real_commit() {
             .shim(&engine)
             .var("RO_TESTKIT_WORKDIR", &workdir)
             .run(|| {
-                Command::new("claude")
+                Command::new(engine.program())
                     .arg("-p")
                     .arg("do the thing")
                     .output()

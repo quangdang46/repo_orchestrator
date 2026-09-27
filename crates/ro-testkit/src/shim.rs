@@ -268,6 +268,46 @@ exit /b 0"#
         self.dir.path()
     }
 
+    /// The command to spawn in order to run this shim.
+    ///
+    /// **A path, not the bare name, and that is not a style choice.** A
+    /// probe run on a real `windows-latest` runner — after two fixes
+    /// based on guessing — showed that `std::process::Command` does
+    /// **not** apply `PATHEXT` to a bare name:
+    ///
+    /// ```text
+    /// Command::new("claude")   with PATH prepended  => program not found
+    /// Command::new("claude")   after env_clear      => program not found
+    /// Command::new(".../claude.cmd")                => ok, out="ran"
+    /// ```
+    ///
+    /// So a shim on Windows is reached by its file, and the shim is
+    /// looked up on the caller's behalf. Resolving it here rather than at
+    /// each call site means a test cannot forget and cannot get it subtly
+    /// wrong on the one platform that needs it.
+    pub fn program(&self) -> std::path::PathBuf {
+        let file = self.file_name();
+        if self.dir.path().is_absolute() {
+            return self.dir.path().join(&file);
+        }
+        std::fs::canonicalize(self.dir.path().join(&file)).unwrap_or_else(|_| {
+            // Not yet on disk. The plain join still names it, and a caller
+            // that reaches this is about to get a spawn error naming the
+            // path it tried.
+            self.dir.path().join(&file)
+        })
+    }
+
+    /// The file this shim actually is on this platform: `gh.cmd` on
+    /// Windows, `gh` elsewhere.
+    pub fn file_name(&self) -> String {
+        if cfg!(windows) {
+            format!("{}.cmd", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+
     /// This shim's name, e.g. `gh`.
     pub fn name(&self) -> &str {
         &self.name

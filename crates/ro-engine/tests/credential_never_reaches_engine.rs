@@ -205,7 +205,7 @@ fn a_spawned_engine_reports_no_credential() {
     let captured = unsafe {
         TestEnv::new().var("GH_TOKEN", token).shim(&engine).run(|| {
             let env = ChildEnv::from_parent();
-            let out = Command::new("claude")
+            let out = Command::new(engine.program())
                 .arg("-p")
                 .arg("do the thing")
                 .env_clear()

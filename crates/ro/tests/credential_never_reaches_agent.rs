@@ -99,7 +99,7 @@ fn the_credential_never_reaches_the_agent() {
                     let env = ChildEnv::from_parent()
                         .with_identity(None)
                         .with_additions(&[]);
-                    Command::new("claude")
+                    Command::new(agent.program())
                         .arg("-p")
                         .arg("do the thing")
                         .current_dir(work.path())
@@ -199,7 +199,7 @@ fn ro_output_carries_no_pat_shaped_string() {
     let agent_out = unsafe {
         TestEnv::new().shim(&agent).var("GH_TOKEN", CRED_A).run(|| {
             let env = ChildEnv::from_parent();
-            Command::new("claude")
+            Command::new(agent.program())
                 .arg("-p")
                 .arg("x")
                 .current_dir(work.path())
