@@ -111,30 +111,13 @@ idempotent by construction — which is a better answer than resuming.
 Per-repo state: current branch, whether the worktree is dirty, and how far
 ahead or behind the remote it is. Omit the repo to get every tracked repo.
 
-### `ro prune`
-Two independent kinds of cleanup.
-
-**Database-level** — forgets repos from the inventory:
-
-| Flag | Removes |
-|---|---|
-| `--archived` | Repos marked archived |
-| `--missing` | Repos whose local path no longer exists on disk |
-
-**Disk-level** — finds working copies that are in the projects directory but
-*not* in the inventory:
-
-| Flag | Effect |
-|---|---|
-| `--orphans` | Report only. |
-| `--archive` | Move to `<state-dir>/archived/<name>_<timestamp>` |
-| `--delete` | Delete permanently. |
-
-`--delete` refuses to run without an interactive terminal unless
-`--non-interactive` is passed, and `--archive` and `--delete` are mutually
-exclusive. The scan descends at most 4 levels and never enters `.git`,
-`node_modules` or `target`; a working copy is treated as a leaf, so its own
-subdirectories are not mistaken for separate repos.
+### `ro prune` — removed
+There is no `ro prune`. It was cut, and nothing replaced it: forgetting a
+repo is `ro remove`, and reclaiming its disk is `ro remove --delete`, which
+asks first and prints the path it is about to remove. The two kinds of
+cleanup that lived here were the same operation spelled twice, and the
+destructive one had no gate at all — see "What is deliberately absent"
+below.
 
 ---
 
@@ -175,9 +158,16 @@ in an untouched crate would block a one-file commit.
 
 ## Conflict recovery
 
-### `ro conflict list` / `explain <ID>` / `abort <ID>` / `mark-resolved <ID>`
-Surfaces repos with an in-progress merge or rebase, explains what state each
-one is in, and lets you bail out or record that you have handled it by hand.
+### There is no `ro conflict` verb
+A conflict is a **stage inside `ro sync`**, not a namespace. `ro sync`
+reports the conflicted files and stops; it does not resolve them for you,
+because the file a conflict lands in is a decision only you can make.
+`ro ship --resolve` is the one exception and it is opt-in for the same
+reason: a model editing a file mid-rebase is the one step where ro would be
+rewriting work rather than organising it.
+
+To bail out by hand, the underlying git commands are the interface:
+`git rebase --abort`, `git merge --abort`, `git rebase --continue`.
 
 ---
 
@@ -224,15 +214,16 @@ version, and for each command its `about`, its arguments (`name`, `long`,
 
 This replaces `ro robot-docs <TOPIC>`, which was a hand-written JSON literal. It
 had already drifted in four places before being cut: it omitted `commit-sweep`
-from the sweep subcommands, omitted `--orphans/--archive/--delete` from `prune`,
-listed only two output formats, and recommended `ro health` in its quickstart. A
+from the sweep subcommands, omitted `--orphans/--archive/--delete` from the (since-removed) `prune`,
+listed only two output formats, and recommended the (since-removed)
+`ro health` command in its quickstart. A
 mirror of a clap tree that is written by hand is wrong the moment it is written,
 and nothing in the build or the test suite can see it.
 
 **Compatibility break.** `ro schema` is a live command-tree dump, which is a
 different artifact from the old topic-addressed summary. Anything parsing
-`ro robot-docs commands` or `ro robot-docs quickstart` needs to move to
-`ro schema` and the new shape.
+removed `ro robot-docs commands` or `ro robot-docs quickstart` needs to move
+to `ro schema` and the new shape.
 
 ---
 

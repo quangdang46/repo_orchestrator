@@ -30,6 +30,20 @@ pub struct RepoStatus {
     /// flattened into a boolean — "unknown" alone sends the user hunting
     /// for which of twenty rows is unmeasured and why.
     pub unmeasurable_reason: Option<String>,
+    /// Is the current branch one `ro` refuses to commit to directly?
+    ///
+    /// A fact, not a verdict. It belongs beside dirty and ahead/behind
+    /// because every one of those is a thing that decides whether the next
+    /// `ro ship` will work, and a user who has to run a command to learn
+    /// that `main` is protected learns it one run too late.
+    pub is_protected: bool,
+    /// Is a merge or rebase in progress here?
+    ///
+    /// Also a fact, and also in the same list for the same reason: it is
+    /// the one condition that makes every other field on the row — the
+    /// ahead/behind comparison in particular — not mean what it appears to
+    /// mean.
+    pub in_conflict: bool,
     pub last_synced_at: Option<i64>,
 }
 
@@ -143,15 +157,29 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
         .ok()
         .flatten();
 
+    // Resolved before the struct literal, because two of the fields want
+    // to *look* at the branch and one wants to own it.
+    let effective = branch.clone().or(tracked_branch.clone());
+    let is_protected = effective
+        .as_deref()
+        .is_some_and(ro_git::primitives::is_protected_branch);
+    let in_conflict = ro_git::conflict::detect(&path).ok().flatten().is_some();
+
     Ok(RepoStatus {
         repo_id: repo_id.to_string(),
         owner,
         name,
-        branch: branch.or(tracked_branch),
+        branch: effective,
         is_dirty,
         ahead,
         behind,
         unmeasurable_reason,
+        // Both are read from the working copy rather than from the row,
+        // because both are properties of *this* checkout right now: a repo
+        // can be tracked against `main` while sitting on a feature branch,
+        // and it is the branch it is on that the next `ro ship` will use.
+        is_protected,
+        in_conflict,
         last_synced_at,
     })
 }

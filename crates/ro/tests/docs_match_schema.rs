@@ -21,6 +21,10 @@ use serde_json::Value;
 const COMMANDS: &[(&str, &str)] = &[
     ("init", "create the config and the state database"),
     ("add", "track a repository, cloning or adopting one"),
+    (
+        "remove",
+        "stop tracking a repository, and optionally delete its working copy",
+    ),
     ("list", "show what is tracked"),
     ("status", "what state each repository is in"),
     ("sync", "bring every tracked repository up to date"),
@@ -92,24 +96,113 @@ fn every_live_command_is_documented() {
     );
 }
 
+/// The nearest char boundary at or below `i`.
+///
+/// The docs are full of box-drawing characters, and slicing `text` at an
+/// arbitrary byte index panics rather than returning `None`. A window that
+/// starts or ends inside one is simply nudged outward — the exact edge
+/// never decides whether a mention is a denial.
+fn floor_boundary(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil_boundary(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
+/// Phrases that make a mention a *denial* rather than an advertisement.
+const DENIALS: &[&str] = &[
+    "no `ro",
+    "There is no",
+    "there is no",
+    "removed",
+    "deleted",
+    "replaces",
+    "not a command",
+    "no longer",
+    "was cut",
+    "were cut",
+    "is cut",
+    "cut.",
+];
+
 #[test]
 fn no_documented_command_is_gone() {
     let live = live_commands();
     let text = docs();
-    let mut ghosts = Vec::new();
-    for (name, _) in COMMANDS {
-        if live.iter().any(|c| c == name) {
-            continue;
-        }
-        if text.contains(&format!("ro {name} ")) || text.contains(&format!("`ro {name}`")) {
-            ghosts.push(*name);
+    let mut ghosts: Vec<String> = Vec::new();
+
+    // Scanned **out of the prose**, not out of `COMMANDS`. The old version
+    // walked the hand-written list, so the check only ever asked about
+    // commands somebody remembered to write down: delete a command from the
+    // binary *and* from this list in the same commit and the test is
+    // silent — which is precisely what happened to `prune` and `run`.
+    //
+    // The scan reads the two shapes a doc actually uses to show a command
+    // someone can type: inside backticks, or at the start of a line. Both
+    // are unambiguous. Ordinary prose ("ro tracks many repos") matches
+    // neither, so the test needs no allowlist of English.
+    let mut offset = 0usize;
+    for raw in text.lines() {
+        let base = offset;
+        offset += raw.len() + 1;
+        let line = raw.trim_start().trim_start_matches("$ ").trim();
+        let candidates = raw
+            .match_indices('`')
+            .step_by(2)
+            .filter_map(|(i, _)| {
+                raw.get(i + 1..)
+                    .and_then(|r| r.find('`').map(|j| &raw[i + 1..i + 1 + j]))
+            })
+            .chain(std::iter::once(line))
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+
+        for c in candidates {
+            let Some(rest) = c.strip_prefix("ro ") else {
+                continue;
+            };
+            let word: String = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+                .collect();
+            // A passage that *denies* the command is correct documentation,
+            // not a ghost: "There is no `ro conflict` verb" is exactly what
+            // the docs should say about a command that does not exist.
+            //
+            // The window is a character range around the match rather than
+            // the line, because the word that makes it a denial is routinely
+            // on the *neighbouring* line — "the (since-removed) `ro health`
+            // command" splits across two, and so does "that Phase 1 deleted".
+            // Judging the line alone called both a ghost.
+            let at = base + raw.find(&c).unwrap_or(0);
+            let lo = floor_boundary(&text, at.saturating_sub(120));
+            let hi = ceil_boundary(&text, (at + c.len() + 120).min(text.len()));
+            let window = &text[lo..hi];
+            let denies = DENIALS.iter().any(|d| window.contains(*d));
+
+            if denies || word.is_empty() || word.starts_with('-') || live.iter().any(|l| *l == word)
+            {
+                continue;
+            }
+            if !ghosts.contains(&word) {
+                ghosts.push(word);
+            }
         }
     }
+    ghosts.sort();
+
     assert!(
         ghosts.is_empty(),
-        "the docs still show {ghosts:?} as invocations, and the binary has \
-         no such command. A command that is gone but still documented is \
-         worse than one that never existed: the reader's command fails."
+        "the docs show {ghosts:?} as an invocation, and `ro schema` has no such \
+         command. A command that is gone but still documented is worse than one \
+         that never existed: the reader's command fails."
     );
 }
 

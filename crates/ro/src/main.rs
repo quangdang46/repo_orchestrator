@@ -45,14 +45,6 @@ struct Cli {
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
 
-    /// Suppress non-essential output
-    #[arg(long, short, global = true)]
-    quiet: bool,
-
-    /// Enable verbose output
-    #[arg(long, global = true)]
-    verbose: bool,
-
     /// Never prompt for confirmation
     #[arg(long, global = true)]
     non_interactive: bool,
@@ -105,6 +97,16 @@ enum Commands {
     Remove {
         /// Repo key: owner/repo, alias, or id
         key: String,
+        /// Also delete the working copy on disk
+        ///
+        /// Destructive, and gated four ways. Deleting a working copy is the
+        /// only way to reclaim disk, and it is also the exact operation a
+        /// path-arithmetic bug would aim at *other* repositories — so the
+        /// path is printed in full, checked against the registry again
+        /// immediately before the removal, and a directory whose origin
+        /// belongs to a different registered repo is refused outright.
+        #[arg(long)]
+        delete: bool,
     },
 
     /// List tracked repos
@@ -142,15 +144,9 @@ enum Commands {
         /// Stash changes before pull, pop after
         #[arg(long)]
         autostash: bool,
-        /// Number of repos to sync concurrently
-        #[arg(long, short = 'j', default_value_t = 1)]
-        parallel: u32,
         /// Network timeout in seconds
         #[arg(long)]
         timeout: Option<u32>,
-        /// Resume an interrupted sync
-        #[arg(long)]
-        resume: bool,
     },
 
     /// Show status of tracked repos
@@ -160,32 +156,6 @@ enum Commands {
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
-    },
-
-    /// Prune removed/missing repos
-    Prune {
-        /// Also prune archived repos
-        #[arg(long)]
-        archived: bool,
-        /// Also prune missing repos
-        #[arg(long)]
-        missing: bool,
-        /// Scan the projects dir for working copies not in the inventory
-        #[arg(long)]
-        orphans: bool,
-        /// Move orphaned working copies into <state-dir>/archived
-        #[arg(long, conflicts_with = "delete")]
-        archive: bool,
-        /// Permanently delete orphaned working copies (destructive)
-        #[arg(long)]
-        delete: bool,
-    },
-
-    // ── Runs / Timeline ──────────────────────────────────────────────
-    /// Run management commands
-    Run {
-        #[command(subcommand)]
-        sub: RunCommands,
     },
 
     // ── Conflict ─────────────────────────────────────────────────────
@@ -335,19 +305,6 @@ enum Commands {
     /// `ro robot-docs` was this command. Hidden alias, one release.
     #[command(alias = "robot-docs")]
     Schema,
-}
-
-#[derive(Debug, Subcommand)]
-enum RunCommands {
-    /// List recent runs
-    List {
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-    /// Show a specific run
-    Show { run_id: String },
-    /// Show timeline for a run
-    Timeline { run_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -515,7 +472,6 @@ fn schema_json() -> serde_json::Value {
 /// Resolve multi-repo targets from --repos/--filter/--all flags.
 fn run() -> Result<()> {
     use ro_sync::manage;
-    use ro_sync::prune;
     use ro_sync::status;
     use ro_sync::sync;
 
@@ -523,7 +479,6 @@ fn run() -> Result<()> {
     let paths = resolve_paths(&cli)?;
     let db_path = paths.state_db();
     let non_interactive = cli.non_interactive;
-    let _quiet = cli.quiet;
 
     match cli.command {
         // ── commit / push / ship ───────────────────────────────────────
@@ -668,9 +623,79 @@ fn run() -> Result<()> {
             eprintln!("  path: {}", repo.local_path);
         }
 
-        Commands::Remove { key } => {
+        Commands::Remove { key, delete } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
+
+            // Resolve **before** removing the row, because the deletion is
+            // the part that needs the registry, and a row deleted first
+            // would be the one place the check could not consult.
+            //
+            // A name that matches nothing is a **usage** error, the same
+            // code the removal below reports it as. A typo must not read as
+            // a broken installation, and it must not read as one on the
+            // `--delete` path and not on the other.
+            let target = ro_sync::manage::find_repo(&conn, &key).map_err(|e| {
+                eprintln!("error: {e:#}");
+                std::process::exit(exit::EX_USAGE as i32);
+            })?;
+
+            if delete {
+                let path = std::path::PathBuf::from(&target.local_path);
+
+                // (1) The path, in full, before anything is asked or done.
+                // A prompt that shows a shortened form is a prompt the user
+                // cannot check, and this is the only line they get.
+                eprintln!("Will delete the working copy at:");
+                eprintln!("  {}", path.display());
+
+                // (2) Refuse if this directory is a *different* registered
+                // repo. Two repos pointing at one path is the copy-paste
+                // accident, and deleting through it removes someone else's
+                // work to reclaim this one's disk.
+                let wanted = path.to_string_lossy().to_string();
+                let clash = manage::list(&conn, None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|r| r.id != target.id && r.local_path == wanted);
+                if let Some(other) = clash {
+                    eprintln!(
+                        "refused: {} is also the working copy of {}/{}; \
+                         remove that one first, or move this one out of the way.",
+                        path.display(),
+                        other.owner,
+                        other.name
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+
+                // (3) Consent: an interactive confirmation, or the caller
+                // having said up front that it is not going to answer.
+                if !non_interactive {
+                    if !confirm("Type 'y' to delete it: ") {
+                        eprintln!("Not deleted.");
+                        std::process::exit(exit::EX_USAGE as i32);
+                    }
+                }
+
+                // (4) The registry, one last time, immediately before the
+                // removal. Between (2) and here the only thing that ran was
+                // a human reading a line.
+                if ro_sync::manage::find_repo(&conn, &key).is_err() {
+                    eprintln!("refused: {key} is no longer tracked; nothing was deleted.");
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+
+                if path.exists() {
+                    std::fs::remove_dir_all(&path).map_err(|e| {
+                        exit::FatalError::new(format!("deleting {}: {e}", path.display()))
+                    })?;
+                    eprintln!("Deleted working copy: {}", path.display());
+                } else {
+                    eprintln!("Working copy already absent: {}", path.display());
+                }
+            }
+
             // A name that matches nothing is a **usage** error, not a
             // fatal one. `context` turned "no such repo" into exit 70,
             // which is the same code as a config file that will not parse
@@ -710,9 +735,7 @@ fn run() -> Result<()> {
             clone_only,
             pull_only,
             autostash,
-            parallel: _,
             timeout,
-            resume: _,
         } => {
             if clone_only && pull_only {
                 anyhow::bail!("--clone-only and --pull-only cannot be used together");
@@ -760,6 +783,15 @@ fn run() -> Result<()> {
                 match format {
                     OutputFormat::Text => {
                         let dirty = if s.is_dirty { " (dirty)" } else { "" };
+                        // The two flags that decide whether the *next*
+                        // command can work, printed where the eye already
+                        // is. A protected branch is not a warning — half
+                        // the fleet is on `main` by choice — so it is a
+                        // parenthetical, not a banner. A conflict is a
+                        // different thing: it invalidates the rest of the
+                        // row, so it is named first.
+                        let conflict = if s.in_conflict { " [CONFLICT] " } else { "" };
+                        let protected = if s.is_protected { " (protected)" } else { "" };
                         // An unmeasurable repo prints `ahead=unknown`, never
                         // `ahead=0`. Printing zero here is the bug this bead
                         // exists to remove: a green board over rows nobody
@@ -767,20 +799,24 @@ fn run() -> Result<()> {
                         // because the user stops looking.
                         match (s.ahead, s.behind) {
                             (Some(a), Some(b)) => println!(
-                                "{}/{}: {}{} ahead={} behind={}",
+                                "{}/{}: {}{}{}{} ahead={} behind={}",
                                 s.owner,
                                 s.name,
                                 s.branch.as_deref().unwrap_or("HEAD"),
+                                conflict,
                                 dirty,
+                                protected,
                                 a,
                                 b
                             ),
                             _ => println!(
-                                "{}/{}: {}{} ahead=unknown behind=unknown — {}",
+                                "{}/{}: {}{}{}{} ahead=unknown behind=unknown — {}",
                                 s.owner,
                                 s.name,
                                 s.branch.as_deref().unwrap_or("HEAD"),
+                                conflict,
                                 dirty,
+                                protected,
                                 s.unmeasurable_reason.as_deref().unwrap_or("unknown reason")
                             ),
                         }
@@ -799,119 +835,7 @@ fn run() -> Result<()> {
             }
         }
 
-        Commands::Prune {
-            archived,
-            missing,
-            orphans,
-            archive,
-            delete,
-        } => {
-            let conn = ro_state::open_db(&db_path)
-                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-
-            if orphans || archive || delete {
-                use ro_sync::prune::{OrphanAction, find_orphans, handle_orphans};
-
-                if delete
-                    && !non_interactive
-                    && !std::io::IsTerminal::is_terminal(&std::io::stdin())
-                {
-                    eprintln!(
-                        "prune --delete needs an interactive terminal, or pass --non-interactive."
-                    );
-                    std::process::exit(3);
-                }
-
-                let found = find_orphans(&conn, &paths.state_dir.join("projects"))?;
-                if found.is_empty() {
-                    eprintln!("No orphan working copies found.");
-                } else {
-                    eprintln!("Found {} orphan working cop(ies):", found.len());
-                    for o in &found {
-                        eprintln!("  {}", o.path);
-                    }
-                }
-
-                let action = if delete {
-                    if !confirm("Permanently delete these directories? [y/N] ") {
-                        eprintln!("Aborted.");
-                        return Ok(());
-                    }
-                    OrphanAction::Delete
-                } else if archive {
-                    OrphanAction::Archive
-                } else {
-                    OrphanAction::Report
-                };
-
-                let done = handle_orphans(&found, action, &paths.state_dir)?;
-                if !done.is_empty() {
-                    eprintln!("Acted on {} orphan(s).", done.len());
-                }
-            }
-
-            let mut pruned: Vec<prune::PruneResult> = Vec::new();
-            if archived {
-                let results = prune::prune_archived(&conn)?;
-                pruned.extend(results);
-            }
-            if missing {
-                let results = prune::prune_missing(&conn)?;
-                pruned.extend(results);
-            }
-            if !pruned.is_empty() {
-                eprintln!("Pruned {} repos:", pruned.len());
-                for p in &pruned {
-                    eprintln!("  {}/{}", p.owner, p.name);
-                }
-            } else {
-                let mut hints = Vec::new();
-                if !archived {
-                    hints.push("--archived");
-                }
-                if !missing {
-                    hints.push("--missing");
-                }
-                if hints.is_empty() {
-                    eprintln!("Nothing to prune.");
-                } else {
-                    eprintln!("Nothing to prune. Try: ro prune {}", hints.join(" "));
-                }
-            }
-        }
-
         // ── Runs / Timeline ──
-        Commands::Run { sub } => {
-            let conn = ro_state::open_db(&db_path)
-                .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-            match sub {
-                RunCommands::List { limit } => {
-                    let runs = ro_jobs::recent_runs(&conn, limit)?;
-                    for run in &runs {
-                        let status = if run.is_finished() {
-                            format!("exit={}", run.exit_code.unwrap_or(0))
-                        } else {
-                            "running".into()
-                        };
-                        println!("{} {} {} ({})", run.id, run.command, status, run.started_at);
-                    }
-                }
-                RunCommands::Show { run_id } => match ro_jobs::get_run(&conn, &run_id)? {
-                    Some(run) => println!("{}", serde_json::to_string_pretty(&run)?),
-                    None => eprintln!("Run {run_id} not found."),
-                },
-                RunCommands::Timeline { run_id } => {
-                    let events = ro_jobs::events_for_run(&conn, &run_id)?;
-                    if events.is_empty() {
-                        eprintln!("No events for run {run_id}.");
-                    }
-                    for ev in &events {
-                        println!("[{}] {}: {}", ev.level, ev.ts, ev.message);
-                    }
-                }
-            }
-        }
-
         // ── Conflict ──
 
         // ── Doctor ──

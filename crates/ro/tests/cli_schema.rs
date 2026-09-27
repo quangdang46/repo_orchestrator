@@ -23,9 +23,29 @@ use tempfile::TempDir;
 /// enum. That is the whole mechanism: the compiler will not notice a missing
 /// entry, and that is deliberate — the failure is supposed to be a red test a
 /// human reads, not a type error.
+/// The command surface, transcribed from PLAN.md.
+///
+/// Kept here rather than derived from the binary on purpose: a test that
+/// reads the code it is testing proves only that the code equals itself.
+/// The point of this list is that it is a *second* statement of the same
+/// specification, and a disagreement between the two is information.
+///
+/// It is not a copy of any one place in PLAN.md — the plan is not
+/// self-consistent here. §"Done looks like" lists eleven names and omits
+/// `ro remove`, which §3 explicitly keeps (`ro add` / `ro list` / `ro
+/// remove`), and the "Removed | Replacement" table folds `ro status` into
+/// `ro list` while the same document keeps it three other times, the last
+/// saying "stays `ro status` … Kept as its own command". Where they
+/// disagree the more specific statement wins, so `status` and `remove` both
+/// stay.
+///
+/// `prune` and `run` were here and are not any more: the plan cuts them
+/// ("`ro run` / … / `prune` | **cut.** No audit trail"), and the help text
+/// for every other command says the per-repo summary line is the audit
+/// trail instead.
 const EXPECTED_COMMANDS: &[&str] = &[
-    "init", "add", "remove", "list", "sync", "status", "prune", "run", "commit", "push", "ship",
-    "doctor", "config", "schema",
+    "init", "add", "remove", "list", "sync", "status", "commit", "push", "ship", "doctor",
+    "config", "schema",
 ];
 
 fn schema() -> Value {
