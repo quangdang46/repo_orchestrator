@@ -20,7 +20,7 @@ resolver = "3"
 default-members = ["crates/ro"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 authors = ["quangdang46 <quangdang46@github.com>"]
 edition = "2024"
 rust-version = "1.85"

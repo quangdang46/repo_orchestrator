@@ -2673,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "ro"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "ro-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2719,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "ro-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2735,7 +2735,7 @@ dependencies = [
 
 [[package]]
 name = "ro-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ro-config",
  "ro-core",
@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "ro-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "fs4",
@@ -2760,7 +2760,7 @@ dependencies = [
 
 [[package]]
 name = "ro-github"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "ro-jobs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ro-core",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "ro-state"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ro-core",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "ro-sweep"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "globset",
@@ -2821,7 +2821,7 @@ dependencies = [
 
 [[package]]
 name = "ro-sync"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "ro-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
 ]
