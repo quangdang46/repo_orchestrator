@@ -210,11 +210,6 @@ fn classify(stderr: &str) -> FailureClass {
     FailureClass::DirtyWorktree
 }
 
-#[cfg(windows)]
-fn is_executable(path: &Path) -> bool {
-    path.is_file()
-}
-
 /// The deadline `EngineContext` guarantees, for documentation parity with
 /// the agent engines.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);

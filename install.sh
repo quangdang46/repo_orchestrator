@@ -174,7 +174,7 @@ main() {
     info "repo:   https://github.com/${REPO}"
     info "user:   $(id -un 2>/dev/null || echo unknown)"
 
-    local target tag archive_name archive_url checksum_url
+    local target tag archive_name checksum_url
     target="$(detect_target)"
     info "target: ${C_BOLD}${target}${C_RESET}"
 
@@ -190,7 +190,6 @@ main() {
     # behaves exactly as before, and the legacy branch disappears on its
     # own once there is no legacy release left to serve.
     local base="https://github.com/${REPO}/releases/download/${tag}"
-    local archive_name checksum_url
     archive_name="${BIN}-${target}.tar.xz"
     checksum_url="${base}/${archive_name}.sha256"
 

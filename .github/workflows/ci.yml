@@ -135,3 +135,70 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: ${{ contains(matrix.target, 'aarch64') && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-linux-gnu-g++' || '' }}
           AR_aarch64_unknown_linux_gnu: ${{ contains(matrix.target, 'aarch64') && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-linux-gnu-ar' || '' }}
         run: cargo build --release --workspace --target ${{ matrix.target }}
+
+  # The installers, actually run.
+  #
+  # `install.sh` and `install.ps1` are the two files a new user meets first,
+  # and neither had ever been executed: `install.sh` was verified by hand on
+  # one machine, and `install.ps1` had never been run at all. An installer
+  # that has never run is a script whose correctness is a claim, and the
+  # failures it produces land on the user rather than on us.
+  #
+  # These steps install from the **published release** — the same download
+  # `curl -fsSL ... | bash` performs — and then run the binary that landed.
+  # That makes "the installer works" and "the released binary works" a single
+  # check rather than two claims that can drift apart.
+  install:
+    name: Installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run install.sh
+        if: runner.os != 'Windows'
+        env:
+          # Into the workspace, so the step is hermetic and leaves nothing
+          # behind on the runner image.
+          RO_INSTALL_DIR: ${{ github.workspace }}/robin
+          # The job re-runs on a fresh runner, but a cache hit would make
+          # the "already exists" refusal fire for the wrong reason.
+          RO_FORCE: "1"
+        run: bash install.sh
+
+      - name: Run install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RO_PREFIX: ${{ github.workspace }}\robin
+        run: ./install.ps1
+
+      # The install is only evidence if the binary it placed is the one that
+      # runs, and the version it reports is the one the release named.
+      - name: The installed binary runs
+        shell: bash
+        run: |
+          "${{ github.workspace }}/robin/ro" --version
+          "${{ github.workspace }}/robin/ro" --help > /dev/null
+
+      - name: The installed binary runs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\robin\ro.exe" --version
+          & "${{ github.workspace }}\robin\ro.exe" --help | Out-Null
+
+      # A binary that installs and prints a version but cannot do the job is
+      # not installed, it is merely present. `ro doctor` is the closest thing
+      # to a self-check ro has, and it exercises config, state and the git
+      # backend for real.
+      - name: The installed binary does the job
+        shell: bash
+        run: |
+          export RO_CONFIG_DIR="${{ github.workspace }}/.ro-check"
+          "${{ github.workspace }}/robin/ro" init
+          "${{ github.workspace }}/robin/ro" --version

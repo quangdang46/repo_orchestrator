@@ -69,8 +69,20 @@ impl FakeBinary {
             // every write: `--version--RO-SEP--` arrived as
             // `-version--RO-SEP--`. `echo` appends a newline, which
             // the reader tolerates because it trims each record.
+            //
+            // `findstr "^"` copies stdin to stdout, and `>>` sends that to
+            // the log. It is here because the engine cannot hand a
+            // multi-paragraph prompt to a `.cmd` as an argv element —
+            // `cmd.exe` has no way to carry a newline in an argument — so
+            // on Windows the prompt arrives on **stdin** instead. Without
+            // this line the shim would record an empty argv and the tests
+            // asserting the prompt reached the child would report "never
+            // invoked" for an agent that was invoked, with the prompt.
+            // On Unix the prompt is in argv and this reads nothing, so
+            // the record is the same shape on both platforms.
             r##"@echo off
 echo %*>> "@LOGPATH@"
+findstr "^">> "@LOGPATH@"
 echo --RO-SEP-->> "@LOGPATH@"
 exit /b 0"##,
             &log,

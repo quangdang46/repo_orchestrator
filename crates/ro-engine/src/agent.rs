@@ -181,12 +181,42 @@ impl AgentEngine {
         // they type; they have not configured an extension, and making
         // them type `.cmd` would be the tool's problem, not theirs.
         let program = self.resolve_program();
-        let mut cmd = std::process::Command::new(&program);
+
+        // A `.cmd` is not an executable. The loader hands one to
+        // `cmd.exe`, and `cmd.exe` **cannot carry a newline in an
+        // argument** — `Command` refuses the spawn outright with
+        // "batch file arguments are invalid" before the child ever runs.
+        //
+        // `BUILTIN_PROMPT` is multi-paragraph by design, so this is not a
+        // corner case: it is every Windows user whose agent was installed
+        // by npm, which is what `claude` and `codex` ship. On Unix the
+        // prompt is one `execve` argument and this never arises.
+        //
+        // So on Windows the prompt travels on **stdin**, where no shell
+        // ever parses it — which keeps the invariant this module is built
+        // on ("no shell sees the prompt") *more* strictly than the argv
+        // path, since argv on Windows would necessarily go through
+        // `cmd.exe`'s own quoting and expansion rules. The prompt arrives
+        // byte-for-byte, as one value, which is the whole claim.
+        let via_stdin = is_batch_file(&program);
+        let mut cmd = if via_stdin {
+            let mut c = std::process::Command::new(comspec());
+            // `/c` then the program, as separate arguments. Passing the
+            // whole thing as one quoted string is the variant where
+            // `cmd.exe` strips the outer quotes and then mis-parses the
+            // path, and it is the only difference between the two forms.
+            c.arg("/c").arg(&program);
+            c
+        } else {
+            std::process::Command::new(&program)
+        };
         cmd.args(&self.default_args);
-        // ONE argv element. No shell, no interpolation, no quoting: the
-        // prompt carries diff text and file paths, and a shell would
-        // treat every one of them as syntax.
-        cmd.arg(prompt);
+        if !via_stdin {
+            // ONE argv element. No shell, no interpolation, no quoting: the
+            // prompt carries diff text and file paths, and a shell would
+            // treat every one of them as syntax.
+            cmd.arg(prompt);
+        }
         cmd.current_dir(ctx.repo_root);
         cmd.env_clear();
         cmd.envs(child_env.to_pairs());
@@ -194,12 +224,24 @@ impl AgentEngine {
         // Piped explicitly. `spawn()` gives the child the parent's
         // streams, so without this the agent's output goes to ro's own
         // stdout and the run-deadline path has nothing to read.
-        cmd.stdin(std::process::Stdio::null());
+        //
+        // On the stdin path this is the prompt's only route to the child,
+        // so it must be a pipe rather than `/dev/null`.
+        cmd.stdin(if via_stdin {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
         let started = Instant::now();
-        let out = run_with_deadline(&mut cmd, ctx.timeout).map_err(|e| match e {
+        let out = run_with_deadline(
+            &mut cmd,
+            ctx.timeout,
+            if via_stdin { Some(prompt) } else { None },
+        )
+        .map_err(|e| match e {
             RunError::Spawned(err) => RunError::Spawned(err),
             RunError::TimedOut => RunError::TimedOut,
         })?;
@@ -389,14 +431,58 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
 }
 
+/// Is this a Windows batch file?
+///
+/// Always `false` off Windows: there, a program path is a program path, and
+/// returning `true` would send every prompt down a route that does not
+/// exist.
+fn is_batch_file(program: &std::path::Path) -> bool {
+    #[cfg(not(windows))]
+    {
+        let _ = program;
+        false
+    }
+    #[cfg(windows)]
+    {
+        program
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                let e = e.to_ascii_lowercase();
+                e == "cmd" || e == "bat"
+            })
+            .unwrap_or(false)
+    }
+}
+
+/// The command interpreter — the only thing on Windows that can run a batch
+/// file.
+///
+/// Read from the environment rather than hardcoded, because `ComSpec` is
+/// what actually defines it on this machine; a hardcoded `cmd.exe` would be
+/// right until someone moves it.
+fn comspec() -> std::path::PathBuf {
+    std::env::var_os("ComSpec")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("cmd.exe"))
+}
+
 /// Spawn with a deadline.
 ///
 /// The child's **tree** is killed, not just the child: an agent spawns
 /// tools of its own, and killing only the direct child leaves those
 /// holding the worktree while the fleet reports success.
+///
+/// `stdin_text` is the prompt, on the one platform where it cannot be an
+/// argv element. It is written and the handle dropped **before** the wait,
+/// so the child sees the whole prompt followed by end-of-input; a child
+/// that blocked reading a pipe nobody fed would sit here until the
+/// deadline killed it, and the run would be reported as a timeout rather
+/// than as the success it was.
 fn run_with_deadline(
     cmd: &mut std::process::Command,
     limit: Duration,
+    stdin_text: Option<&str>,
 ) -> std::result::Result<std::process::Output, RunError> {
     #[cfg(unix)]
     {
@@ -408,6 +494,29 @@ fn run_with_deadline(
     // be enforced while the child runs — `wait_with_output` alone blocks
     // forever, and `output()` has no timeout at all.
     let mut child = cmd.spawn().map_err(RunError::Spawned)?;
+    if let Some(text) = stdin_text {
+        if let Some(mut pipe) = child.stdin.take() {
+            // Written on its own thread, and the reason is a deadlock.
+            //
+            // A child that never reads stdin — and `ro` cannot know that in
+            // advance — leaves `write_all` blocked once the pipe fills, and
+            // that write happens *before* the poll loop below, so a large
+            // prompt would hang the run with the deadline not yet armed. The
+            // deadline is the only thing standing between a wedged agent and
+            // a wedged fleet, so it must never be behind a blocking write.
+            //
+            // The thread owns the pipe and drops it, so the child still sees
+            // the whole prompt followed by end-of-input. If the child dies
+            // first, the write fails and the thread ends; a thread blocked on
+            // a pipe that just broke is a thread that returns.
+            let owned = text.to_string();
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = pipe.write_all(owned.as_bytes());
+                let _ = pipe.flush();
+            });
+        }
+    }
     let started = Instant::now();
     const POLL: Duration = Duration::from_millis(25);
 
