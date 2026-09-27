@@ -132,6 +132,24 @@ impl ChildEnv {
         self.set("GCM_INTERACTIVE", "Never");
         self.set("GIT_PAGER", "cat");
         self.set("PAGER", "cat");
+        // `PATHEXT` on Windows, and it is load-bearing.
+        //
+        // A `Command` spawns through the OS loader, which decides that
+        // `claude` means `claude.cmd` **by reading `PATHEXT` from the
+        // child's own environment**. A caller doing
+        // `env_clear().envs(child_env)` has therefore removed the very
+        // variable that made the shim findable, and the spawn fails with
+        // "program not found" for a name sitting right there on `PATH`.
+        //
+        // Unix and macOS resolve an extensionless name directly and never
+        // needed it, so nothing local ever notices the omission.
+        #[cfg(windows)]
+        if std::env::var_os("PATHEXT").is_none() {
+            // A sensible default rather than nothing: the standard set is
+            // what a stock Windows install carries, and a caller that has
+            // its own is honoured above.
+            self.set("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        }
         self
     }
 
@@ -211,6 +229,22 @@ impl ChildEnv {
 
 #[cfg(test)]
 mod tests {
+    /// `PATHEXT` survives into the child, on the platform that needs it.
+    ///
+    /// A caller that does `env_clear().envs(child_env)` has otherwise
+    /// removed the variable the Windows loader reads to turn `claude`
+    /// into `claude.cmd`, and the spawn fails on a name that is on `PATH`.
+    #[cfg(windows)]
+    #[test]
+    fn pathext_reaches_the_child() {
+        let env = ChildEnv::subtracting([("PATH", "/tmp".to_string())]);
+        assert_eq!(
+            env.get("PATHEXT"),
+            Some(".COM;.EXE;.BAT;.CMD"),
+            "without PATHEXT the Windows loader cannot resolve a .cmd shim"
+        );
+    }
+
     use super::*;
 
     fn parent_with_a_token() -> Vec<(String, String)> {
