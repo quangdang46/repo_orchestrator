@@ -1133,7 +1133,11 @@ echo PROBE_ARGS=%*
             &shim_dir,
             "git-shim",
             "#!/bin/sh\necho \"PROMPT=$GIT_TERMINAL_PROMPT|$GCM_INTERACTIVE|$LC_ALL\"\n",
-            "@echo off\necho PROMPT=%GIT_TERMINAL_PROMPT%|%GCM_INTERACTIVE%|%LC_ALL%\n",
+            // `^|`, not `|`. A bare `|` is a **pipe** to `cmd.exe`, so the
+            // line parsed as "echo PROMPT=… piped into %GCM_INTERACTIVE%
+            // piped into %LC_ALL%" and printed nothing at all. `echo a^|b`
+            // prints `a|b`, which is the separator the assertion wants.
+            "@echo off\necho PROMPT=%GIT_TERMINAL_PROMPT%^|%GCM_INTERACTIVE%^|%LC_ALL%\n",
         );
 
         let repo = tmp.path().join("repo");
