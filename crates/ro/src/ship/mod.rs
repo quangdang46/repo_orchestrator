@@ -123,8 +123,18 @@ pub fn run_verb(
     };
 
     if targets.is_empty() {
+        // Names the user typed and nothing matched is a **usage** error, not
+        // an empty run. `ro ship alpha` used to print this and exit 0 —
+        // a typo reported as a success, in a script's terms indistinguishable
+        // from having done the work. Only a request that named nothing (a
+        // bare `ro ship`, or a filter that selected none) is exit 0.
+        let named_something = !named.is_empty() || pattern.is_some();
         eprintln!("no repos matched. Use --all, or a --repos pattern.");
-        std::process::exit(0);
+        std::process::exit(if named_something {
+            crate::exit::EX_USAGE as i32
+        } else {
+            0
+        });
     }
 
     let slots = ro_engine::EngineSlots::default();

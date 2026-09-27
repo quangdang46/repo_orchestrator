@@ -38,17 +38,25 @@ pub fn resolve_targets(
         return Ok(Vec::new());
     }
 
+    // Every whitespace-separated token is compiled on its own, so
+    // `ro ship alpha beta` is two names rather than one glob containing a
+    // space — which is what it used to be, and which matched nothing at
+    // all while reporting a cheerful empty run.
+    //
     // Compiled **once, and an error is an error**. The previous version
     // fell back to `*` on a bad pattern, so `--repos owner/*-typo`
     // silently selected every repo in the fleet and the run reported
     // success on twenty repositories nobody asked about.
-    let matcher = match pattern {
-        Some(p) => Some(
-            Glob::new(p)
-                .with_context(|| format!("--repos {p:?} is not a valid glob"))?
-                .compile_matcher(),
-        ),
-        None => None,
+    let tokens: Vec<(String, Option<globset::GlobMatcher>)> = match pattern {
+        Some(p) => p
+            .split_whitespace()
+            .map(|t| {
+                Glob::new(t)
+                    .with_context(|| format!("--repos {t:?} is not a valid glob"))
+                    .map(|g| (t.to_string(), Some(g.compile_matcher())))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
     };
 
     let tracked = crate::manage::list(conn, None)?;
@@ -58,8 +66,19 @@ pub fn resolve_targets(
         let label = format!("{}/{}", repo.owner, repo.name);
         let matches = if all {
             true
-        } else if let Some(m) = &matcher {
-            m.is_match(&label)
+        } else if !tokens.is_empty() {
+            // A token selects a repo three ways, because three things are
+            // things a user types: the glob, the name they gave it, and the
+            // `owner/name` the registry knows it by. The help text promises
+            // "by name or alias" and only the last of the three worked, so
+            // `ro ship alpha` selected nothing and said so in a tone that
+            // reads like success.
+            tokens.iter().any(|(tok, m)| {
+                m.as_ref().is_some_and(|g| g.is_match(&label))
+                    || repo.alias.as_deref() == Some(tok.as_str())
+                    || label == *tok
+                    || repo.id == *tok
+            })
         } else if let Some(f) = filter {
             matches_filter(conn, &repo.id, &label, f)?
         } else {

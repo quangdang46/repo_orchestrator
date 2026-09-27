@@ -439,7 +439,7 @@ mod tests {
         // here and must not be confused with the broken state below.
         assert_eq!(status_repo(&conn, &repo.id).unwrap().last_synced_at, None);
 
-        crate::sync::sync_all(&conn, &crate::sync::SyncOptions::default()).unwrap();
+        crate::sync::sync_all(&conn, &crate::sync::SyncOptions::default(), &[]).unwrap();
 
         let after = status_repo(&conn, &repo.id).unwrap().last_synced_at;
         assert!(

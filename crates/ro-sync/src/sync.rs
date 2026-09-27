@@ -415,7 +415,19 @@ pub fn sync_repo(
 /// The run is finalised on **every** path including the failing ones. A
 /// run left open means "still going", and a fleet that crashed halfway
 /// would leave a run that never ends and a status that never updates.
-pub fn sync_all(conn: &Connection, opts: &SyncOptions) -> Result<Vec<SyncResult>> {
+/// Sync every repo, or just `selected` when the caller named some.
+///
+/// `selected` is a list of repo ids, empty meaning "all". The caller
+/// resolves names to ids before calling, because a name that matches
+/// nothing is a **usage** error and only the caller knows whether the user
+/// named a repo: `ro sync` on an empty registry is a legitimate question
+/// with the answer "nothing to do", and `ro sync nonexistent` is a typo
+/// that deserves to be reported rather than absorbed.
+pub fn sync_all(
+    conn: &Connection,
+    opts: &SyncOptions,
+    selected: &[String],
+) -> Result<Vec<SyncResult>> {
     // Archived and disabled rows are excluded here rather than at each
     // call site. `list(conn, None)` returns every row, so a sync that did
     // not filter would reach into repos the user had explicitly retired —
@@ -425,6 +437,7 @@ pub fn sync_all(conn: &Connection, opts: &SyncOptions) -> Result<Vec<SyncResult>
     let repos: Vec<_> = all
         .into_iter()
         .filter(|r| !r.archived && !r.disabled)
+        .filter(|r| selected.is_empty() || selected.contains(&r.id))
         .collect();
     let run = ro_jobs::open_run(conn, "sync", &[]).context("opening the sync run record")?;
     let run_id = run.id.clone();
@@ -587,7 +600,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = sync_all(&conn, &SyncOptions::default()).unwrap();
+        let results = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, "success", "the sync itself should work");
 
@@ -651,7 +664,7 @@ mod tests {
         )
         .unwrap();
 
-        sync_all(&conn, &SyncOptions::default()).unwrap();
+        sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
 
         // What the old code did: a bare UUID with no `runs` row behind it.
         let orphan: i64 = conn
@@ -702,7 +715,7 @@ mod tests {
         .unwrap();
 
         // First sync clones.
-        sync_all(&conn, &SyncOptions::default()).unwrap();
+        sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
 
         // Local commits something the remote does not have, so a
         // fast-forward pull must refuse.
@@ -716,6 +729,7 @@ mod tests {
                 strategy: SyncStrategy::FfOnly,
                 ..Default::default()
             },
+            &[],
         )
         .unwrap();
 
@@ -804,7 +818,7 @@ mod tests {
     fn sync_all_with_empty_list() {
         let (_, conn) = setup();
         let opts = SyncOptions::default();
-        let results = sync_all(&conn, &opts).unwrap();
+        let results = sync_all(&conn, &opts, &[]).unwrap();
         assert!(results.is_empty());
     }
 
@@ -888,7 +902,7 @@ mod filter_and_skip_tests {
             pull_only: true,
             ..Default::default()
         };
-        let results = sync_all(&conn, &opts).unwrap();
+        let results = sync_all(&conn, &opts, &[]).unwrap();
 
         assert_eq!(
             results.len(),
@@ -939,7 +953,7 @@ mod filter_and_skip_tests {
         std::fs::write(work.join("a.txt"), "one\n").unwrap();
         std::fs::write(work.join("b.txt"), "two\n").unwrap();
 
-        let results = sync_all(&conn, &SyncOptions::default()).unwrap();
+        let results = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].action, "skipped_dirty",
@@ -994,7 +1008,7 @@ mod filter_and_skip_tests {
         )
         .unwrap();
 
-        let results = sync_all(&conn, &SyncOptions::default()).unwrap();
+        let results = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
         assert_ne!(
             results[0].action, "skipped_dirty",
             "a clean worktree must not be skipped, got {:?}",

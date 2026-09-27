@@ -126,6 +126,15 @@ enum Commands {
     // ── Sync / Status ────────────────────────────────────────────────
     /// Sync all tracked repos
     Sync {
+        /// Repos to sync, by name or alias; omit for every tracked repo
+        ///
+        /// The same shape as `ro commit` / `ro push` / `ro ship`, and for
+        /// the same reason: a name someone typed should outrank a flag left
+        /// in a shell profile. Without it `ro sync cass` is a clap error,
+        /// which is a usage failure wearing the costume of a name that
+        /// happens not to be a flag.
+        #[arg(value_name = "REPO")]
+        repos: Vec<String>,
         /// Sync strategy: ff-only (default), rebase, merge
         #[arg(long, value_enum, default_value_t = SyncStrategy::FfOnly)]
         strategy: SyncStrategy,
@@ -727,6 +736,7 @@ fn run() -> Result<()> {
 
         // ── Sync / Status ──
         Commands::Sync {
+            repos,
             strategy,
             format,
             dry_run,
@@ -740,6 +750,44 @@ fn run() -> Result<()> {
             }
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
+
+            // Names, or everything. Resolved through the same helper the
+            // fleet verbs use, so a name that means the same thing to `ro
+            // ship` means the same thing here.
+            //
+            // A name that matches nothing is a **usage** error, not a
+            // silent no-op: the user asked for a repository and was told,
+            // in a report full of other repositories, that nothing
+            // happened. A bare `ro sync` on an empty registry stays exit 0 —
+            // there is nothing wrong with asking for everything when there
+            // is nothing.
+            let selected: Vec<String> = if repos.is_empty() {
+                Vec::new()
+            } else {
+                let targets = ro_sync::targets::resolve_targets(
+                    &conn,
+                    Some(&repos.join(" ")),
+                    None,
+                    false,
+                    &paths.state_dir.join("projects"),
+                )
+                .map_err(|e| {
+                    eprintln!("error: {e:#}");
+                    std::process::exit(exit::EX_USAGE as i32);
+                })?;
+                if targets.is_empty() {
+                    eprintln!(
+                        "no repo matched {}",
+                        repos
+                            .iter()
+                            .map(|r| format!("`{r}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+                targets.iter().map(|t| t.repo_id.clone()).collect()
+            };
             let opts = sync::SyncOptions {
                 strategy,
                 autostash,
@@ -749,7 +797,7 @@ fn run() -> Result<()> {
                 pull_only,
             };
             let repo_labels = repo_labels_by_id(&conn);
-            let results = sync::sync_all(&conn, &opts).context("syncing repos")?;
+            let results = sync::sync_all(&conn, &opts, &selected).context("syncing repos")?;
             for r in &results {
                 match format {
                     OutputFormat::Text => {
