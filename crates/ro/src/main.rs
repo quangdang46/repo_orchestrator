@@ -671,11 +671,9 @@ fn run() -> Result<()> {
 
                 // (3) Consent: an interactive confirmation, or the caller
                 // having said up front that it is not going to answer.
-                if !non_interactive {
-                    if !confirm("Type 'y' to delete it: ") {
-                        eprintln!("Not deleted.");
-                        std::process::exit(exit::EX_USAGE as i32);
-                    }
+                if !non_interactive && !confirm("Type 'y' to delete it: ") {
+                    eprintln!("Not deleted.");
+                    std::process::exit(exit::EX_USAGE as i32);
                 }
 
                 // (4) The registry, one last time, immediately before the

@@ -148,10 +148,16 @@ fn no_documented_command_is_gone() {
     // someone can type: inside backticks, or at the start of a line. Both
     // are unambiguous. Ordinary prose ("ro tracks many repos") matches
     // neither, so the test needs no allowlist of English.
+    // `split_inclusive` rather than `lines()` so the running offset is
+    // exact. Adding a fixed `+ 1` per line assumed LF; a Windows checkout
+    // is CRLF, every line's base drifted by one, and the denial window
+    // slid off the words it was looking for — five ghosts on Windows that
+    // the same docs did not produce on macOS.
     let mut offset = 0usize;
-    for raw in text.lines() {
+    for chunk in text.split_inclusive('\n') {
         let base = offset;
-        offset += raw.len() + 1;
+        offset += chunk.len();
+        let raw = chunk.trim_end_matches(['\n', '\r']);
         let line = raw.trim_start().trim_start_matches("$ ").trim();
         let candidates = raw
             .match_indices('`')
@@ -181,14 +187,13 @@ fn no_documented_command_is_gone() {
             // on the *neighbouring* line — "the (since-removed) `ro health`
             // command" splits across two, and so does "that Phase 1 deleted".
             // Judging the line alone called both a ghost.
-            let at = base + raw.find(&c).unwrap_or(0);
+            let at = base + raw.find(c).unwrap_or(0);
             let lo = floor_boundary(&text, at.saturating_sub(120));
             let hi = ceil_boundary(&text, (at + c.len() + 120).min(text.len()));
             let window = &text[lo..hi];
             let denies = DENIALS.iter().any(|d| window.contains(*d));
 
-            if denies || word.is_empty() || word.starts_with('-') || live.iter().any(|l| *l == word)
-            {
+            if denies || word.is_empty() || word.starts_with('-') || live.contains(&word) {
                 continue;
             }
             if !ghosts.contains(&word) {
