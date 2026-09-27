@@ -33,6 +33,7 @@ pub fn resolve_targets(
     filter: Option<&str>,
     all: bool,
     projects_dir: &Path,
+    include_archived: bool,
 ) -> Result<Vec<Target>> {
     if !all && pattern.is_none() && filter.is_none() {
         return Ok(Vec::new());
@@ -63,6 +64,16 @@ pub fn resolve_targets(
     let mut targets = Vec::new();
 
     for repo in &tracked {
+        // `archived = 0 AND disabled = 0` is the default, not a filter
+        // somebody remembered to apply at the call site. A row the user
+        // retired is still in the registry — the row is the record, the
+        // directory on disk is not the only thing that is still there — and
+        // a fleet run that reached it would be doing something the user
+        // said not to do. `--include-archived` is the way back, which is
+        // what makes excluding it safe to do by default.
+        if !include_archived && (repo.archived || repo.disabled) {
+            continue;
+        }
         let label = format!("{}/{}", repo.owner, repo.name);
         let matches = if all {
             true
@@ -230,6 +241,7 @@ mod tests {
             None,
             false,
             std::path::Path::new("/projects"),
+            false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -254,6 +266,7 @@ mod tests {
             None,
             false,
             std::path::Path::new("/projects"),
+            false,
         )
         .unwrap();
         assert_eq!(labels(&t), vec!["acme/api", "acme/web"]);
@@ -272,6 +285,7 @@ mod tests {
             Some("halth:<50"),
             false,
             std::path::Path::new("/projects"),
+            false,
         )
         .unwrap_err();
         assert!(
@@ -284,8 +298,15 @@ mod tests {
     fn no_selector_and_not_all_selects_nothing() {
         let (_tmp, conn) = setup();
         track(&conn, "acme", "api");
-        let t =
-            resolve_targets(&conn, None, None, false, std::path::Path::new("/projects")).unwrap();
+        let t = resolve_targets(
+            &conn,
+            None,
+            None,
+            false,
+            std::path::Path::new("/projects"),
+            false,
+        )
+        .unwrap();
         assert!(t.is_empty(), "an empty selection is not an error");
     }
 
@@ -294,8 +315,15 @@ mod tests {
         let (_tmp, conn) = setup();
         track(&conn, "acme", "api");
         track(&conn, "other", "thing");
-        let t =
-            resolve_targets(&conn, None, None, true, std::path::Path::new("/projects")).unwrap();
+        let t = resolve_targets(
+            &conn,
+            None,
+            None,
+            true,
+            std::path::Path::new("/projects"),
+            false,
+        )
+        .unwrap();
         assert_eq!(labels(&t), vec!["acme/api", "other/thing"]);
     }
 
@@ -322,6 +350,7 @@ mod tests {
             None,
             true,
             std::path::Path::new("/state/projects"),
+            false,
         )
         .unwrap();
         assert_eq!(t.len(), 1);
@@ -370,9 +399,16 @@ mod filter_contract {
     }
 
     fn selected(conn: &ro_state::Connection, filter: &str) -> Vec<String> {
-        resolve_targets(conn, None, Some(filter), false, std::path::Path::new("/s"))
-            .map(|t| t.into_iter().map(|x| x.repo_id).collect())
-            .unwrap_or_default()
+        resolve_targets(
+            conn,
+            None,
+            Some(filter),
+            false,
+            std::path::Path::new("/s"),
+            true,
+        )
+        .map(|t| t.into_iter().map(|x| x.repo_id).collect())
+        .unwrap_or_default()
     }
 
     /// The regression this whole commit is about. `health:50` — a number,
@@ -404,6 +440,7 @@ mod filter_contract {
             Some("health:soon"),
             false,
             std::path::Path::new("/s"),
+            false,
         )
         .expect_err("a threshold that is not a number cannot be honoured");
         assert!(
@@ -455,6 +492,7 @@ mod filter_contract {
             Some("has:archvied"),
             false,
             std::path::Path::new("/s"),
+            false,
         )
         .expect_err("a typo must not select everything");
         assert!(
@@ -480,8 +518,8 @@ mod filter_contract {
         )
         .unwrap();
         for token in ["acme/api", "service", "id-1"] {
-            let t =
-                resolve_targets(&conn, Some(token), None, false, tmp.path()).unwrap_or_default();
+            let t = resolve_targets(&conn, Some(token), None, false, tmp.path(), false)
+                .unwrap_or_default();
             assert_eq!(t.len(), 1, "{token:?} should select the one repo");
         }
     }
@@ -491,14 +529,93 @@ mod filter_contract {
     #[test]
     fn two_names_select_two_repositories() {
         let (_t, conn) = fixture();
+        // `true` for the archived escape hatch: `oss` is archived in this
+        // fixture, and the question here is how many *tokens* were split
+        // out, not whether archived rows are reachable.
         let t = resolve_targets(
             &conn,
             Some("acme/api acme/oss"),
             None,
             false,
             std::path::Path::new("/s"),
+            true,
         )
         .unwrap();
         assert_eq!(t.len(), 2, "a space separates names, it does not join them");
+    }
+}
+
+/// `archived = 0 AND disabled = 0` is in the resolver, not at the call
+/// sites, so `ro sync`, `ro commit`, `ro push` and `ro ship` cannot
+/// disagree about what "every repo" means.
+#[cfg(test)]
+mod archived_is_excluded_by_default {
+    use super::*;
+
+    fn conn_with(archived: bool, disabled: bool) -> (tempfile::TempDir, ro_state::Connection) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (name, a, d) in [
+            ("live", 0i64, 0i64),
+            ("archived", archived as i64, 0),
+            ("disabled", 0, disabled as i64),
+        ] {
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at, archived, disabled)
+                 VALUES (?1, 'github.com', 'acme', ?2, 'https://example.com/x.git', ?3, ?4, ?4, ?5, ?6)",
+                rusqlite::params![format!("id-{name}"), name, format!("/s/{name}"), now, a, d],
+            )
+            .unwrap();
+        }
+        (tmp, conn)
+    }
+
+    fn all_but_archived(conn: &ro_state::Connection, include: bool) -> Vec<String> {
+        resolve_targets(conn, None, None, true, std::path::Path::new("/s"), include)
+            .map(|t| t.into_iter().map(|x| x.repo_id).collect())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_retired_repo_is_not_in_a_fleet_run() {
+        let (_t, conn) = conn_with(true, true);
+        let ids = all_but_archived(&conn, false);
+        assert_eq!(
+            ids,
+            vec!["id-live".to_string()],
+            "only the live repo; --all means every *active* row"
+        );
+    }
+
+    /// The escape hatch is what makes the default safe: a repo the user
+    /// retired by mistake has to be reachable again without a database
+    /// edit.
+    #[test]
+    fn the_escape_hatch_reaches_them_again() {
+        let (_t, conn) = conn_with(true, true);
+        assert_eq!(all_but_archived(&conn, true).len(), 3);
+    }
+
+    #[test]
+    fn naming_a_retired_repo_still_needs_the_flag() {
+        let (_t, conn) = conn_with(true, false);
+        let found = |include: bool| {
+            resolve_targets(
+                &conn,
+                Some("acme/archived"),
+                None,
+                false,
+                std::path::Path::new("/s"),
+                include,
+            )
+            .map(|t| t.len())
+            .unwrap()
+        };
+        assert_eq!(found(false), 0, "quietly reaching a retired row by name");
+        assert_eq!(found(true), 1);
     }
 }

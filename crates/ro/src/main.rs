@@ -163,6 +163,11 @@ enum Commands {
         /// be spelled the same way at every verb
         #[arg(long)]
         all: bool,
+        /// Retired repos, and repos the user switched off, are skipped
+        /// unless this is passed. The default is the safe one: a row that
+        /// was archived is a row the user said to leave alone.
+        #[arg(long)]
+        include_archived: bool,
     },
 
     /// Show status of tracked repos
@@ -214,6 +219,14 @@ enum Commands {
         /// Preview without writing
         #[arg(long)]
         dry_run: bool,
+        /// Retired repos, and repos switched off, are skipped unless this
+        /// is passed.
+        ///
+        /// The default is the safe one: a row the user archived is a row
+        /// they said to leave alone, and a fleet run that reached it would
+        /// be doing something they did not ask for. This is the way back.
+        #[arg(long)]
+        include_archived: bool,
     },
     /// Commit and push
     Push {
@@ -248,6 +261,10 @@ enum Commands {
         resolve: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Retired repos, and repos switched off, are skipped unless this
+        /// is passed. The default is the safe one.
+        #[arg(long)]
+        include_archived: bool,
     },
     /// The whole thing: fetch, rebase, commit, push
     Ship {
@@ -292,6 +309,11 @@ enum Commands {
         /// out with `--dry-run` rather than in.
         #[arg(long, hide = true)]
         commit_sweep: bool,
+        /// Retired repos, and repos the user switched off, are skipped
+        /// unless this is passed. The default is the safe one: a row that
+        /// was archived is a row the user said to leave alone.
+        #[arg(long)]
+        include_archived: bool,
         /// The old opt-in switch. Now the default.
         #[arg(long, hide = true)]
         execute: bool,
@@ -513,6 +535,7 @@ fn run() -> Result<()> {
             onto,
             resolve,
             dry_run,
+            include_archived,
         } => ship::run_verb(
             &paths,
             ship::HowFar::Commit,
@@ -525,6 +548,7 @@ fn run() -> Result<()> {
             onto.as_deref(),
             resolve,
             dry_run,
+            include_archived,
         ),
         Commands::Push {
             repos: named,
@@ -536,6 +560,7 @@ fn run() -> Result<()> {
             onto,
             resolve,
             dry_run,
+            include_archived,
         } => ship::run_verb(
             &paths,
             ship::HowFar::Push,
@@ -548,6 +573,7 @@ fn run() -> Result<()> {
             onto.as_deref(),
             resolve,
             dry_run,
+            include_archived,
         ),
         Commands::Ship {
             repos: named,
@@ -561,6 +587,7 @@ fn run() -> Result<()> {
             execute,
             resolve,
             dry_run,
+            include_archived,
         } => {
             // The old `ro sweep commit-sweep` spelling, for one release.
             // A script that breaks on a rename is a script the user has to
@@ -582,6 +609,7 @@ fn run() -> Result<()> {
                     /* onto */ None,
                     /* resolve */ false,
                     /* dry_run */ !execute,
+                    /* include_archived */ false,
                 );
             }
             ship::run_verb(
@@ -596,6 +624,7 @@ fn run() -> Result<()> {
                 onto.as_deref(),
                 resolve,
                 dry_run,
+                include_archived,
             );
         }
 
@@ -753,6 +782,7 @@ fn run() -> Result<()> {
             timeout,
             filter,
             all,
+            include_archived,
         } => {
             if clone_only && pull_only {
                 anyhow::bail!("--clone-only and --pull-only cannot be used together");
@@ -781,6 +811,7 @@ fn run() -> Result<()> {
                         filter.as_deref(),
                         all,
                         &paths.state_dir.join("projects"),
+                        include_archived,
                     )
                     .map_err(|e| {
                         eprintln!("error: {e:#}");
@@ -797,6 +828,7 @@ fn run() -> Result<()> {
                     filter.as_deref(),
                     all,
                     &paths.state_dir.join("projects"),
+                    include_archived,
                 )
                 .map_err(|e| {
                     eprintln!("error: {e:#}");

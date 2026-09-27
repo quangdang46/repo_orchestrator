@@ -65,6 +65,7 @@ pub fn run_verb(
     onto: Option<&str>,
     resolve: bool,
     dry_run: bool,
+    include_archived: bool,
 ) -> ! {
     // The engine the user named, else the config, else an error naming
     // the three. Never a silent fall-through to `git`: a user who asked
@@ -112,6 +113,7 @@ pub fn run_verb(
         filter,
         all,
         &projects_dir,
+        include_archived,
     ) {
         Ok(t) => t,
         Err(e) => {
