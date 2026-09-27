@@ -162,7 +162,7 @@ fn a_hanging_engine_is_killed_and_reported_as_timed_out() {
     let w = Worktree::with_one_commit();
     w.write("a.txt", "x\n");
 
-    let shim = hanging_shim();
+    let shim = ro_testkit::FakeBinary::hanging("claude");
     let engine = AgentEngine::claude();
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_millis(300));
 
@@ -180,25 +180,6 @@ fn a_hanging_engine_is_killed_and_reported_as_timed_out() {
     );
 }
 
-/// A shim that never returns.
-fn hanging_shim() -> ro_testkit::FakeBinary {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("claude");
-    std::fs::write(&path, "#!/bin/sh\nsleep 600\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&path).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&path, p).unwrap();
-    }
-    // The temp dir must outlive the shim, so leak it deliberately: the
-    // fixture is dropped at the end of the test, not before the run.
-    let dir = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
-    ro_testkit::FakeBinary::at(dir, path, "claude")
-}
-
 /// A non-zero agent exit is classified into the shared taxonomy.
 ///
 /// One taxonomy, not a second one for agents: a caller that has to learn
@@ -208,7 +189,8 @@ fn a_non_zero_agent_exit_is_classified() {
     let w = Worktree::with_one_commit();
     w.write("a.txt", "x\n");
 
-    let shim = failing_shim("Error: rate limit exceeded, try later later");
+    let shim =
+        ro_testkit::FakeBinary::failing("claude", 1, "Error: rate limit exceeded, try later later");
     let engine = AgentEngine::claude();
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(10));
 
@@ -225,22 +207,6 @@ fn a_non_zero_agent_exit_is_classified() {
         }
         other => panic!("a non-zero exit must be Failed, got {other:?}"),
     }
-}
-
-fn failing_shim(message: &str) -> ro_testkit::FakeBinary {
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("claude");
-    std::fs::write(&path, format!("#!/bin/sh\necho '{message}' >&2\nexit 1\n")).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&path).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&path, p).unwrap();
-    }
-    let dir = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
-    ro_testkit::FakeBinary::at(dir, path, "claude")
 }
 
 /// The prompt is a constant, and a caller cannot accidentally inject one

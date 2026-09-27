@@ -244,6 +244,29 @@ exit /b 0"#
         std::fs::read_to_string(self.dir.path().join("agent-report.txt")).unwrap_or_default()
     }
 
+    /// A shim that never returns.
+    ///
+    /// For testing the deadline, so the body has to be something the
+    /// *host* can actually execute — hence here rather than a `#!/bin/sh`
+    /// literal at the call site, which runs on macOS and cannot run on
+    /// Windows at all.
+    pub fn hanging(name: &str) -> Self {
+        let dir = TempDir::new().expect("the shim dir is creatable");
+        let log = dir.path().join("argv.log");
+        let body = shim_body(
+            r#"sleep 600"#,
+            r#"@echo off
+ping -n 600 127.0.0.1 > nul
+exit /b 0"#,
+            &log,
+        );
+        write_shim(dir.path(), name, &body);
+        Self {
+            dir: OwnedDir::Temp(dir),
+            name: name.to_string(),
+        }
+    }
+
     /// A shim from a script the caller wrote, kept alive by a caller-owned
     /// directory.
     ///
