@@ -1,0 +1,23 @@
+name: Windows diagnostic
+on:
+  push:
+    branches: ["worktree-diagnostic"]
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Does the testkit shim resolve through PATH at all
+        shell: pwsh
+        run: |
+          $d = Join-Path $env:RUNNER_TEMP "s"
+          New-Item -ItemType Directory -Path $d -Force | Out-Null
+          $log = Join-Path $d "argv.log"
+          Set-Content -Path (Join-Path $d "claude.cmd") -Value "@echo off`r`n<nul set /p=`"%*`" >> `"$log`"`r`n<nul set /p=`"--RO-SEP--`" >> `"$log`"`r`nexit /b 0"
+          # a bare extensionless name next to it, as write_shim also makes
+          Copy-Item (Join-Path $d "claude.cmd") (Join-Path $d "claude")
+          Write-Host "FILES:"
+          Get-ChildItem $d | ForEach-Object { Write-Host "  $($_.Name)" }
+      - name: Ask the code itself
+        run: cargo test -p ro-testkit --test fixtures -- --nocapture the_recorder_is_not_blind 2>&1
