@@ -80,6 +80,16 @@ jobs:
           save-if: ${{ runner.os != 'Windows' }}
       - run: cargo test --all-features --verbose --workspace
       - run: cargo test --doc --workspace
+      # The feature set a **release** is actually built with.
+      #
+      # `--all-features` above turns on ro-core's `keychain`; the release
+      # build drops default features instead, because musl cannot link the
+      # glibc libdbus behind it (see `default-features` in Cargo.toml's
+      # `[workspace.metadata.dist]`). A configuration that is built on every
+      # release and tested on none is a configuration that breaks silently
+      # and is only discovered by a user, so it gets a run of its own.
+      - name: Test the release feature set
+        run: cargo test --workspace --no-default-features
 
   build:
     name: Build (${{ matrix.target }})
@@ -126,6 +136,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      # `keychain` is default-on in ro-core, and it reaches
+      # `dbus-secret-service` -> `libdbus-sys`, whose build script shells
+      # out to `pkg-config` for `dbus-1`. The gnu targets need the package;
+      # without it the build dies inside `libdbus-sys` with "Package dbus-1
+      # was not found", which reads as a broken dependency tree rather than
+      # a missing system package. Same reason, same step, as clippy and test.
+      - name: Install Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev
       - name: Build
         env:
           # Tell the cc / cmake crates to use the ARM cross-compilers when
@@ -134,7 +155,21 @@ jobs:
           CC_aarch64_unknown_linux_gnu: ${{ contains(matrix.target, 'aarch64') && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-linux-gnu-gcc' || '' }}
           CXX_aarch64_unknown_linux_gnu: ${{ contains(matrix.target, 'aarch64') && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-linux-gnu-g++' || '' }}
           AR_aarch64_unknown_linux_gnu: ${{ contains(matrix.target, 'aarch64') && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-linux-gnu-ar' || '' }}
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        run: |
+          if [[ "${{ matrix.target }}" == *musl ]]; then
+            # musl builds without the keychain feature.
+            #
+            # A statically linked musl binary cannot link a **glibc**
+            # libdbus, so for this target the feature has no working
+            # implementation — that is a missing libc, not a missing
+            # package, and no `apt-get install` fixes it. Dropping the
+            # feature leaves a working tool rather than a broken one, which
+            # is the stated design of `keychain`: `env:VAR_NAME` is always
+            # available and the resolver names it when it is what is needed.
+            cargo build --release --workspace --target ${{ matrix.target }} --no-default-features
+          else
+            cargo build --release --workspace --target ${{ matrix.target }}
+          fi
 
   # The installers, actually run.
   #

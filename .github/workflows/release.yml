@@ -100,6 +100,20 @@ jobs:
         run: |
           irm "https://github.com/axodotdev/cargo-dist/releases/download/v$env:DIST_VERSION/cargo-dist-installer.ps1" | iex
 
+      # No `libdbus-1-dev` step here, and that is deliberate rather than an
+      # oversight. The `keychain` feature reaches `dbus-secret-service` ->
+      # `libdbus-sys`, whose build script runs `pkg-config` for `dbus-1`; the
+      # Linux targets in this matrix are all musl, and a statically linked
+      # musl binary cannot link a glibc libdbus at all — a missing libc, not a
+      # missing package, so no `apt-get` line fixes it.
+      #
+      # `dist` cannot set features per target (axodotdev/cargo-dist#772 is an
+      # open request), so the feature is turned off for the release build as
+      # a whole via `default-features = false` in Cargo.toml's
+      # `[workspace.metadata.dist]`. The consequence is stated there, and it
+      # is the right trade: a released binary is a static one, and a static
+      # binary is what gets installed on headless machines, where a keyring
+      # is not running anyway. `env:VAR_NAME` remains the credential path.
       - name: Build artifacts
         if: runner.os != 'Windows'
         shell: bash

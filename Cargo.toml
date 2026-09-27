@@ -90,6 +90,24 @@ serde_yaml      = "0.9"
 cargo-dist-version = "0.28.0"
 # We drive CI ourselves; let dist still know it targets GitHub Actions.
 ci = ["github"]
+# Release builds drop default features — i.e. ro-core's `keychain`.
+#
+# `keychain` reaches `dbus-secret-service` -> `libdbus-sys`, whose build
+# script runs `pkg-config` for `dbus-1`. Every Linux target in the release
+# matrix is musl, and a statically linked musl binary cannot link a glibc
+# libdbus at all: that is a missing libc rather than a missing package, so
+# there is no `apt-get` line that makes it work. `dist` also cannot set
+# features per target — axodotdev/cargo-dist#772 is an open request — so
+# this is the one switch available, and it applies to the whole release.
+#
+# The trade is deliberate. A released binary is a *static* one, and a static
+# binary is what ends up installed on headless machines, CI runners and
+# servers — where a keyring is not running and `keyring` would find nothing
+# anyway. `env:VAR_NAME` remains the credential path, and the resolver names
+# it explicitly when that is what is needed; that is the stated design of
+# the feature, not a consolation prize. Source builds, and the test and
+# clippy jobs, all still compile the keychain path.
+default-features = false
 # Installer flavors generated alongside the archives.
 installers = ["shell", "powershell"]
 # Release targets — must match the matrix in the release workflow.
