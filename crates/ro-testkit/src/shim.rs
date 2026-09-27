@@ -63,10 +63,15 @@ impl FakeBinary {
         let dir = TempDir::new().expect("the shim dir is creatable");
         let log = dir.path().join("argv.log");
         let body = shim_body(
-            r#"printf '%s\036' "$*" >> "$RO_TESTKIT_LOG""#,
+            r#"printf '%s--RO-SEP--' "$*" >> "$RO_TESTKIT_LOG""#,
+            // The separator is the byte the reader splits on, written
+            // as a decimal escape. `^Z` looked right and was not: it is
+            // cmd.exe's end-of-file marker, so the second record could
+            // never appear and a shim that ran wrote nothing the reader
+            // could see.
             r#"@echo off
 <nul set /p="%*" >> "@LOGPATH@"
-<nul set /p="^Z" >> "@LOGPATH@"
+<nul set /p= >> "@LOGPATH@"
 exit /b 0"#,
             &log,
         );
@@ -373,7 +378,7 @@ exit /b 0"#
 ///
 /// ASCII 0x1E (record separator): it cannot appear in an argument, so a
 /// prompt containing any text at all round-trips through the log intact.
-const RECORD_SEP: char = '\x1e';
+const RECORD_SEP: &str = "--RO-SEP--";
 
 /// Builds a shim body for this platform.
 ///
