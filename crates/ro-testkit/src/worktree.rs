@@ -11,6 +11,8 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+use crate::shim::git_path;
+
 /// A git checkout on disk.
 pub struct Worktree {
     dir: TempDir,
@@ -69,10 +71,11 @@ impl Worktree {
     /// Commit everything currently in the tree.
     pub fn commit(&self, message: &str) {
         run(self.dir.path(), &["add", "-A"]);
-        let out = Command::new("git")
+        let out = Command::new(git_path())
             .args(["commit", "-q", "-m", message])
             .current_dir(self.dir.path())
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
             .output()
             .expect("git runs");
         assert!(
@@ -92,7 +95,7 @@ impl Worktree {
 
     /// The current branch name.
     pub fn current_branch(&self) -> String {
-        let out = Command::new("git")
+        let out = Command::new(git_path())
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .current_dir(self.dir.path())
             .output()
@@ -102,7 +105,7 @@ impl Worktree {
 
     /// `git status --porcelain` — the same call `ro-git::read::is_dirty` makes.
     pub fn porcelain(&self) -> String {
-        let out = Command::new("git")
+        let out = Command::new(git_path())
             .args(["status", "--porcelain"])
             .current_dir(self.dir.path())
             .output()
@@ -119,8 +122,27 @@ impl Worktree {
 ///
 /// Test-only, so panicking is right: a fixture that quietly swallows a git
 /// failure produces a test that passes for the wrong reason.
+///
+/// # Never spawn a bare `git` here
+///
+/// Fixture spawns take **no lock** and consult no process-global state: the
+/// binary is [`crate::shim::git_path`], resolved to an absolute path once
+/// and cached, so a `PATH` scrubbed by a concurrent test (the engine
+/// "missing binary" assertion, e.g.) does not starve the lookup. The
+/// process-global `PATH` is mutable by design; see the doc comment on the
+/// resolver for why the competing fix — taking [`crate::shim::path_lock`]
+/// on the fixture side — is a self-deadlock, and why the *reentrant* variant
+/// is worse than either.
+///
+/// **The tripwire has a stated reach and it is this file's spawns.** "If a
+/// line here reads `Command::new("git")`" is a rule a reader can check; it
+/// is not a rule that covers the crate. The agent-engine shims in
+/// `shim.rs` are generated shell and `.cmd` bodies that run a bare `git`,
+/// and those resolve through `PATH` at shim runtime — the resolver's doc
+/// comment names them and says why they are still out of reach. Read that
+/// before concluding the crate has no `PATH`-dependent `git`.
 pub fn run(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let out = Command::new(git_path())
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")

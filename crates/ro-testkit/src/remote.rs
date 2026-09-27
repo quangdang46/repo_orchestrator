@@ -21,6 +21,8 @@ use std::process::Command;
 
 use tempfile::TempDir;
 
+use crate::shim::git_path;
+
 /// A bare git repository that pushes can land in.
 pub struct BareRemote {
     /// Owns the whole temp dir, so cleanup is automatic.
@@ -172,8 +174,16 @@ impl Default for RemotePair {
 /// identity is supplied through the environment git documents for exactly
 /// this purpose, and the config files are only neutralised where the path
 /// exists.
+///
+/// The program is [`crate::shim::git_path`], not the bare name: a bare name
+/// is resolved through the process-global `PATH` **at spawn time**, and
+/// every test in a binary shares that `PATH` with a test that is currently
+/// rewriting it under [`crate::shim::path_lock`]. A `BareRemote` built on
+/// the other thread from that test then fails with
+/// `git runs: Os { code: 2, kind: NotFound }` — a flake that has nothing to
+/// do with whatever the sibling test is asserting.
 fn git() -> Command {
-    let mut c = Command::new("git");
+    let mut c = Command::new(git_path());
     c.env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "Never")
         .env("LC_ALL", "C")

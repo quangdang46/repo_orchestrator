@@ -9,16 +9,39 @@
 #   RO_INSTALL_DIR   Where the `ro` binary is placed. Default: $HOME/.local/bin.
 #   RO_NO_VERIFY     If set to 1, skip SHA256 verification (NOT recommended).
 #   RO_FORCE         If set to 1, overwrite an existing binary without prompting.
+#   RO_BASE_URL      Base URL for release artifacts (test seam). Default: the
+#                    GitHub release download URL for $REPO at the resolved tag.
+#                    Set to a local server (e.g. http://127.0.0.1:8000) to test
+#                    installs without hitting GitHub. Must start with http://
+#                    or https://; anything else fails loudly with exit 3.
 #   GITHUB_TOKEN     Optional. Only used to raise the GitHub API rate limit
 #                    while resolving "latest"; the default path needs no
 #                    token, and public read access is enough.
+#
+# Archive layout (expected inside the tarball):
+#   <binary>-<target>/<binary>   e.g. ro-x86_64-unknown-linux-musl/ro
+#   The checksum asset is <archive>.sha256 next to the archive on the server.
 #
 # Exit codes:
 #   0  success
 #   1  generic failure
 #   2  unsupported platform
-#   3  network / download failure
+#   3  network / download failure, *or* an invalid RO_BASE_URL. A mistyped
+#      RO_BASE_URL is a configuration error, not a network failure; exit 3
+#      names the variable and prints what was received so the user can see
+#      the typo rather than go looking at their network.
 #   4  checksum mismatch
+#
+# RO_BASE_URL and the http:// transport:
+#   A `http://` RO_BASE_URL is accepted, and the `https`-only transport
+#   restriction is dropped for it — this exists to serve a locally built
+#   release from a local server for testing. **http:// is therefore not a
+#   general "download over plaintext" escape hatch.** Only a loopback host
+#   (127.0.0.1, localhost, ::1) is accepted on `http://`; a non-loopback
+#   `http://` host is refused on the same exit-3 path, and the refusal says
+#   that https is required. The checksum is the only protection against a
+#   malicious host for a loopback base, which is the threat model this seam
+#   exists for.
 
 set -euo pipefail
 
@@ -28,6 +51,12 @@ VERSION="${RO_VERSION:-latest}"
 INSTALL_DIR="${RO_INSTALL_DIR:-$HOME/.local/bin}"
 NO_VERIFY="${RO_NO_VERIFY:-0}"
 FORCE="${RO_FORCE:-0}"
+# Unset means "the GitHub release download URL for $REPO at the resolved
+# tag", i.e. exactly the string this script built before the seam existed.
+# Set means "the bytes live here instead" — the same directory must then hold
+# both the archive and its .sha256, or the checksum 404s and the install dies
+# on a verification it could not perform.
+BASE_URL="${RO_BASE_URL:-}"
 
 # ---------- pretty output ----------
 if [ -t 1 ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
@@ -55,6 +84,38 @@ need() {
     fi
 }
 
+# An unset RO_BASE_URL means "build the github.com URL as always" and there
+# is nothing to check. A *set* one is hand-typed by whoever runs the install,
+# so it is checked here — before any download — because the alternative is
+# discovering the typo inside curl's own error text ("Protocol http not
+# supported or disabled in libcurl", or a bare "URL rejected: Malformed input
+# to a URL function") several steps later, which reads as a broken network
+# and sends people looking in the wrong place.
+validate_base_url() {
+    [ -n "$BASE_URL" ] || return 0
+    case "$BASE_URL" in
+        https://*) ;;
+        http://127.0.0.1*|http://localhost*|http://\[::1\]*)
+            # A locally served base, for testing. Accepts both `127.0.0.1`
+            # and `localhost` (they are the same machine by construction),
+            # and `[::1]` (the IPv6 loopback; the brackets are the URL form).
+            ;;
+        http://*)
+            err "RO_BASE_URL over http:// is only for loopback (testing):"
+            err "  got: ${BASE_URL}"
+            err "Use https:// for anything off this machine — a checksum"
+            err "confirms the bytes, not the sender, so plaintext is a real"
+            err "downgrade, not a redundant precaution."
+            exit 3
+            ;;
+        *)
+            err "RO_BASE_URL must start with http:// or https://"
+            err "  got: ${BASE_URL}"
+            exit 3
+            ;;
+    esac
+}
+
 cleanup() {
     if [ -n "${TMPDIR_RO:-}" ] && [ -d "$TMPDIR_RO" ]; then
         rm -rf "$TMPDIR_RO"
@@ -64,10 +125,31 @@ trap cleanup EXIT INT TERM
 
 http_get() {
     # http_get <url> <out>
+    #
+    # The transport restriction follows the URL scheme instead of being
+    # unconditional. `https://` keeps it, so a github.com URL — which this
+    # script only ever builds with an https:// base — is never fetched over
+    # plaintext and never silently downgraded to http. `http://` drops it,
+    # because a local install test serves the artifact over a plaintext
+    # localhost server: with the restriction unconditional, RO_BASE_URL
+    # could not reach a local server at all and the seam would be
+    # decorative. Plaintext can only come from an explicit RO_BASE_URL;
+    # the default base is always https.
+    local https_only=1
+    case "$1" in http://*) https_only=0 ;; esac
+
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"
+        if [ "$https_only" = 1 ]; then
+            curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"
+        else
+            curl -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget --https-only --tries=3 -qO "$2" "$1"
+        if [ "$https_only" = 1 ]; then
+            wget --https-only --tries=3 -qO "$2" "$1"
+        else
+            wget --tries=3 -qO "$2" "$1"
+        fi
     else
         err "neither curl nor wget is installed"
         exit 1
@@ -218,6 +300,10 @@ main() {
     need uname
     need tar
 
+    # A bad RO_BASE_URL fails here with exit 3, naming the variable, before it
+    # can surface as a curl/wget error on the first download.
+    validate_base_url
+
     info "ro installer"
     info "repo:   https://github.com/${REPO}"
     info "user:   $(id -un 2>/dev/null || echo unknown)"
@@ -237,7 +323,19 @@ main() {
     # The current name is tried first, so a release cut after the rename
     # behaves exactly as before, and the legacy branch disappears on its
     # own once there is no legacy release left to serve.
-    local base="https://github.com/${REPO}/releases/download/${tag}"
+    # One base, one string, every URL. RO_BASE_URL replaces it wholesale so a
+    # local install test can serve the archive; unset, the expansion is
+    # byte-identical to the literal it replaced, so every real install
+    # constructs exactly the URLs it always did. The archive and the
+    # checksum below are both built from this variable — there is no second
+    # expression for the checksum to disagree with.
+    #
+    # The checksum is not "fetched from somewhere else": `checksum_url` is
+    # `<base>/<archive>.sha256`, so a RO_BASE_URL that names a directory
+    # without the `.sha256` fails to fetch the checksum and the install dies
+    # on a verification it could not perform. That is documented at the
+    # BASE_URL seam above rather than invented as a past bug.
+    local base="${BASE_URL:-https://github.com/${REPO}/releases/download/${tag}}"
     archive_name="${BIN}-${target}.tar.xz"
     checksum_url="${base}/${archive_name}.sha256"
 

@@ -22,18 +22,34 @@ fn a_missing_binary_is_unavailable_not_a_process_failure() {
 
     // An engine pointed at a binary that cannot exist, so the test does
     // not depend on whether `claude` happens to be installed here.
-    let engine = AgentEngine::claude();
+    //
+    // The absence is expressed as a *name*, not as a scrubbed PATH. A
+    // scrubbed PATH is a process-global fact, and this binary runs its
+    // tests in parallel against one process: writing
+    // `PATH=/nonexistent-directory-for-this-test` here makes every
+    // sibling test that spawns a bare `git` — which is what the testkit
+    // fixtures did — fail with `Os { code: 2, kind: NotFound }`. That is
+    // the flake `ro_testkit::git_path` was written to remove, and the way
+    // to keep it removed is to not need the global here. An absent name is
+    // the same fact about availability with none of the blast radius, and
+    // it is the shape `git_engine.rs` already uses for the same assertion
+    // (its doc comment says so explicitly).
+    let engine = AgentEngine::with(
+        ro_engine::EngineKind::Claude,
+        "definitely-not-installed-this-test-only",
+        None,
+    );
     let ctx = EngineContext::new(w.path(), "main");
 
-    let outcome = unsafe {
-        TestEnv::new()
-            .var("PATH", "/nonexistent-directory-for-this-test")
-            .run(|| engine.checkpoint(&ctx))
-    };
+    let outcome = engine.checkpoint(&ctx);
 
     match outcome {
         EngineOutcome::Unavailable { binary, hint } => {
-            assert_eq!(binary, "claude", "the message must name the binary");
+            assert_eq!(
+                binary, "definitely-not-installed-this-test-only",
+                "the message must name the binary that is missing, not some \
+                 other name"
+            );
             assert!(
                 hint.contains("checkpoint.engine"),
                 "the hint must name the setting that changes the answer, \
@@ -55,22 +71,35 @@ fn the_availability_probe_distinguishes_present_from_missing() {
     // A shim on PATH, so "present" is a fact this test created rather
     // than a guess about what the machine happens to have installed.
     let shim = ro_testkit::FakeBinary::recording("claude");
-    let engine = AgentEngine::claude();
-
-    let present = unsafe { TestEnv::new().shim(&shim).run(|| engine.availability()) };
-    let missing = unsafe {
+    let present = unsafe {
         TestEnv::new()
-            .var("PATH", "/nonexistent-directory-for-this-test")
-            .run(|| engine.availability())
+            .shim(&shim)
+            .run(|| AgentEngine::claude().availability())
     };
     assert!(
         present.is_present(),
         "a shim on PATH must read as present, got {present:?}"
     );
+
+    // The missing half is asserted against a name nothing can have
+    // installed, *without* scrubbing PATH. Writing an empty PATH here is
+    // the same process-global mutation as above — it answers "not on
+    // PATH" for every thread except the one asking, and that is exactly
+    // the failure `ro_testkit::git_path` exists for ("not found" on a bare
+    // `git` spawned by a parallel fixture has nothing to do with what that
+    // test is asserting). A definitely-absent name is the same negative
+    // control with no shared state at all, which is also why
+    // `git_engine.rs` chose it for its own missing-binary case.
+    let missing = AgentEngine::with(
+        ro_engine::EngineKind::Claude,
+        "definitely-not-installed-this-test-only",
+        None,
+    )
+    .availability();
     assert_eq!(
         missing,
         ro_engine::Availability::Missing,
-        "and an empty PATH must read as missing"
+        "and a name nothing on PATH can answer for must read as missing"
     );
 }
 

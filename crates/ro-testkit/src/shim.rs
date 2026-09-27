@@ -557,10 +557,29 @@ impl TestEnv {
     /// `catch_unwind` is what makes that true; the panic is then resumed
     /// so the caller's own reporting is unaffected.
     ///
+    /// The `git` resolution is **forced before the lock is taken**, not
+    /// after. That ordering is the whole structural half of the resolver's
+    /// guarantee, and putting it here makes it a property of the lock
+    /// rather than a property of the test suite: a fixture built inside
+    /// `body` calls [`git_path`] on a thread that is about to hold
+    /// `path_lock` for the duration of `body`, and a first call landing
+    /// there deadlocks — the `OnceLock` would need the same non-reentrant
+    /// lock the caller already has. Resolving first means the expensive
+    /// and only `PATH`-consulting call has already happened before the
+    /// guard exists, and the fixtures below can only ever read the cached
+    /// answer. See the resolver's doc comment for why the alternatives
+    /// (take the lock in the fixture; make the lock reentrant) are both
+    /// worse.
+    ///
     /// # Safety
     ///
     /// `body` must not mutate `PATH` or process-wide env vars.
     pub unsafe fn run<R>(self, body: impl FnOnce() -> R) -> R {
+        // Force the one-time `git` resolution while no guard is installed.
+        // Deliberately outside the `path_lock` critical section below —
+        // it takes the same lock itself when it runs the initializer.
+        let _git = git_path();
+
         // The one lock. Held until after the restore, so no other thread
         // can observe a half-installed environment.
         let _serialised = path_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -632,4 +651,228 @@ impl Default for TestEnv {
 pub fn path_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     &LOCK
+}
+
+/// The absolute path to `git`, resolved **once** and cached for the life of
+/// the process.
+///
+/// # The invariant, stated once so it is auditable
+///
+/// **Never spawn a bare `git` from inside ro-testkit.** The process-global
+/// `PATH` is *mutable by design* — [`TestEnv::run`] rewrites it, under
+/// [`path_lock`], for the whole body — and `Command::new("git")` resolves
+/// the name through that global at *spawn* time. So a fixture built on a
+/// thread that happens to be inside a `TestEnv` body is a `PATH` lookup
+/// against whatever that body installed, and the whole test binary shares
+/// one process and one `PATH`. That is the flake: `Worktree::empty` on one
+/// thread dying with `git runs: Os { code: 2, kind: NotFound }` because a
+/// test on another thread was asserting "this binary is not installed".
+///
+/// An absolute path has no lookup to lose. The scrub is still what it was —
+/// the point is that no *Rust-side* fixture spawn consults it any more.
+/// The exception is named, not hidden: the agent-engine shim *bodies* in
+/// this file shell out to a bare `git` (the `git add -A` / `git commit` /
+/// `git push` lines in `agent_engine`, `agent_engine_that_pushes` and
+/// `env_dumping_agent`, Unix and `.cmd` variants alike), because a body is
+/// generated text, not a `Command` the resolver could have built. That name
+/// is looked up through the process-global `PATH` at *shim runtime*, so a
+/// `PATH` scrub that straddles a running shim still starves the shell-side
+/// lookup exactly the way the cached path starved-proofs the fixture side.
+/// The tripwire in `worktree.rs` cannot catch them: it reads
+/// `Command::new("git")`, and these are not `Command`s. Baking the resolver
+/// into the generated bodies is left open — it ends the generated text's
+/// platform-channel, which `shim_body` exists to keep narrow — and until it
+/// happens the honest invariant is narrower than the blanket one: the
+/// absolute path protects spawns, not shell bodies.
+///
+/// # Why the fixture side cannot just take the lock instead
+///
+/// The obvious competing fix — have `worktree::run` hold [`path_lock`] —
+/// **self-deadlocks**, and the reasoning is worth keeping because it looks
+/// so reasonable. The lock is a non-reentrant static `Mutex`, and
+/// `TestEnv::run` holds it for the whole body. Fixtures are routinely built
+/// *inside* such a body (an engine test builds a `Worktree`, then runs the
+/// engine under a `PATH` guard; the same shape is in
+/// `credential_never_reaches_engine.rs`, `credential_never_reaches_agent.rs`
+/// and `tests/fixtures.rs`). A lock in the fixture is a lock ordering the
+/// caller already holds.
+///
+/// A **reentrant** variant keyed on [`std::thread::ThreadId`] is worse than
+/// no fix, and not because of anything about thread ids: they are a
+/// monotonic process-wide counter, never reused, so "this thread already
+/// holds the lock" would in fact be a *sound* answer. The objection is one
+/// step further out. The only thing the lock is for is keeping a `PATH`
+/// swap from straddling a read — and reentrancy means the inner holder is
+/// the swap itself. It would let a fixture resolve `git` out of the very
+/// `PATH` the enclosing `TestEnv` is holding it against, which is the
+/// mis-resolution the absolute path exists to prevent, arriving through the
+/// door that was added to stop the deadlock. A hang is a bad failure; a
+/// fixture that quietly ran against a half-installed environment and failed
+/// an unrelated assertion is worse, because nothing says the two are
+/// related. So reentrancy is rejected on the ground that the lock protects
+/// the read, not on any property of `ThreadId`.
+///
+/// # Why the one resolution still takes the lock
+///
+/// Exactly once, and never again. Reading `PATH` and running `git` are
+/// separate steps, and a `TestEnv` body that begins between them installs a
+/// `PATH` with no `git` in it. Snapshotting `PATH` under the lock makes that
+/// window unrepresentable rather than merely unlikely, and after it the
+/// answer is cached in a [`OnceLock`] so the whole "fixtures under a scrub"
+/// shape costs nothing.
+///
+/// # Why the resolution cannot deadlock, and what that rests on
+///
+/// The obvious first version of this held `path_lock` across the *whole*
+/// resolution, and it deadlocked: the lock is a non-reentrant static
+/// `Mutex`, and a fixture built inside a `TestEnv::run` body is on a thread
+/// that already holds it. So the lock is now taken to snapshot `PATH` and
+/// released before the walk — which is only half the answer, because the
+/// *snapshot* still wants the lock, and a cold call from inside a body still
+/// wants it too.
+///
+/// The other half is that no call can be cold while the caller holds the
+/// lock: [`TestEnv::run`] forces the resolution at its top, **before** it
+/// takes `path_lock`. `path_lock` is only ever held by `TestEnv::run`, and
+/// `TestEnv::run` always resolves first, so by the time any body executes
+/// the `OnceLock` is populated and every later call is a cache read that
+/// touches no lock at all. That is an ordering in code, not a convention in
+/// a test file.
+///
+/// **The residual, stated because it is a real coupling:** a future holder of
+/// `path_lock` that does not pre-warm reintroduces a hang, and the hang has
+/// no message — the caller is stuck acquiring the lock, never reaching the
+/// `git_on_path` walk or the panic below. `TestEnv::run` is the only holder
+/// today. If a second one appears, it needs the same forced resolution at
+/// its top, or the resolver needs to stop wanting the lock.
+///
+/// Once resolved, a scrub cannot reach the cached answer at all: the
+/// `OnceLock` is written exactly once, `TestEnv` rewrites `PATH` for the
+/// duration of a body and restores it after, and no second resolution
+/// consults `PATH`.
+///
+/// # Panics
+///
+/// If `git` is genuinely absent from the snapshotted `PATH`. That is a broken
+/// environment, and a panic naming it *here* — once, at the one place that
+/// knows the answer — beats `NotFound` surfacing a hundred tests deep with the
+/// wrong culprit. A `PATH` scrub installed by a *sibling* thread cannot
+/// trigger it, because the snapshot waits for `path_lock`, which that
+/// thread's `TestEnv::run` holds for its whole body: the scrubber is either
+/// not running, or has already restored. A scrub cannot be visible to the
+/// pre-warm in `TestEnv::run` either, for the same reason — and a scrub
+/// cannot be visible *from* a body, because the body can only run after the
+/// pre-warm has already resolved.
+pub fn git_path() -> &'static Path {
+    static RESOLVED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    RESOLVED.get_or_init(|| {
+        // The window this closes: `TestEnv::run` swapping `PATH` between the
+        // read and the result. So the *snapshot* is taken under the lock —
+        // that is the one thing the lock is for, and holding it only for the
+        // read is what makes this callable from inside a `TestEnv::run` body.
+        //
+        // The lock is **released before the walk**. An earlier version held it
+        // across the whole resolution, which deadlocked: the lock is a
+        // non-reentrant static `Mutex`, `TestEnv::run` holds it for its whole
+        // body, and fixtures are routinely built *inside* such a body — so a
+        // cold call from there re-locked a mutex the calling thread already
+        // held and hung the suite. That was a real hang, reproduced and
+        // confirmed, not a theoretical one.
+        //
+        // Releasing first is safe precisely because the snapshot was coherent:
+        // `TestEnv::run` installs every var and its `PATH` swap inside this
+        // same lock, so anything read under it is a `PATH` that was fully
+        // installed at some instant. A `git` found there names a real binary,
+        // and that fact survives any later scrub. The race this leaves — a
+        // scrub landing between the snapshot and the walk — can only make the
+        // walk *miss*, never make it resolve a different `git`.
+        let path_var = {
+            let _serialised = path_lock().lock().unwrap_or_else(|e| e.into_inner());
+            std::env::var_os("PATH")
+        };
+        git_on_path(&path_var).unwrap_or_else(|| {
+            panic!(
+                "git was not found on PATH, so no testkit fixture can build a \
+                 repository. This is a broken environment, not a test failure: \
+                 every `Worktree` and `BareRemote` in the workspace needs it."
+            )
+        })
+    })
+}
+
+/// The first `git` on the current `PATH`, Windows extensions included.
+///
+/// A `PATH` walk rather than a bare name, for two reasons. First, the point
+/// of this module: the answer must be an absolute path that survives `PATH`
+/// being rewritten afterwards. Second, on Windows a bare name is not a file,
+/// it is a *family* of files decided by `PATHEXT` (`git.exe`, `git.cmd`, …).
+/// Getting that wrong does not fail on the machine it was written on — it
+/// fails on the Windows CI leg, where a fixture that "cannot find git" costs
+/// the whole job. So the extensions tried are the platform's own list, read
+/// from `PATHEXT` with the usual default, in the platform's own order — the
+/// same rule the loader applies, minus the loader.
+///
+/// Empty `PATH` entries are skipped rather than read as the current
+/// directory: a `git` found relative to wherever the test binary happens to
+/// run is a fixture that depends on the runner's working directory, which is
+/// exactly the "quietly depends on the machine" failure every other
+/// constructor comment in this file is written against.
+fn git_on_path(path_var: &Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let path_var = path_var.as_ref()?;
+    for dir in std::env::split_paths(&path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        for candidate in git_candidates(&dir) {
+            if is_runnable(&candidate) {
+                // Canonicalised now, against *this* process's directory:
+                // the fixture later sets `current_dir` on the command, and
+                // a relative `PATH` entry would be re-resolved against the
+                // new repository instead. The fallback keeps a lost race (a
+                // temp dir removed under us) from turning into a panic; the
+                // path we found still names a real `git`.
+                return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+            }
+        }
+    }
+    None
+}
+
+/// The filenames `git` can have in `dir`: the bare name everywhere, plus
+/// every `PATHEXT` spelling on Windows, in the platform's order.
+fn git_candidates(dir: &Path) -> Vec<PathBuf> {
+    let mut out = vec![dir.join("git")];
+    if cfg!(windows) {
+        // The loader's own list when present (`.COM;.EXE;.BAT;.CMD;…`),
+        // the documented default when it is not. Either way the platform's
+        // rule, not a guess made on a Unix machine about what Windows does.
+        let pathext =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        for ext in pathext.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            let ext = ext.strip_prefix('.').unwrap_or(ext);
+            out.push(dir.join(format!("git.{ext}")));
+        }
+    }
+    out
+}
+
+/// A file that can actually be spawned: present, a file (not a directory a
+/// previous install left behind), and — where the platform has the bit —
+/// marked executable.
+fn is_runnable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }

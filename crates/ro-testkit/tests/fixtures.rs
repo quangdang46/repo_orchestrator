@@ -12,8 +12,10 @@
 //! same green.
 
 use std::process::Command;
+use std::sync::Barrier;
+use std::time::Duration;
 
-use ro_testkit::{BareRemote, Captured, FakeBinary, RemotePair, Worktree};
+use ro_testkit::{BareRemote, Captured, FakeBinary, RemotePair, TestEnv, Worktree};
 
 /// Run `args` through `shim`, returning what the shim saw.
 ///
@@ -353,4 +355,127 @@ fn captured_combines_both_streams() {
         leaky.contains_pat(),
         "a token on stderr is leaked exactly as much as one on stdout"
     );
+}
+
+/// Fixtures keep building while another thread scrubs `PATH`.
+///
+/// The flake, reproduced: the availability test in `ro-engine` used to write
+/// `PATH=/nonexistent-directory-for-this-test` under the one global lock
+/// (`TestEnv::run`), and — because a bare `git` resolves that name at spawn
+/// *time* — a `Worktree` built on any sibling thread failed with
+/// `git runs: Os { code: 2, kind: NotFound }`. Nothing in the failing test has
+/// anything to do with `git`; the error names a fixture. That is the whole
+/// shape of the bug, so this is the test that pins it.
+///
+/// The invariant under test: a fixture spawn consults no process-global
+/// state. `ro_testkit::git_path` resolves `git` once to an absolute path and
+/// caches it, so after the first resolution a scrubbed `PATH` is irrelevant
+/// — by construction, and here by observation.
+///
+/// Why this shape, and not the deadlocks it avoids:
+///
+/// - The **scrubber** takes the real lock and holds it for a whole
+///   `TestEnv::run` body, exactly like the engine test it reproduces.
+///   It never touches fixture state.
+/// - The **builder** takes **no lock at all**. That is the point: the
+///   competing design — the fixture holding `path_lock` — self-deadlocks,
+///   because the lock is a non-reentrant `Mutex` and `TestEnv::run` holds
+///   it for a body that routinely builds a fixture *inside* it.
+/// - **Bounded loops, no retries.** A fixed number of iterations on each
+///   side; the assertion is "every one of those N built", not "it built
+///   eventually". A retry loop would make this test hang rather than fail
+///   under contention — the wrong lesson from a slow machine.
+/// - The builder asserts the *files exist* after each build, not merely that
+///   no error was thrown: a fixture that half-built would otherwise read as a
+///   pass.
+///
+/// Kept modest on purpose: each fixture is a `git init` plus a commit, so
+/// `K` is the number of commits this test pays for, and the cost is
+/// seconds, not minutes.
+#[test]
+fn fixtures_build_while_path_is_scrubbed_on_another_thread() {
+    // Bounded, so the test adds seconds rather than minutes and — more
+    // importantly — so a pre-fix failure *count* is a number, not a guess.
+    // 30 is enough that a fixture built against a scrubbed global PATH at
+    // any point during the run is overwhelmingly likely to be hit.
+    const K: usize = 30;
+
+    // One barrier, released by both threads together, so the two loops
+    // overlap for the whole run rather than serially. Without it the builder
+    // could finish before the scrubber started, and the test would be a
+    // green nothing — the same failure mode the recorder guards exist for.
+    let start = Barrier::new(2);
+
+    // A thread *scope*: both threads must finish before the assertion, and
+    // `join` is the only way to know that. A detached thread would make the
+    // pass/fail depend on the test harness happening to wait.
+    //
+    // `scrubs` is the vacuity guard for the whole test. If the two loops ever
+    // stopped overlapping, the builder would simply build K fixtures under
+    // a healthy `PATH` — green, and proving nothing, which is the exact
+    // failure mode the negative controls in this file exist to prevent. The
+    // scrubber counts what it actually did, so a test that never raced
+    // cannot read as a test that raced and passed.
+    let scrubs = std::sync::atomic::AtomicUsize::new(0);
+    let scrubs = &scrubs;
+    std::thread::scope(|scope| {
+        let builder = scope.spawn(|| {
+            start.wait();
+            for _ in 0..K {
+                let w = Worktree::with_one_commit();
+                // Assert the artifact, not the absence of a panic: the
+                // pre-fix failure was `git runs: ... NotFound` on exactly
+                // this call, and a fixture that failed to build must be
+                // counted, not skipped.
+                assert!(
+                    w.path().join(".git").exists(),
+                    "the worktree was not really built"
+                );
+                let remote = BareRemote::ephemeral();
+                assert!(
+                    remote.path().join("HEAD").exists(),
+                    "the bare remote was not really built"
+                );
+                assert!(remote.branches().is_empty());
+            }
+        });
+
+        let scrubber = scope.spawn(|| {
+            start.wait();
+            // The pre-fix engine test's scrub, reproduced as the same
+            // lock-held global mutation for the same duration shape.
+            for _ in 0..K {
+                // SAFETY: the body mutates nothing and sleeps; the
+                // global `PATH` swap is installed and restored by the
+                // `TestEnv` under its own lock. The sleep is what
+                // makes the window overlap the builder's spawns rather
+                // than flash past them.
+                unsafe {
+                    TestEnv::new()
+                        .var("PATH", "/nonexistent-directory-for-this-test")
+                        .run(|| std::thread::sleep(Duration::from_millis(1)))
+                };
+                // Counted only after the restore, so a count of K means K
+                // *completed* scrubs, not K attempts.
+                scrubs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+
+        // `join` rather than `is_finished`: a panicked thread must fail
+        // this test, and the `expect` on the `Result` is the assertion. A
+        // timeout would be a worse test — the fix must not trade a flake
+        // for a hang, so a hang is a failure here, loudly.
+        builder.join().expect("the builder thread must not panic");
+        scrubber.join().expect("the scrubber thread must not panic");
+
+        // The overlap really happened, so the builder really did race a
+        // scrubbed `PATH` K times. Without this the test would pass on a
+        // run where the two threads never met.
+        assert_eq!(
+            scrubs.load(std::sync::atomic::Ordering::SeqCst),
+            K,
+            "every scrub must have run: a test whose two threads never \
+             overlap passes for a reason unrelated to what it claims"
+        );
+    });
 }
