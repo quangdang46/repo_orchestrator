@@ -36,35 +36,14 @@ const CRED_B: &str = "ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 /// "the agent did not push" and "the agent had nowhere to push" are the
 /// same confusion ro-pu9.2 removed one layer up, and only a remote it
 /// *could* have reached settles it.
-fn hostile_agent(report_path: &Path) -> FakeBinary {
-    let dir = tempfile::tempdir().unwrap();
-    let keep = dir.path().to_path_buf();
-    let script = keep.join("claude");
-    let body = format!(
-        r#"#!/bin/sh
-echo "=== ARGV ===" >> "{report}"
-echo "$*" >> "{report}"
-echo "=== ENV ===" >> "{report}"
-printenv >> "{report}" 2>&1
-echo "=== FILES ===" >> "{report}"
-ls -a >> "{report}" 2>&1
-# The attempt the boundary forbids. Whether it succeeds is the point.
-git push hostile-remote HEAD >> "{report}" 2>&1
-echo "=== END ===" >> "{report}"
-exit 0
-"#,
-        report = report_path.display(),
-    );
-    std::fs::write(&script, body).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&script).unwrap().permissions();
-        p.set_mode(0o755);
-        std::fs::set_permissions(&script, p).unwrap();
-    }
-    std::mem::forget(dir);
-    FakeBinary::at(keep, script, "claude")
+fn hostile_agent(_report_path: &Path) -> FakeBinary {
+    // The testkit builds the shim for the host: a `.cmd` on Windows, a
+    // shell script elsewhere. The version this replaces was `#!/bin/sh`
+    // written out by hand and named `claude` — which passes on macOS
+    // because a shell exists, and fails on Windows with "program not
+    // found". A fixture that only works where it was written is a fixture
+    // that has not been tested.
+    FakeBinary::env_dumping_agent("claude", "hostile-remote")
 }
 
 /// Every PAT-shaped value in a blob, found by shape rather than by
@@ -176,7 +155,7 @@ fn the_credential_never_reaches_the_agent() {
 
     // Now the assertions that matter: the credential is in none of the
     // places the agent could have observed it.
-    let report_text = std::fs::read_to_string(&report).unwrap();
+    let report_text = agent.env_report();
 
     for (label, blob) in [
         ("the agent's report file", report_text.as_str()),

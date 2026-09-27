@@ -183,6 +183,62 @@ exit /b 0"#
         }
     }
 
+    /// A hostile agent: dumps its argv, its whole environment and a
+    /// directory listing, then attempts a push of its own.
+    ///
+    /// The push is the point. "The engine did not push" and "the engine
+    /// had nowhere to push" are the same observation, and only a remote it
+    /// *could* have reached settles it.
+    ///
+    /// Built through the same `shim_body` path as every other shim here,
+    /// so it exists as a `.cmd` on Windows rather than a POSIX script that
+    /// no Windows runner can execute. A fixture written as `#!/bin/sh` and
+    /// named `claude` passes on macOS and fails on two thirds of the
+    /// matrix — which is a fixture that only works where it was written.
+    pub fn env_dumping_agent(name: &str, remote: &str) -> Self {
+        let dir = TempDir::new().expect("the shim dir is creatable");
+        let log = dir.path().join("agent-report.txt");
+        let body = shim_body(
+            &format!(
+                r#"echo "=== ARGV ===" >> "$RO_TESTKIT_LOG"
+echo "$*" >> "$RO_TESTKIT_LOG"
+echo "=== ENV ===" >> "$RO_TESTKIT_LOG"
+printenv >> "$RO_TESTKIT_LOG" 2>&1
+echo "=== FILES ===" >> "$RO_TESTKIT_LOG"
+ls -a >> "$RO_TESTKIT_LOG" 2>&1
+echo "=== PUSH ===" >> "$RO_TESTKIT_LOG"
+cd "$RO_TESTKIT_WORKDIR" 2>/dev/null && git push {remote} HEAD >> "$RO_TESTKIT_LOG" 2>&1
+echo "=== END ===" >> "$RO_TESTKIT_LOG"
+exit 0"#
+            ),
+            &format!(
+                r#"@echo off
+echo === ARGV ===>> "%RO_TESTKIT_LOG%"
+echo %*>> "%RO_TESTKIT_LOG%"
+echo === ENV ===>> "%RO_TESTKIT_LOG%"
+set>> "%RO_TESTKIT_LOG%" 2>&1
+echo === FILES ===>> "%RO_TESTKIT_LOG%"
+dir>> "%RO_TESTKIT_LOG%" 2>&1
+echo === PUSH ===>> "%RO_TESTKIT_LOG%"
+cd /d "%RO_TESTKIT_WORKDIR%"
+git push {remote} HEAD>> "%RO_TESTKIT_LOG%" 2>&1
+echo === END ===>> "%RO_TESTKIT_LOG%"
+exit /b 0"#
+            ),
+            &log,
+        );
+        write_shim(dir.path(), name, &body);
+        Self {
+            dir: OwnedDir::Temp(dir),
+            name: name.to_string(),
+        }
+    }
+
+    /// What the env-dumping agent saw, as one string.
+    pub fn env_report(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("agent-report.txt")).unwrap_or_default()
+    }
+
     /// A shim from a script the caller wrote, kept alive by a caller-owned
     /// directory.
     ///

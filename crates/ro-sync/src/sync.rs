@@ -506,19 +506,30 @@ mod tests {
         (tmp, conn)
     }
 
-    fn run_git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
+    /// Run git without depending on the machine's own configuration.
+    ///
+    /// A developer has `user.email` in their `~/.gitconfig`; a CI
+    /// runner does not, so a fixture that commits is green on one and
+    /// "Author identity unknown" on the other. The identity comes from
+    /// the environment git documents for exactly this, and the config
+    /// files are neutralised — `NUL` on Windows, `/dev/null` elsewhere.
+    fn run_git(dir: &Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args)
             .current_dir(dir)
             .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .unwrap();
-        if !out.status.success() {
-            panic!(
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
+            .env("LC_ALL", "C")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com");
+        #[cfg(windows)]
+        cmd.env("GIT_CONFIG_GLOBAL", "NUL")
+            .env("GIT_CONFIG_SYSTEM", "NUL");
+        #[cfg(not(windows))]
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        cmd.output().expect("git runs")
     }
 
     fn init_bare_remote(dir: &Path) -> PathBuf {
@@ -998,24 +1009,29 @@ mod filter_and_skip_tests {
     /// passes on a workstation and fails on a CI runner with no identity
     /// configured — "Author identity unknown" on one machine and green on
     /// another, for the same commit.
-    fn run_git(dir: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
+    /// Run git without depending on the machine's own configuration.
+    ///
+    /// A developer has `user.email` in their `~/.gitconfig`; a CI
+    /// runner does not, so a fixture that commits is green on one and
+    /// "Author identity unknown" on the other. The identity comes from
+    /// the environment git documents for exactly this, and the config
+    /// files are neutralised — `NUL` on Windows, `/dev/null` elsewhere.
+    fn run_git(dir: &Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(args)
             .current_dir(dir)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.com")
             .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .output()
-            .expect("git runs");
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+            .env("GIT_COMMITTER_EMAIL", "test@example.com");
+        #[cfg(windows)]
+        cmd.env("GIT_CONFIG_GLOBAL", "NUL")
+            .env("GIT_CONFIG_SYSTEM", "NUL");
+        #[cfg(not(windows))]
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+        cmd.output().expect("git runs")
     }
 }
