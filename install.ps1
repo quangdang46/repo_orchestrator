@@ -6,6 +6,9 @@
 # Environment knobs:
 #   $env:RO_VERSION   Specific version tag (e.g. "v0.1.0").  Default: latest release
 #   $env:RO_PREFIX    Install directory for ro.exe.          Default: $env:LOCALAPPDATA\Programs\ro
+#   $env:GITHUB_TOKEN Optional. Only used to raise the GitHub API rate limit
+#                     on the fallback path; the default path needs no token,
+#                     and public read access is enough.
 #
 # Downloads the pre-built binary from GitHub Releases — no Rust toolchain
 # required.  Only needs PowerShell 5+ and internet access.
@@ -30,14 +33,55 @@
     }
 
     # ── Resolve version tag ──────────────────────────────────────────────
+    # An optional token, used only to raise the API rate limit on the
+    # fallback path. Public read access is enough, and the default path
+    # below does not use the API at all.
+    $apiHeaders = @{}
+    if ($env:GITHUB_TOKEN) {
+        $apiHeaders['Authorization'] = "Bearer $env:GITHUB_TOKEN"
+    }
+
+    # The tag of the latest release, resolved **without the GitHub API**.
+    #
+    # `releases/latest` answers with a redirect to `releases/tag/<tag>`, and
+    # following it costs no API quota. The API endpoint is unauthenticated
+    # by default and GitHub rate-limits it per source address — which is
+    # what a CI runner and a user behind a shared NAT both are. The failure
+    # is a 403 on a script that had nothing to do with rate limits, and it
+    # is non-deterministic: the same workflow, one runner green and one red.
+    function Get-LatestTagViaRedirect {
+        try {
+            $resp = Invoke-WebRequest -Uri "https://github.com/$GH_REPO/releases/latest" -UseBasicParsing
+            # PowerShell 5 and 7 expose the final URI differently; both are
+            # handled so the script works on the one it actually runs on.
+            $uri = $null
+            if ($resp.BaseResponse.RequestMessage.RequestUri) {
+                $uri = $resp.BaseResponse.RequestMessage.RequestUri.AbsoluteUri
+            } elseif ($resp.BaseResponse.ResponseUri) {
+                $uri = $resp.BaseResponse.ResponseUri.AbsoluteUri
+            }
+            if ($uri -and $uri -match '/releases/tag/([^/]+)$') { return $Matches[1] }
+        } catch {
+            # Fall through to the API. Not worth reporting: the API may
+            # still succeed, and if it does not the caller says so.
+        }
+        return $null
+    }
+
     $tag = $env:RO_VERSION
     if (-not $tag) {
         Write-Step 'resolving latest release ...'
-        try {
-            $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$GH_REPO/releases/latest" -UseBasicParsing
-            $tag = $release.tag_name
-        } catch {
-            Fail "could not fetch latest release from GitHub: $_"
+        $tag = Get-LatestTagViaRedirect
+        if (-not $tag) {
+            try {
+                $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$GH_REPO/releases/latest" -Headers $apiHeaders -UseBasicParsing
+                $tag = $release.tag_name
+            } catch {
+                Fail "could not resolve the latest release from GitHub: $_`n" +
+                     "  GitHub may be rate-limiting this network. Either set" +
+                     " `$env:GITHUB_TOKEN (public read access is enough) or pin a" +
+                     " version with `$env:RO_VERSION."
+            }
         }
     }
     Write-Step "version: $tag"

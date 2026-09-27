@@ -152,6 +152,8 @@ jobs:
     name: Installer (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -168,6 +170,10 @@ jobs:
           # The job re-runs on a fresh runner, but a cache hit would make
           # the "already exists" refusal fire for the wrong reason.
           RO_FORCE: "1"
+          # The installer resolves the latest tag from a redirect and does
+          # not need the API. This only raises the limit on its fallback,
+          # which is what an unauthenticated runner otherwise gets 403'd on.
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash install.sh
 
       - name: Run install.ps1
@@ -175,6 +181,7 @@ jobs:
         shell: pwsh
         env:
           RO_PREFIX: ${{ github.workspace }}\robin
+          GITHUB_TOKEN: ${{ github.token }}
         run: ./install.ps1
 
       # The install is only evidence if the binary it placed is the one that

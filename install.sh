@@ -9,6 +9,9 @@
 #   RO_INSTALL_DIR   Where the `ro` binary is placed. Default: $HOME/.local/bin.
 #   RO_NO_VERIFY     If set to 1, skip SHA256 verification (NOT recommended).
 #   RO_FORCE         If set to 1, overwrite an existing binary without prompting.
+#   GITHUB_TOKEN     Optional. Only used to raise the GitHub API rate limit
+#                    while resolving "latest"; the default path needs no
+#                    token, and public read access is enough.
 #
 # Exit codes:
 #   0  success
@@ -73,13 +76,45 @@ http_get() {
 
 http_get_stdout() {
     if command -v curl >/dev/null 2>&1; then
-        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 "$1"
+        curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 ${GITHUB_TOKEN:+-H "Authorization: Bearer $GITHUB_TOKEN"} "$1"
     elif command -v wget >/dev/null 2>&1; then
-        wget --https-only --tries=3 -qO- "$1"
+        wget --https-only --tries=3 -qO- ${GITHUB_TOKEN:+--header="Authorization: Bearer $GITHUB_TOKEN"} "$1"
     else
         err "neither curl nor wget is installed"
         exit 1
     fi
+}
+
+# The tag of the latest release, resolved **without the GitHub API**.
+#
+# `releases/latest` answers with a redirect to `releases/tag/<tag>`, and
+# following it costs no API quota. The API endpoint is unauthenticated by
+# default and GitHub rate-limits it per source address — which is exactly
+# what a CI runner and a user behind a shared NAT both are. The failure is a
+# 403 on a script that had nothing to do with rate limits, and it is
+# non-deterministic: two runners in the same workflow, one green and one
+# red, on the same script.
+#
+# Returns non-zero if the shape is not what it expects, and the caller
+# falls back to the API.
+latest_tag_via_redirect() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local effective
+    effective="$(curl --proto '=https' --tlsv1.2 -fsSLI -o /dev/null \
+        --retry 3 --retry-delay 2 \
+        -w '%{url_effective}' \
+        "https://github.com/${REPO}/releases/latest" 2>/dev/null)" || return 1
+    effective="${effective%/}"
+    case "$effective" in
+        */releases/tag/*)
+            printf '%s' "${effective##*/}"
+            ;;
+        *)
+            # The redirect did not go where it should — a redirect to a
+            # login page, or an HTML error page. Let the API try.
+            return 1
+            ;;
+    esac
 }
 
 sha256_of() {
@@ -134,26 +169,39 @@ resolve_version() {
     if [ "$VERSION" = "latest" ]; then
         local api="https://api.github.com/repos/${REPO}/releases/latest"
         local tag
-        tag="$(http_get_stdout "$api" \
-            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-            | head -n1)"
+        # Redirect first, API second. The redirect needs no quota; the API
+        # is the fallback for the machines that have no curl.
+        tag="$(latest_tag_via_redirect 2>/dev/null || true)"
         if [ -z "$tag" ]; then
-            err "could not resolve latest release tag from $api"
-            err "GitHub may be rate-limiting; pin a version with RO_VERSION=v0.1.0"
+            tag="$(http_get_stdout "$api" 2>/dev/null \
+                | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                | head -n1)"
+        fi
+        if [ -z "$tag" ]; then
+            err "could not resolve the latest release tag"
+            err "GitHub may be rate-limiting this network; either set"
+            err "  GITHUB_TOKEN=<token>    (only needs public read access)"
+            err "or pin a version explicitly:"
+            err "  RO_VERSION=v0.2.0 bash install.sh"
             exit 3
         fi
 
-        # Verify the release has assets; a tag-only release (CI still
-        # running or failed) will 404 on the actual artifact URL.
-        local assets
-        assets="$(http_get_stdout "$api" \
-            | sed -n 's/.*"assets"[[:space:]]*:[[:space:]]*\[\]/EMPTY/p' \
-            | head -n1)"
-        if [ "$assets" = "EMPTY" ]; then
-            err "release ${tag} has no assets yet (CI may still be building)"
-            err "wait a few minutes and retry, or build from source:"
-            err "  git clone https://github.com/${REPO} && cd repo_orchestrator && cargo build --release"
-            exit 3
+        # A tag-only release — CI still building, or a failed run — 404s on
+        # the artifact URL. Worth catching early *when the API answers*.
+        # When it does not answer, saying so and continuing is right: the
+        # download reports a far more specific error than this can, and
+        # failing here instead would break an install that was about to
+        # work.
+        local body
+        if body="$(http_get_stdout "$api" 2>/dev/null)"; then
+            case "$body" in
+                *'"assets"'*'[]'*)
+                    err "release ${tag} has no assets yet (CI may still be building)"
+                    err "wait a few minutes and retry, or build from source:"
+                    err "  git clone https://github.com/${REPO} && cd repo_orchestrator && cargo build --release"
+                    exit 3
+                    ;;
+            esac
         fi
 
         printf '%s' "$tag"

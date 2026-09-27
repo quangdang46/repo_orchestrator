@@ -124,8 +124,14 @@ exit /b 0"##,
         let log = dir.path().join("argv.log");
         let body = shim_body(
             &format!("cat >&2 <<'RO_TESTKIT_EOF'\n{stderr}\nRO_TESTKIT_EOF\nexit {code}"),
+            // `1>&2` after the message, so the text goes to **stderr** and
+            // the redirection is not part of it. Plain `echo` writes to
+            // stdout, which is a different shim: the Unix body above sends
+            // this same text to stderr, and a fixture that disagrees with
+            // its own contract between platforms makes every assertion
+            // about "what the agent said" platform-dependent.
             &format!(
-                "@echo off\r\necho {}\r\nexit /b {code}",
+                "@echo off\r\necho {} 1>&2\r\nexit /b {code}",
                 stderr.replace('\n', " ")
             ),
             &log,
