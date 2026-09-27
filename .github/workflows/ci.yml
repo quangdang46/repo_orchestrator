@@ -136,17 +136,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-      # `keychain` is default-on in ro-core, and it reaches
-      # `dbus-secret-service` -> `libdbus-sys`, whose build script shells
-      # out to `pkg-config` for `dbus-1`. The gnu targets need the package;
-      # without it the build dies inside `libdbus-sys` with "Package dbus-1
-      # was not found", which reads as a broken dependency tree rather than
-      # a missing system package. Same reason, same step, as clippy and test.
-      - name: Install Linux system libraries
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libdbus-1-dev
       - name: Build
         env:
           # Tell the cc / cmake crates to use the ARM cross-compilers when
@@ -156,16 +145,20 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: ${{ contains(matrix.target, 'aarch64') && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-linux-gnu-g++' || '' }}
           AR_aarch64_unknown_linux_gnu: ${{ contains(matrix.target, 'aarch64') && runner.os == 'Linux' && runner.arch == 'X64' && 'aarch64-linux-gnu-ar' || '' }}
         run: |
-          if [[ "${{ matrix.target }}" == *musl ]]; then
-            # musl builds without the keychain feature.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            # Linux builds the release feature set: no default features, so
+            # no `keychain` and therefore no `dbus-1`.
             #
-            # A statically linked musl binary cannot link a **glibc**
-            # libdbus, so for this target the feature has no working
-            # implementation — that is a missing libc, not a missing
-            # package, and no `apt-get install` fixes it. Dropping the
-            # feature leaves a working tool rather than a broken one, which
-            # is the stated design of `keychain`: `env:VAR_NAME` is always
-            # available and the resolver names it when it is what is needed.
+            # Every Linux target needs this for a different reason, and all
+            # three are the same bug wearing different clothes:
+            #   musl  — a static musl binary cannot link a *glibc* libdbus.
+            #   gnu   — needs `libdbus-1-dev` installed, or pkg-config fails.
+            #   aarch64 gnu — cross-compiling on an x86_64 runner, pkg-config
+            #     hands back **amd64** library paths for an aarch64 link.
+            # Turning the feature off sidesteps all three, and it is exactly
+            # what the release does, so this job verifies the shipped
+            # configuration rather than a near neighbour of it. The keychain
+            # path is still compiled and tested by the test and clippy jobs.
             cargo build --release --workspace --target ${{ matrix.target }} --no-default-features
           else
             cargo build --release --workspace --target ${{ matrix.target }}
