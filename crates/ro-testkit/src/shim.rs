@@ -406,24 +406,39 @@ fn shim_body(log_line: &str, windows: &str, log: &Path) -> String {
 /// everywhere would mean the Unix file is a stray non-executable, so the
 /// platform decides.
 fn write_shim(dir: &std::path::Path, name: &str, body: &str) {
+    // Windows gets **two** files. A `.cmd` is what `Command::new` can
+    // spawn there, but the engine resolves the binary it was *configured*
+    // with — `claude` — and the loader does not consult `PATHEXT` for a
+    // bare name. Writing the extensionless name as well means both an
+    // explicit spawn and the production resolution find something,
+    // whichever path a given test takes.
     #[cfg(windows)]
-    let file = dir.join(format!("{name}.cmd"));
+    let files = vec![dir.join(format!("{name}.cmd")), dir.join(name)];
     #[cfg(not(windows))]
-    let file = dir.join(name);
+    let files = vec![dir.join(name)];
 
-    std::fs::write(&file, body).expect("the shim is writable");
+    // A `.cmd` run by `cmd.exe` needs CRLF; a `#!/bin/sh` one needs LF.
+    #[cfg(windows)]
+    let body = &body.replace('\n', "\r\n");
 
+    for file in &files {
+        std::fs::write(file, body).expect("the shim is writable");
+    }
+
+    // A mode bit, on the platform that has one. Windows decides what is
+    // executable by extension rather than by a permission bit, so there
+    // is nothing to set there.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&file)
-            .expect("the shim exists")
-            .permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&file, perms).expect("the mode is settable");
+        for file in &files {
+            let mut perms = std::fs::metadata(file)
+                .expect("the shim exists")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(file, perms).expect("the mode is settable");
+        }
     }
-    // On Windows no mode bit is needed: PATHEXT resolution does not check
-    // one, and a `.cmd` is not a Unix executable in the first place.
 }
 
 /// Process-global state a test needs changed, installed and restored under
