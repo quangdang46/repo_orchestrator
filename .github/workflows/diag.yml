@@ -7,13 +7,26 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux system libraries (needed by ro-core on any OS here)
-        run: echo skipped
-      - name: Run one failing test with output
-        run: cargo test -p ro-engine --test agent_engines -- --nocapture the_prompt_arrives 2>&1
-      - name: What is in the shim dir
+      - name: Try the three ways of appending argv in a .cmd
         shell: pwsh
         run: |
-          Get-ChildItem -Path $env:TEMP -Recurse -Filter "claude*" -ErrorAction SilentlyContinue |
-            Select-Object -First 10 FullName
+          $d = Join-Path $env:RUNNER_TEMP "t"
+          New-Item -ItemType Directory -Path $d -Force | Out-Null
+          $log = Join-Path $d "log.txt"
+
+          # A: nul set /p
+          Set-Content -Path (Join-Path $d "a.cmd") -Value "@echo off`r`n<nul set /p=`"%*`" >> `"$log`"`r`nexit /b 0"
+          & (Join-Path $d "a.cmd") -p hello
+          Write-Host "A nul-set  => [$(if (Test-Path $log) { (Get-Content $log -Raw) } else { '<no file>' })]"
+
+          Remove-Item $log -ErrorAction SilentlyContinue
+          # B: echo with redirection
+          Set-Content -Path (Join-Path $d "b.cmd") -Value "@echo off`r`necho %*>> `"$log`"`r`nexit /b 0"
+          & (Join-Path $d "b.cmd") -p hello
+          Write-Host "B echo    => [$(if (Test-Path $log) { (Get-Content $log -Raw) } else { '<no file>' })]"
+
+          Remove-Item $log -ErrorAction SilentlyContinue
+          # C: plain echo, no redirect quoting
+          Set-Content -Path (Join-Path $d "c.cmd") -Value "@echo off`r`necho %* > `"$log`"`r`nexit /b 0"
+          & (Join-Path $d "c.cmd") -p hello
+          Write-Host "C echo2   => [$(if (Test-Path $log) { (Get-Content $log -Raw) } else { '<no file>' })]"
