@@ -156,6 +156,13 @@ enum Commands {
         /// Network timeout in seconds
         #[arg(long)]
         timeout: Option<u32>,
+        /// Restrict to repos matching a selector, e.g. `health:50`
+        #[arg(long)]
+        filter: Option<String>,
+        /// Every tracked repo — the default, stated so the fleet verbs can
+        /// be spelled the same way at every verb
+        #[arg(long)]
+        all: bool,
     },
 
     /// Show status of tracked repos
@@ -744,6 +751,8 @@ fn run() -> Result<()> {
             pull_only,
             autostash,
             timeout,
+            filter,
+            all,
         } => {
             if clone_only && pull_only {
                 anyhow::bail!("--clone-only and --pull-only cannot be used together");
@@ -762,13 +771,31 @@ fn run() -> Result<()> {
             // there is nothing wrong with asking for everything when there
             // is nothing.
             let selected: Vec<String> = if repos.is_empty() {
-                Vec::new()
+                // `--all` and a filter go through the **same resolver** the
+                // fleet verbs use, so "which repos does that name mean" has
+                // one answer in this tool rather than one per verb.
+                if all || filter.is_some() {
+                    let targets = ro_sync::targets::resolve_targets(
+                        &conn,
+                        None,
+                        filter.as_deref(),
+                        all,
+                        &paths.state_dir.join("projects"),
+                    )
+                    .map_err(|e| {
+                        eprintln!("error: {e:#}");
+                        std::process::exit(exit::EX_USAGE as i32);
+                    })?;
+                    targets.iter().map(|t| t.repo_id.clone()).collect()
+                } else {
+                    Vec::new()
+                }
             } else {
                 let targets = ro_sync::targets::resolve_targets(
                     &conn,
                     Some(&repos.join(" ")),
-                    None,
-                    false,
+                    filter.as_deref(),
+                    all,
                     &paths.state_dir.join("projects"),
                 )
                 .map_err(|e| {

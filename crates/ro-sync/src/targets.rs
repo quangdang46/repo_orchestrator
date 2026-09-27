@@ -108,6 +108,18 @@ pub fn resolve_targets(
     Ok(targets)
 }
 
+/// Read one boolean fact about a tracked repo, for `--filter has:`.
+fn matches_filter_repo(conn: &ro_state::Connection, repo_id: &str, flag: &str) -> bool {
+    let sql = match flag {
+        "archived" => "SELECT archived FROM repos WHERE id = ?1",
+        "disabled" => "SELECT disabled FROM repos WHERE id = ?1",
+        _ => "SELECT CASE WHEN local_path = '' THEN 0 ELSE 1 END FROM repos WHERE id = ?1",
+    };
+    conn.query_row(sql, rusqlite::params![repo_id], |r| r.get::<_, i64>(0))
+        .map(|v| v != 0)
+        .unwrap_or(false)
+}
+
 /// Does one repo satisfy `--filter`?
 ///
 /// An **unrecognised** filter is an error, not a silent false. `has:x`
@@ -116,22 +128,56 @@ pub fn resolve_targets(
 fn matches_filter(
     conn: &ro_state::Connection,
     repo_id: &str,
-    label: &str,
+    _label: &str,
     filter: &str,
 ) -> Result<bool> {
-    if let Some(rest) = filter.strip_prefix("health:<") {
+    // `health:<N>` in the docs is a *placeholder*, not a literal — the angle
+    // brackets are the manual's way of writing "a number here". The prefix
+    // match required them anyway, so `health:50` matched no branch, fell
+    // through to the `bail!` below, and the scorer the plan says "remains
+    // a real selector" had never selected a thing in its life. Both
+    // spellings work now, because the documented one is the one people copy.
+    if let Some(rest) = filter
+        .strip_prefix("health:")
+        .map(|r| r.trim_start_matches(['<', ' ']))
+    {
         let threshold = rest
+            .trim_end_matches(['>', ' '])
             .parse::<i64>()
             .with_context(|| format!("--filter health:<N> needs a number, got {rest:?}"))?;
         let snap = ro_state::queries::score_repo_health(conn, repo_id).ok();
         return Ok(snap.is_some_and(|s| s.score < threshold));
     }
-    if let Some(rest) = filter.strip_prefix("tag:") {
-        return Ok(label.contains(rest));
+
+    // Tags live in `repo_tags`, not in the label. Matching on `owner/name`
+    // meant the tag filtered by coincidence of the repository's *name*:
+    // `tag:api` selected everything called `api-service` and nothing
+    // actually carrying the tag.
+    if let Some(tag) = filter.strip_prefix("tag:") {
+        let found = conn
+            .query_row(
+                "SELECT 1 FROM repo_tags WHERE repo_id = ?1 AND tag = ?2",
+                rusqlite::params![repo_id, tag],
+                |_| Ok(1),
+            )
+            .ok();
+        return Ok(found.is_some());
     }
-    if let Some(_rest) = filter.strip_prefix("has:") {
-        return Ok(true);
+
+    // `has:` names a real fact about the row. It returned `true` for any
+    // suffix, which is precisely the failure this function's own comment
+    // describes: a typo selects the whole fleet and the run reports success
+    // on every repository.
+    if let Some(flag) = filter.strip_prefix("has:") {
+        return match flag {
+            "archived" | "disabled" | "cloned" => Ok(matches_filter_repo(conn, repo_id, flag)),
+            other => bail!(
+                "unknown --filter has:{other}. \
+                 Expected has:archived, has:disabled or has:cloned."
+            ),
+        };
     }
+
     bail!("unknown --filter {filter:?}. Expected health:<N>, tag:<name>, or has:<flag>.")
 }
 
@@ -284,5 +330,175 @@ mod tests {
             std::path::PathBuf::from("/state/projects/acme/api"),
             "an empty local_path must not become the current directory"
         );
+    }
+}
+
+/// The selectors the plan promises, tested against the spellings a user
+/// actually types.
+///
+/// Every one of these was broken and none of it was caught, for the same
+/// reason: the tests below used the *documented* forms, and the documented
+/// forms were the broken ones.
+#[cfg(test)]
+mod filter_contract {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, ro_state::Connection) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (name, archived) in [("api", 0i64), ("oss", 1)] {
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at, archived)
+                 VALUES (?1, 'github.com', 'acme', ?2, 'https://example.com/x.git', ?3, ?4, ?4, ?5)",
+                rusqlite::params![format!("id-{name}"), name, format!("/s/{name}"), now, archived],
+            )
+            .unwrap();
+        }
+        // A tag on `oss` — and note that `api` *contains* neither the tag
+        // nor any hint of it, so a label-based match cannot accidentally
+        // produce the right answer.
+        conn.execute(
+            "INSERT INTO repo_tags (repo_id, tag) VALUES ('id-oss', 'backend')",
+            [],
+        )
+        .unwrap();
+        (tmp, conn)
+    }
+
+    fn selected(conn: &ro_state::Connection, filter: &str) -> Vec<String> {
+        resolve_targets(conn, None, Some(filter), false, std::path::Path::new("/s"))
+            .map(|t| t.into_iter().map(|x| x.repo_id).collect())
+            .unwrap_or_default()
+    }
+
+    /// The regression this whole commit is about. `health:50` — a number,
+    /// the only thing a person types — used to fail the prefix match on
+    /// `health:<`, fall through, and raise "unknown --filter". The health
+    /// selector had never once selected a repository.
+    #[test]
+    fn a_health_filter_with_a_plain_number_is_not_an_unknown_filter() {
+        let (_t, conn) = fixture();
+        // No snapshots exist, so nothing matches — but the call must
+        // succeed. Reaching this assertion at all is the test.
+        assert_eq!(selected(&conn, "health:50"), Vec::<String>::new());
+    }
+
+    /// The spelling the documentation uses has to keep working too, or the
+    /// fix above would have traded one broken form for another.
+    #[test]
+    fn the_documented_angle_bracket_spelling_still_parses() {
+        let (_t, conn) = fixture();
+        assert_eq!(selected(&conn, "health:<50>"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_non_numeric_health_filter_names_the_problem() {
+        let (_t, conn) = fixture();
+        let err = resolve_targets(
+            &conn,
+            None,
+            Some("health:soon"),
+            false,
+            std::path::Path::new("/s"),
+        )
+        .expect_err("a threshold that is not a number cannot be honoured");
+        assert!(
+            format!("{err:#}").contains("needs a number"),
+            "the message must say what was wrong, got: {err:#}"
+        );
+    }
+
+    /// A tag is a row in `repo_tags`. It was matched against the *label*
+    /// instead, so `--filter tag:api` selected the repository called
+    /// `api` and ignored the one actually carrying the tag.
+    #[test]
+    fn a_tag_filter_reads_the_tag_table_and_not_the_repository_name() {
+        let (_t, conn) = fixture();
+        assert_eq!(
+            selected(&conn, "tag:backend"),
+            vec!["id-oss".to_string()],
+            "the tagged repository, whichever it is called"
+        );
+        assert!(
+            selected(&conn, "tag:api").is_empty(),
+            "a repository named `api` carries no tag and must not match"
+        );
+    }
+
+    #[test]
+    fn has_selects_a_real_fact_about_the_row() {
+        let (_t, conn) = fixture();
+        assert_eq!(selected(&conn, "has:archived"), vec!["id-oss".to_string()]);
+        assert_eq!(
+            selected(&conn, "has:disabled").len(),
+            0,
+            "neither fixture row is disabled"
+        );
+        // Both rows carry a local_path, so both are cloned. The assertion
+        // is that the flag reads the *row* rather than answering `true`
+        // for everything, which is what it used to do for any suffix.
+        assert_eq!(selected(&conn, "has:cloned").len(), 2);
+    }
+
+    /// The failure this function's own comment warns about: an
+    /// unrecognised flag that quietly selects the whole fleet.
+    #[test]
+    fn an_unknown_has_flag_is_an_error_not_the_whole_fleet() {
+        let (_t, conn) = fixture();
+        let err = resolve_targets(
+            &conn,
+            None,
+            Some("has:archvied"),
+            false,
+            std::path::Path::new("/s"),
+        )
+        .expect_err("a typo must not select everything");
+        assert!(
+            format!("{err:#}").contains("has:archived"),
+            "the message lists the flags that exist, got: {err:#}"
+        );
+    }
+
+    /// A bare name, an alias and an `owner/name` are the three things a
+    /// user types, and the help text promises all three.
+    #[test]
+    fn a_name_an_alias_and_a_label_all_select() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at, alias)
+             VALUES ('id-1', 'github.com', 'acme', 'api', 'https://example.com/x.git', '/s/api', ?1, ?1, 'service')",
+            rusqlite::params![now],
+        )
+        .unwrap();
+        for token in ["acme/api", "service", "id-1"] {
+            let t =
+                resolve_targets(&conn, Some(token), None, false, tmp.path()).unwrap_or_default();
+            assert_eq!(t.len(), 1, "{token:?} should select the one repo");
+        }
+    }
+
+    /// Two names are two selections. Joined into one pattern they became
+    /// a single glob containing a space, which matches nothing at all.
+    #[test]
+    fn two_names_select_two_repositories() {
+        let (_t, conn) = fixture();
+        let t = resolve_targets(
+            &conn,
+            Some("acme/api acme/oss"),
+            None,
+            false,
+            std::path::Path::new("/s"),
+        )
+        .unwrap();
+        assert_eq!(t.len(), 2, "a space separates names, it does not join them");
     }
 }
