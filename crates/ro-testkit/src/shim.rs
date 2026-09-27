@@ -65,8 +65,8 @@ impl FakeBinary {
         let body = shim_body(
             r#"printf '%s\036' "$*" >> "$RO_TESTKIT_LOG""#,
             r#"@echo off
-<nul set /p="%*" >> "%RO_TESTKIT_LOG%"
-<nul set /p="^Z" >> "%RO_TESTKIT_LOG%"
+<nul set /p="%*" >> "@LOGPATH@"
+<nul set /p="^Z" >> "@LOGPATH@"
 exit /b 0"#,
             &log,
         );
@@ -213,16 +213,16 @@ exit 0"#
             ),
             &format!(
                 r#"@echo off
-echo === ARGV ===>> "%RO_TESTKIT_LOG%"
-echo %*>> "%RO_TESTKIT_LOG%"
-echo === ENV ===>> "%RO_TESTKIT_LOG%"
-set>> "%RO_TESTKIT_LOG%" 2>&1
-echo === FILES ===>> "%RO_TESTKIT_LOG%"
-dir>> "%RO_TESTKIT_LOG%" 2>&1
-echo === PUSH ===>> "%RO_TESTKIT_LOG%"
+echo === ARGV ===>> "@LOGPATH@"
+echo %*>> "@LOGPATH@"
+echo === ENV ===>> "@LOGPATH@"
+set>> "@LOGPATH@" 2>&1
+echo === FILES ===>> "@LOGPATH@"
+dir>> "@LOGPATH@" 2>&1
+echo === PUSH ===>> "@LOGPATH@"
 cd /d "%RO_TESTKIT_WORKDIR%"
-git push {remote} HEAD>> "%RO_TESTKIT_LOG%" 2>&1
-echo === END ===>> "%RO_TESTKIT_LOG%"
+git push {remote} HEAD>> "@LOGPATH@" 2>&1
+echo === END ===>> "@LOGPATH@"
 exit /b 0"#
             ),
             &log,
@@ -395,8 +395,14 @@ fn shim_body(log_line: &str, windows: &str, log: &Path) -> String {
 #[cfg(windows)]
 fn shim_body(log_line: &str, windows: &str, log: &Path) -> String {
     let _ = log_line;
+    // The log path is **inlined**, not passed through a variable. A
+    // `.cmd` expands `%VAR%` at run time, and the probe on a real
+    // `windows-latest` runner showed the variable form silently
+    // producing an empty record — the shim ran, and wrote nothing, so a
+    // test asserting on the log saw "never invoked" for a binary that had
+    // been invoked. Inlining removes the hop that was eating the argv.
     let log = log.display();
-    format!("@echo off\r\nset \"RO_TESTKIT_LOG={log}\"\r\n{windows}\r\n")
+    format!("@echo off\r\n{windows}\r\n").replace("@LOGPATH@", &log.to_string())
 }
 
 /// Write the shim under both names.
