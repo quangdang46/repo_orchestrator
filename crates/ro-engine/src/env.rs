@@ -144,11 +144,26 @@ impl ChildEnv {
         // Unix and macOS resolve an extensionless name directly and never
         // needed it, so nothing local ever notices the omission.
         #[cfg(windows)]
-        if std::env::var_os("PATHEXT").is_none() {
-            // A sensible default rather than nothing: the standard set is
-            // what a stock Windows install carries, and a caller that has
-            // its own is honoured above.
-            self.set("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        {
+            // Windows resolves an executable through the child's own
+            // environment, and four variables are load-bearing for *any*
+            // spawn: `PATHEXT` decides that `claude` means `claude.cmd`,
+            // and `SystemRoot` is where the loader looks for the runtime
+            // DLLs that a `.cmd` and everything it launches need.
+            //
+            // A caller that does `env_clear().envs(child_env)` has removed
+            // all four, and the spawn fails with "program not found" for a
+            // shim that is sitting right there on `PATH`. Unix and macOS
+            // resolve an extensionless name directly, so nothing local
+            // ever notices.
+            for key in ["PATHEXT", "SystemRoot", "windir", "ComSpec", "TEMP", "TMP"] {
+                match std::env::var(key) {
+                    Ok(v) if self.get(key).is_none() => {
+                        self.set(key, v);
+                    }
+                    _ => {}
+                }
+            }
         }
         self
     }
@@ -236,13 +251,19 @@ mod tests {
     /// into `claude.cmd`, and the spawn fails on a name that is on `PATH`.
     #[cfg(windows)]
     #[test]
-    fn pathext_reaches_the_child() {
+    fn the_windows_spawn_variables_reach_the_child() {
+        // Every one of these is read by the OS loader out of the child's
+        // own environment. `env_clear().envs(child_env)` removes them all,
+        // and the spawn then fails with "program not found" for a shim
+        // that is on `PATH`.
         let env = ChildEnv::subtracting([("PATH", "/tmp".to_string())]);
-        assert_eq!(
-            env.get("PATHEXT"),
-            Some(".COM;.EXE;.BAT;.CMD"),
-            "without PATHEXT the Windows loader cannot resolve a .cmd shim"
-        );
+        for key in ["PATHEXT", "SystemRoot", "ComSpec"] {
+            assert!(
+                env.get(key).is_some(),
+                "{key} must reach the child or a .cmd shim cannot be \
+                 resolved or launched"
+            );
+        }
     }
 
     use super::*;
