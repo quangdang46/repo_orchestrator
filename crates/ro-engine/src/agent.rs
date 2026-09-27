@@ -132,6 +132,34 @@ impl AgentEngine {
         }
     }
 
+    /// The binary to actually spawn, resolved for this platform.
+    ///
+    /// On Unix that is the configured name. On Windows the loader does
+    /// not consult `PATHEXT` for a bare name, so each known extension is
+    /// tried against `PATH` and the first hit is used. A configured name
+    /// that already carries an extension is spawned as given.
+    fn resolve_program(&self) -> std::path::PathBuf {
+        let configured = std::path::Path::new(&self.bin);
+        if !cfg!(windows) || configured.extension().is_some() {
+            return configured.to_path_buf();
+        }
+        // A configured path — anything with a separator — is taken as
+        // written; only a bare name is searched for.
+        if self.bin.contains('/') || self.bin.contains('\\') {
+            return configured.to_path_buf();
+        }
+        for ext in [".exe", ".cmd", ".bat", ".com"] {
+            let candidate = format!("{}{ext}", self.bin);
+            if let Some(found) = ro_git::which(&candidate) {
+                return found;
+            }
+        }
+        // Nothing found. The bare name goes back to `Command`, which will
+        // report "program not found" naming what it tried — the same
+        // message a user gets for a genuinely missing engine.
+        configured.to_path_buf()
+    }
+
     /// Spawn, with the deadline and the child environment.
     fn run(&self, ctx: &EngineContext<'_>) -> std::result::Result<AgentOutput, RunError> {
         let prompt = ctx.message_override.unwrap_or(BUILTIN_PROMPT);
@@ -140,7 +168,20 @@ impl AgentEngine {
             .with_identity(ctx.identity)
             .with_additions(ctx.env);
 
-        let mut cmd = std::process::Command::new(&self.bin);
+        // Resolve the binary the way the platform can actually spawn it.
+        //
+        // A probe on a real `windows-latest` runner showed that
+        // `Command::new` does **not** apply `PATHEXT` to a bare name:
+        // `claude` was "program not found" while `claude.cmd` in the same
+        // directory ran. So on Windows the configured name is tried with
+        // each extension the platform knows, and the first that exists on
+        // `PATH` is what gets spawned.
+        //
+        // A user who configured `bin = "claude"` has configured the name
+        // they type; they have not configured an extension, and making
+        // them type `.cmd` would be the tool's problem, not theirs.
+        let program = self.resolve_program();
+        let mut cmd = std::process::Command::new(&program);
         cmd.args(&self.default_args);
         // ONE argv element. No shell, no interpolation, no quoting: the
         // prompt carries diff text and file paths, and a shell would
