@@ -1,0 +1,19 @@
+name: Windows diagnostic
+on:
+  push:
+    branches: ["worktree-diagnostic"]
+jobs:
+  diag:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux system libraries (needed by ro-core on any OS here)
+        run: echo skipped
+      - name: Run one failing test with output
+        run: cargo test -p ro-engine --test agent_engines -- --nocapture the_prompt_arrives 2>&1
+      - name: What is in the shim dir
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path $env:TEMP -Recurse -Filter "claude*" -ErrorAction SilentlyContinue |
+            Select-Object -First 10 FullName
