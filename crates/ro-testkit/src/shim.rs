@@ -8,10 +8,15 @@
 //! silently does not run it. A fixture that quietly skips two thirds of the
 //! matrix is worse than no fixture, because it is counted as coverage.
 //!
-//! So: a `gh` shell script on Unix, a **`gh.cmd` on Windows**. Windows
-//! resolves `.cmd` through `PATHEXT` for `Command::new("gh")`, so the same
-//! code that spawns `gh` on macOS spawns the shim on Windows with no
-//! `#[cfg]` at the call site and no compile step.
+//! So: a `gh` shell script on Unix, a **`gh.cmd` on Windows**. On Unix the
+//! shell script is found and launched by bare name, so the same code that
+//! spawns `gh` on macOS spawns the shim on Windows with no `#[cfg]` at the
+//! call site — except that Windows does **not** launch it by bare name. A
+//! probe on a real runner showed `Command::new("gh")` with the shim first on
+//! `PATH` running the machine's real `gh.exe` and never looking at
+//! `gh.cmd`. So on Windows a shim is spawned through
+//! [`FakeBinary::program`], which resolves it. The fixture is portable; the
+//! *spelling* of the spawn is not.
 //!
 //! The shim appends its argv to a log file, because "the command was built
 //! with the right arguments" is not the same claim as "the child saw them".
@@ -453,17 +458,23 @@ fn shim_body(log_line: &str, windows: &str, log: &Path) -> String {
 
 /// Write the shim under both names.
 ///
-/// On Unix only `gh` is needed. On Windows only `gh.cmd` is needed —
-/// `Command::new("gh")` resolves it through `PATHEXT`. Writing both
-/// everywhere would mean the Unix file is a stray non-executable, so the
-/// platform decides.
+/// On Unix only `gh` is needed. On Windows a `.cmd` is the only thing that
+/// can be *spawned*, so that is the file that matters; the extensionless
+/// twin exists for `which`, which resolves by name.
 fn write_shim(dir: &std::path::Path, name: &str, body: &str) {
-    // Windows gets **two** files. A `.cmd` is what `Command::new` can
-    // spawn there, but the engine resolves the binary it was *configured*
-    // with — `claude` — and the loader does not consult `PATHEXT` for a
-    // bare name. Writing the extensionless name as well means both an
-    // explicit spawn and the production resolution find something,
-    // whichever path a given test takes.
+    // Windows gets **two** files, and the reason is narrower than it looks.
+    //
+    // A `.cmd` is what `Command` can actually launch there. The
+    // extensionless name is **not** launchable — Windows will not execute a
+    // file with no extension — so it does not make a bare-name spawn work.
+    // A probe on a real runner settled this: with the shim first on `PATH`,
+    // `Command::new("gh")` ran the machine's real `gh.exe` and reported a
+    // missing `GH_TOKEN`, having never looked at `gh.cmd` at all. Spawn a
+    // shim through [`FakeBinary::program`], which is what the testkit's own
+    // fixtures now do.
+    //
+    // The extensionless file stays for name resolution, which is a
+    // different question from execution.
     #[cfg(windows)]
     let files = vec![dir.join(format!("{name}.cmd")), dir.join(name)];
     #[cfg(not(windows))]

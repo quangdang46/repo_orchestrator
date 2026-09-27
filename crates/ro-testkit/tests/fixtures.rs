@@ -15,21 +15,32 @@ use std::process::Command;
 
 use ro_testkit::{BareRemote, Captured, FakeBinary, RemotePair, Worktree};
 
-/// Run a command with `shim` first on `PATH`, returning what the shim saw.
-fn run_with_shim(shim: &FakeBinary, program: &str, args: &[&str]) -> String {
+/// Run `args` through `shim`, returning what the shim saw.
+///
+/// The shim is spawned **by path**, not by the bare name — and that is the
+/// whole reason this helper exists in this shape. On Windows the loader does
+/// not consult `PATHEXT` for a bare name, so `Command::new("gh")` skipped the
+/// `gh.cmd` sitting first on `PATH` and ran the runner's real `gh.exe`
+/// instead. These tests then asserted on GitHub's CLI rather than on the
+/// fixture, and failed on a missing `GH_TOKEN` — which says nothing about
+/// whether a shim records what it was given. `FakeBinary::program` is the
+/// documented answer, and the rest of this file already used it.
+fn run_with_shim(shim: &FakeBinary, args: &[&str]) -> String {
+    let program = shim.program();
     // SAFETY: the body only spawns a process and reads its output.
-    unsafe { shim.with_on_path(|| spawn(program, args)) }
+    unsafe { shim.with_on_path(|| spawn(&program, args)) }
 }
 
 /// The spawn itself, so `with_on_path` can own the lock and the guard.
-fn spawn(program: &str, args: &[&str]) -> String {
+fn spawn(program: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new(program)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("spawning {program}: {e}"));
+        .unwrap_or_else(|e| panic!("spawning {}: {e}", program.display()));
     assert!(
         out.status.success(),
-        "{program} failed: {}",
+        "{} failed: {}",
+        program.display(),
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
@@ -42,7 +53,7 @@ fn spawn(program: &str, args: &[&str]) -> String {
 #[test]
 fn a_shim_really_runs_and_records_its_argv() {
     let shim = FakeBinary::recording("gh");
-    run_with_shim(&shim, "gh", &["pr", "list", "--head", "feature/x"]);
+    run_with_shim(&shim, &["pr", "list", "--head", "feature/x"]);
 
     let invocations = shim.invocations();
     assert_eq!(invocations.len(), 1, "the shim should have run once");
@@ -55,7 +66,7 @@ fn a_shim_really_runs_and_records_its_argv() {
 #[test]
 fn a_shim_reports_stdout_to_its_caller() {
     let shim = FakeBinary::with_stdout("gh", "[]");
-    let out = run_with_shim(&shim, "gh", &["pr", "list"]);
+    let out = run_with_shim(&shim, &["pr", "list"]);
     assert_eq!(out.trim(), "[]", "gh's caller must see the canned answer");
 }
 
@@ -92,7 +103,7 @@ fn the_recorder_is_not_blind() {
     let shim = FakeBinary::recording("gh");
     assert_eq!(shim.run_count(), 0, "nothing has run yet");
 
-    run_with_shim(&shim, "gh", &["--version"]);
+    run_with_shim(&shim, &["--version"]);
 
     assert_eq!(
         shim.run_count(),
