@@ -38,7 +38,8 @@ pub mod summary;
 
 pub use emit::{plan_for, run};
 pub use orchestrator::{HowFar, RunOptions};
-pub use summary::Summary;
+// `Summary` is built by `run`, and nothing else here names it. The
+// re-export existed for the dry-run branch that fabricated rows by hand.
 
 use ro_config::ConfigPaths;
 
@@ -158,24 +159,17 @@ pub fn run_verb(
         how_far,
         state_dir: paths.state_dir.clone(),
         resolve_conflicts: resolve,
+        // The dry run goes down the **same** path as the real one. It used
+        // to be short-circuited here, with a fabricated
+        // `NothingToCommit` row per plan — so `ro ship --dry-run` reported
+        // "nothing to commit" for a fleet with a dirty repo on a protected
+        // branch, and the real run then refused. The plan is meant to be
+        // what the run would say; building it here instead of there made
+        // it a guess, and a guess is not a preview.
+        dry_run,
         ..Default::default()
     };
-    let summary = if dry_run {
-        Summary::new(
-            plans
-                .iter()
-                .map(|p| crate::ship::summary::SummaryRow {
-                    label: p.label.clone(),
-                    branch: p.base_branch.clone(),
-                    engine: engine_name.clone(),
-                    account: None,
-                    outcome: crate::ship::orchestrator::RepoOutcome::NothingToCommit,
-                })
-                .collect(),
-        )
-    } else {
-        run(&plans, &opts)
-    };
+    let summary = run(&plans, &opts);
 
     print!("{}", summary.render());
     // The summary counts; the table decides. A summary that assigned a

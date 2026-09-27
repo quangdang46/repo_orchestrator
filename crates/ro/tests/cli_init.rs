@@ -240,6 +240,11 @@ fn a_local_only_repo_is_in_sync_not_unmeasurable() {
 fn ship_dry_run_changes_nothing() {
     let t = Test::initialised();
     let repo = local_repo();
+    // A feature branch. `ro add` records the checkout's **current** branch
+    // as the base, and `main` is protected — so leaving the repo on `main`
+    // stopped the dry run at the protection guard, which says nothing
+    // about whether it writes.
+    ro_testkit::worktree::run(repo.path(), &["checkout", "-q", "-b", "feat/x"]);
     t.cmd().arg("add").arg(repo.path()).assert().success();
     repo.write("new.txt", "x\n");
 
@@ -247,7 +252,8 @@ fn ship_dry_run_changes_nothing() {
     t.cmd()
         .args(["ship", "--all", "--engine", "git", "--dry-run"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains("would commit"));
 
     assert_eq!(
         repo.porcelain(),
@@ -258,6 +264,33 @@ fn ship_dry_run_changes_nothing() {
     assert!(
         !subjects.contains("new.txt"),
         "a dry run must not commit, log was: {subjects}"
+    );
+}
+
+/// A dry run reports the refusal it is going to get, rather than an empty
+/// plan.
+///
+/// `--dry-run` used to be short-circuited at the caller with a fabricated
+/// `NothingToCommit` for every repo, so it cheerfully reported "nothing to
+/// commit" for a repo ro was about to refuse — and the plan naming this
+/// property as the single most important one to keep.
+#[test]
+fn a_dry_run_reports_a_protected_branch() {
+    let t = Test::initialised();
+    let repo = local_repo();
+    t.cmd().arg("add").arg(repo.path()).assert().success();
+    repo.write("new.txt", "x\n");
+
+    t.cmd()
+        .args(["ship", "--all", "--engine", "git", "--dry-run"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("refused"));
+
+    let subjects = ro_testkit::worktree::run(repo.path(), &["log", "--format=%s"]);
+    assert!(
+        !subjects.contains("new.txt"),
+        "a refused dry run must not commit, log was: {subjects}"
     );
 }
 

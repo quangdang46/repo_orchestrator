@@ -296,19 +296,25 @@ mod tests {
     /// Two names for one repo must contend on one lock. Canonicalize is what
     /// makes `/tmp/x` and a symlink to it the same repo; without it, two
     /// processes can each hold "the lock" and mutate one worktree.
+    ///
+    /// **Unix only, and says so.** On Windows this used to compile, skip
+    /// its own `#[cfg(unix)]` body, and pass — a green test that asserted
+    /// nothing, which is worse than a red one. Creating a symlink there
+    /// needs `SeCreateSymbolicLinkPrivilege` or Developer Mode, so it is
+    /// not something to assert from an unattended runner. The behaviour
+    /// under test is canonicalisation, which is identical on both.
+    #[cfg(unix)]
     #[test]
     fn two_names_for_one_repo_contend_on_one_lock() {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let link = tmp.path().join("link");
-        #[cfg(unix)]
         std::os::unix::fs::symlink(&repo, &link).expect("a symlink is creatable");
 
         let state = tmp.path().join("state");
         let _held = RepoLock::acquire_default(&state, &repo).unwrap();
 
-        #[cfg(unix)]
         assert!(
             RepoLock::acquire(&state, &link, 1).is_err(),
             "a symlink to a locked repo must not get a second lock"

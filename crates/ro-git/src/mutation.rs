@@ -788,28 +788,26 @@ mod tests {
     /// failure surfaced as a dozen unrelated assertions rather than as one
     /// leaked environment.
     fn env_reporting_shim(dir: &Path) -> PathBuf {
-        let shim = dir.join("git-shim");
-        std::fs::create_dir_all(dir).expect("the shim dir is creatable");
-        std::fs::write(
-            &shim,
+        write_shim(
+            dir,
+            "git-shim",
             r#"#!/bin/sh
 echo "GIT_CONFIG_COUNT=$GIT_CONFIG_COUNT"
 echo "GIT_CONFIG_KEY_0=$GIT_CONFIG_KEY_0"
 echo "GIT_CONFIG_VALUE_0=$GIT_CONFIG_VALUE_0"
 echo "PROBE_ARGS=$*"
 "#,
+            // `%VAR%`, not `$VAR`. An unset variable is echoed back
+            // literally by `cmd.exe`, so `no_credential_means_no_header`
+            // sees the placeholder rather than an empty string — which is
+            // the outcome it wants, and says nothing it did not check.
+            r#"@echo off
+echo GIT_CONFIG_COUNT=%GIT_CONFIG_COUNT%
+echo GIT_CONFIG_KEY_0=%GIT_CONFIG_KEY_0%
+echo GIT_CONFIG_VALUE_0=%GIT_CONFIG_VALUE_0%
+echo PROBE_ARGS=%*
+"#,
         )
-        .expect("the shim is writable");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&shim)
-                .expect("the shim exists")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&shim, perms).expect("the mode is settable");
-        }
-        shim
     }
 
     /// A git that never returns is killed at the timeout, and the outcome says
@@ -887,50 +885,159 @@ echo "PROBE_ARGS=$*"
                 program: Some(shim.to_str().expect("a UTF-8 shim path")),
             },
         );
-        assert!(outcome.is_err(), "the shim hangs, so this must time out");
-
-        // Well past when the grandchild would have written, if it were alive.
-        std::thread::sleep(Duration::from_millis(1500));
-
+        // `TimedOut` specifically, not merely "an error". A shim that
+        // failed to start is also an error, and the old `is_err()`
+        // assertion is why this test was green on Windows while its
+        // fixture was a `#!/bin/sh` script no Windows runner can run.
+        let seen = outcome.as_ref().err().map(|e| format!("{e:#}"));
+        let timed_out = outcome
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<GitError>())
+            .is_some_and(|g| matches!(g, GitError::TimedOut { .. }));
         assert!(
-            !marker.exists(),
-            "a grandchild outlived the timeout and performed its side effect, so the kill \
-             reached the direct child but not the tree"
+            timed_out,
+            "the shim hangs, so this must time out, got {seen:?}"
         );
+
+        // The control, and the reason the assertion below is not a
+        // tautology. The same shim, spawned directly and never killed, does
+        // produce its marker — so a marker that stays absent afterwards is
+        // evidence about the **kill**, rather than about a fixture that
+        // never spawned a grandchild at all.
+        let control_marker = tmp.path().join("control-survived");
+        let control_shim = grandchild_shim(&tmp.path().join("control-bin"), &control_marker);
+        let mut control = std::process::Command::new(&control_shim)
+            .spawn()
+            .expect("the control shim runs");
+        // Polled to a deadline, not slept for a fixed span. The grandchild
+        // waits a second and then writes, and a fixed sleep is a race with
+        // however busy the machine is when the suite runs — which showed up
+        // as a control that failed under load and passed when idle. A
+        // control that flakes is a control people delete.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !control_marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            control_marker.exists(),
+            "the control grandchild never acted, so this fixture does not spawn one \
+             and the assertion below would pass for the wrong reason"
+        );
+        // Reaped, so the control does not hold a process for the next ten
+        // minutes of pings.
+        let _ = control.kill();
+        let _ = control.wait();
+
+        // Checked repeatedly across the window rather than once at the end
+        // of it. "Well past when the grandchild would have written" is only
+        // true if the wait really is well past, and a single check at a
+        // single instant is a statement about that instant.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            assert!(
+                !marker.exists(),
+                "a grandchild outlived the timeout and performed its side effect, so the kill \
+                 reached the direct child but not the tree"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// A shim that never returns.
     fn hanging_shim(dir: &Path) -> PathBuf {
-        write_executable(&dir.join("git-hang"), "#!/bin/sh\nsleep 600\n")
+        write_shim(
+            dir,
+            "git-hang",
+            "#!/bin/sh\nsleep 600\n",
+            // `ping`, not `timeout`: it is on every Windows image and takes
+            // no argument a batch parser could re-read as a redirect.
+            "@echo off\nping -n 600 127.0.0.1 > nul\n",
+        )
     }
 
     /// A shim that starts a child which writes `marker` after a delay, then
     /// hangs itself. The marker existing afterwards is the proof of survival.
+    ///
+    /// Two files on Windows, and the second one is the point: `start` needs
+    /// a path it can launch, and the delayed side effect has to live in a
+    /// process of its own. Building that as one `cmd /c "ping … & copy …"`
+    /// string means nested quotes, which is how a fixture ends up not
+    /// running at all.
     fn grandchild_shim(dir: &Path, marker: &Path) -> PathBuf {
-        write_executable(
-            &dir.join("git-grandchild"),
-            &format!(
-                "#!/bin/sh\n( sleep 1; : > {} ) &\nsleep 600\n",
-                marker.display()
-            ),
-        )
+        #[cfg(windows)]
+        {
+            std::fs::create_dir_all(dir).expect("the shim dir is creatable");
+            let helper = dir.join("grandchild.cmd");
+            std::fs::write(
+                &helper,
+                format!(
+                    "@echo off\r\nping -n 2 127.0.0.1 > nul\r\ncopy NUL \"{}\" > NUL\r\n",
+                    marker.display()
+                ),
+            )
+            .expect("the helper is writable");
+            let path = dir.join("git-grandchild.cmd");
+            std::fs::write(
+                &path,
+                format!(
+                    "@echo off\r\nstart \"\" /b \"{}\"\r\nping -n 600 127.0.0.1 > nul\r\n",
+                    helper.display()
+                ),
+            )
+            .expect("the shim is writable");
+            return path;
+        }
+        #[cfg(not(windows))]
+        {
+            write_shim(
+                dir,
+                "git-grandchild",
+                &format!(
+                    "#!/bin/sh\n( sleep 1; : > {} ) &\nsleep 600\n",
+                    marker.display()
+                ),
+                "",
+            )
+        }
     }
 
-    /// Write an executable shell script, creating its directory.
-    fn write_executable(path: &Path, body: &str) -> PathBuf {
-        std::fs::create_dir_all(path.parent().expect("a path has a parent"))
-            .expect("the shim dir is creatable");
-        std::fs::write(path, body).expect("the shim is writable");
+    /// Write a shim and return the path to spawn on **this** platform.
+    ///
+    /// The body is given twice — once as a `#!/bin/sh` script, once as a
+    /// `.cmd` — because one file cannot be both. A `#!/bin/sh` script
+    /// spawned on Windows fails with "%1 is not a valid Win32 application"
+    /// (os error 193), and that reads like a broken build rather than a
+    /// broken fixture.
+    ///
+    /// Which is worse than a plain failure, because a fixture can hide
+    /// behind it: `the_grandchildren_are_killed_too` asserted only
+    /// `outcome.is_err()`, and a shim that never started produces that too.
+    /// The test was green on Windows because the fixture was not running.
+    fn write_shim(dir: &Path, name: &str, unix: &str, windows: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("the shim dir is creatable");
+        let path = if cfg!(windows) {
+            dir.join(format!("{name}.cmd"))
+        } else {
+            dir.join(name)
+        };
+        // A `.cmd` run by `cmd.exe` needs CRLF.
+        let body = if cfg!(windows) {
+            windows.replace('\n', "\r\n")
+        } else {
+            unix.to_string()
+        };
+        std::fs::write(&path, body).expect("the shim is writable");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path)
+            let mut perms = std::fs::metadata(&path)
                 .expect("the shim exists")
                 .permissions();
             perms.set_mode(0o755);
-            std::fs::set_permissions(path, perms).expect("the mode is settable");
+            std::fs::set_permissions(&path, perms).expect("the mode is settable");
         }
-        path.to_path_buf()
+        path
     }
 
     /// The plumbing, not just the builder.
@@ -1018,22 +1125,16 @@ echo "PROBE_ARGS=$*"
     fn the_hardening_block_reaches_a_wrapped_binary() {
         let tmp = TempDir::new().unwrap();
         let shim_dir = tmp.path().join("bin");
-        let shim = shim_dir.join("git-shim");
-        std::fs::create_dir_all(&shim_dir).expect("the shim dir is creatable");
-        std::fs::write(
-            &shim,
+        // Built through the same helper as every other shim here, so it
+        // exists as a `.cmd` on Windows rather than a POSIX script that no
+        // Windows runner can execute. It was written out inline, which is
+        // how the other two came to be Unix-only in the first place.
+        let shim = write_shim(
+            &shim_dir,
+            "git-shim",
             "#!/bin/sh\necho \"PROMPT=$GIT_TERMINAL_PROMPT|$GCM_INTERACTIVE|$LC_ALL\"\n",
-        )
-        .expect("the shim is writable");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&shim)
-                .expect("the shim exists")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&shim, perms).expect("the mode is settable");
-        }
+            "@echo off\necho PROMPT=%GIT_TERMINAL_PROMPT%|%GCM_INTERACTIVE%|%LC_ALL%\n",
+        );
 
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();

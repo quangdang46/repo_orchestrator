@@ -41,6 +41,73 @@ impl HowFar {
     }
 }
 
+/// The checks that stop a run before anything can write.
+///
+/// Returns the outcome that stops it, or `None` to proceed. Split out so
+/// the dry run and the real run cannot drift apart: a guard stated once
+/// and consulted by both is the only way "the plan agrees with the run"
+/// survives either one being edited.
+///
+/// All three are **reads**. That is what lets the dry run call them: a
+/// guard that wrote would be the one thing `--dry-run` could not do.
+fn guards(plan: &RepoPlan, repo: &std::path::Path) -> Option<RepoOutcome> {
+    // (b) A conflict is a *skip*, not a failure: the worktree is
+    //     mid-merge and ro does not resolve it for you.
+    match ro_git::conflict::detect(repo) {
+        Ok(Some(state)) => {
+            return Some(RepoOutcome::SkippedConflict {
+                detail: format!(
+                    "{} conflicted file(s) during {}",
+                    state.files.len(),
+                    state.op
+                ),
+            });
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return Some(RepoOutcome::Failed {
+                error: format!("could not read {}: {e:#}", plan.label),
+            });
+        }
+    }
+
+    // (b2) The safety net: denylisted paths and a secret scan. This is the
+    // last thing standing between a WIP commit and a leaked credential, so
+    // it runs before the engine and not merely before the push.
+    if let Err(reason) = preflight(repo) {
+        return Some(RepoOutcome::Blocked {
+            reason: reason.0,
+            detail: String::new(),
+        });
+    }
+
+    // (b3) Protected branches, **before** the engine.
+    //
+    // This check used to run after the engine had committed, so `ro ship`
+    // on `main` made the commit and *then* declined to push it — leaving
+    // a WIP commit behind while the summary reported `refused` and
+    // "0 committed". A refusal that mutates is not a refusal.
+    //
+    // `--onto` is the escape, for the rare case where the work genuinely
+    // belongs on a different branch. Naming a branch has consequences: it
+    // is what a teammate fetches and what appears in `git branch` next
+    // month, so a tool that invents one is deciding something with a blast
+    // radius on the user's behalf.
+    if plan.onto.is_none() && ro_git::primitives::is_protected_branch(&plan.base_branch) {
+        return Some(RepoOutcome::Refused {
+            branch: plan.base_branch.clone(),
+            reason: format!(
+                "{} is a protected branch. Create a branch first \
+                 (`git checkout -b feat/x`), or pass --onto <BRANCH> if the \
+                 work genuinely belongs somewhere else.",
+                plan.base_branch
+            ),
+        });
+    }
+
+    None
+}
+
 /// Why a repo did not get as far as a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoOutcome {
@@ -50,6 +117,13 @@ pub enum RepoOutcome {
     },
     /// Nothing to do. Not a failure.
     NothingToCommit,
+    /// A dry run found work it *would* commit.
+    ///
+    /// Distinct from `Committed`, because nothing was committed: a plan
+    /// that reports a commit it did not make is the same lie as a plan
+    /// that reports no work where there is work. Distinct from
+    /// `NothingToCommit`, which is the true statement. Not a failure.
+    WouldCommit,
     /// The worktree is mid-conflict; ro does not resolve it for you.
     SkippedConflict {
         detail: String,
@@ -99,6 +173,7 @@ impl RepoOutcome {
         match self {
             RepoOutcome::Committed { oid, .. } => format!("committed {oid}"),
             RepoOutcome::NothingToCommit => "nothing to commit".into(),
+            RepoOutcome::WouldCommit => "would commit".into(),
             RepoOutcome::SkippedConflict { .. } => "skipped: mid-conflict".into(),
             RepoOutcome::Blocked { reason, .. } => format!("blocked: {reason}"),
             RepoOutcome::Refused { branch, .. } => format!("refused: {branch} is protected"),
@@ -205,14 +280,38 @@ impl Default for RunOptions {
 /// failure and carry on if the function hands back a `Result`, and one
 /// `?` inside a worker turns a per-repo failure into a whole-run abort.
 pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
-    // A dry run stops here, before the lock and before anything can
-    // write. The flag used to sit on RunOptions unread, so `--dry-run`
-    // was a promise the code never kept.
-    if opts.dry_run {
-        return RepoOutcome::NothingToCommit;
+    let repo = plan.path();
+
+    // The guards first, and stated **once**, because the dry run and the
+    // real run have to reach the same conclusion. They used not to:
+    // `--dry-run` returned `NothingToCommit` without looking at the repo
+    // at all, and the protection check sat *after* the engine had already
+    // committed. So a dry run on a dirty tree printed "nothing to
+    // commit", and the real run then committed and refused — the plan
+    // said one thing and the run did another. That is the one thing a dry
+    // run must never do, and the plan names it as the single most
+    // important property to keep.
+    if let Some(stop) = guards(plan, repo) {
+        return stop;
     }
 
-    let repo = plan.path();
+    if opts.dry_run {
+        // No lock, no engine, no write. The engine is deliberately not
+        // dispatched: a plan that runs a model in order to report what it
+        // would have run is not a plan, and what the engine *would* commit
+        // is its decision to make. What the dry run can answer honestly
+        // is whether there is anything to do at all.
+        return match ro_git::read::is_dirty(repo) {
+            Ok(true) => RepoOutcome::WouldCommit,
+            // An unreadable tree is not evidence of a clean one, and
+            // claiming "nothing to commit" about a repo ro could not read
+            // is the same lie in a quieter voice.
+            Ok(false) => RepoOutcome::NothingToCommit,
+            Err(e) => RepoOutcome::Failed {
+                error: format!("could not read {}: {e:#}", plan.label),
+            },
+        };
+    }
 
     // (a) Lock. A guard, so it releases on every path including a panic
     //     — a lock left held is a repo nobody can touch until the
@@ -227,41 +326,10 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         }
     };
 
-    // (b) Preflight. A conflict is a *skip*, not a failure: the worktree
-    //     is mid-merge and ro does not resolve it for you.
-    match ro_git::conflict::detect(repo) {
-        Ok(Some(state)) => {
-            return RepoOutcome::SkippedConflict {
-                detail: format!(
-                    "{} conflicted file(s) during {}",
-                    state.files.len(),
-                    state.op
-                ),
-            };
-        }
-        Ok(None) => {}
-        Err(e) => {
-            return RepoOutcome::Failed {
-                error: format!("could not read {}: {e:#}", plan.label),
-            };
-        }
-    }
-
-    // (b2) The safety net, and it runs **before** the engine. This is
-    // the last thing standing between a WIP commit and a leaked
-    // credential, and a preflight declared but not called is the exact
-    // "looks like a feature and is not one" shape the beads keep naming —
-    // so it is here, in the order that matters, and `Blocked` is
-    // constructed below.
-    match preflight(repo) {
-        Ok(()) => {}
-        Err(reason) => {
-            return RepoOutcome::Blocked {
-                reason: reason.0,
-                detail: String::new(),
-            };
-        }
-    }
+    // (b) The conflict check, the denylist/secret-scan preflight and the
+    //     protected-branch rule all ran in `guards` above, before this
+    //     lock and before anything can write. They are not repeated here:
+    //     a second copy is a second answer waiting to disagree.
 
     // (c) Fetch, for a full ship. A network failure is a failure, not a
     //     silent skip: the user asked for an up-to-date push.
@@ -381,29 +449,10 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     // (e) Push, with the credential resolved from the row. `None` means
     //     "use the machine's own" — the right answer for a repo whose SSH
     //     key is already correct and needs no configuration.
-    // The refusal. ro does **not** create a branch.
     //
-    // The old behaviour silently made `ro/wip/<slug>-<run>` so a pull
-    // request would have something to point at, and with PRs cut the
-    // reason is gone. Naming a branch has consequences: it is what a
-    // teammate fetches, what appears in `git branch` next month, and
-    // what a later `ro push` assumes. A tool that invents a name is a
-    // tool making a decision with a blast radius on your behalf.
-    //
-    // `--onto` is the escape, for the rare case where the work genuinely
-    // belongs on a different branch.
-    if plan.onto.is_none() && ro_git::primitives::is_protected_branch(&plan.base_branch) {
-        return RepoOutcome::Refused {
-            branch: plan.base_branch.clone(),
-            reason: format!(
-                "{} is a protected branch. Create a branch first \
-                 (`git checkout -b feat/x`), or pass --onto <BRANCH> if the \
-                 work genuinely belongs somewhere else.",
-                plan.base_branch
-            ),
-        };
-    }
-
+    // No protection check here: it ran in `guards`, before the engine, and
+    // this point is after the commit. A refusal that arrives after the
+    // work is already on disk is not a refusal.
     let secret = match resolve_credential(plan.credential_ref.as_deref()) {
         Ok(s) => s,
         Err(e) => {
@@ -669,13 +718,21 @@ mod tests {
     #[test]
     fn a_dry_run_returns_without_touching_the_repo() {
         let (_tmp, path) = repo();
+        // The fixture is on `main`, which is protected, so the honest
+        // answer is `Refused` — the same answer the real run gives. The
+        // old expectation was `NothingToCommit` because `--dry-run` used
+        // to return that without looking at the repo at all.
         let plan = plan_for_test(&path);
         let opts = RunOptions {
             dry_run: true,
             state_dir: path.join(".state"),
             ..Default::default()
         };
-        assert_eq!(run_one(&plan, &opts), RepoOutcome::NothingToCommit);
+        assert!(
+            matches!(run_one(&plan, &opts), RepoOutcome::Refused { .. }),
+            "a dry run on a protected branch must preview the refusal, not \
+             report an empty plan"
+        );
         let porcelain = String::from_utf8_lossy(
             &std::process::Command::new("git")
                 .args(["status", "--porcelain"])
@@ -688,6 +745,106 @@ mod tests {
         assert!(
             porcelain.trim().is_empty(),
             "a dry run must leave the tree exactly as it found it, got: {porcelain}"
+        );
+    }
+
+    /// The property the plan names as the single most important one: the
+    /// printed plan and the real outcome **agree**.
+    ///
+    /// The stub version of `--dry-run` returned `NothingToCommit`
+    /// unconditionally, so a dry run on a dirty tree promised there was
+    /// nothing to do and the real run then committed. A dry run that
+    /// disagrees with the run is worse than no dry run, because it is
+    /// trusted precisely when it is wrong.
+    #[test]
+    fn a_dry_run_says_what_the_run_would_do() {
+        let (_tmp, path) = repo();
+        run(&path, &["checkout", "-q", "-b", "feat/x"]);
+
+        // `plan_for_test` names `main` as the base whatever the repo is
+        // on, which is right for a fixture and wrong here: the whole
+        // subject is a branch that is *not* protected. The plan's base
+        // branch is a stored fact about the repo, so that is the field to
+        // set.
+        let plan = RepoPlan {
+            base_branch: "feat/x".into(),
+            ..plan_for_test(&path)
+        };
+        let dry = RunOptions {
+            dry_run: true,
+            state_dir: path.join(".state"),
+            ..Default::default()
+        };
+        assert_eq!(run_one(&plan, &dry), RepoOutcome::NothingToCommit);
+
+        // Dirty, and not protected: there IS work, and the plan has to
+        // say so.
+        std::fs::write(path.join("a.txt"), "x\n").unwrap();
+        assert_eq!(
+            run_one(&plan, &dry),
+            RepoOutcome::WouldCommit,
+            "a dry run on a dirty tree must not claim there is nothing to commit"
+        );
+
+        // …and it still wrote nothing.
+        let porcelain = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned();
+        assert!(
+            porcelain.contains("a.txt") && !porcelain.contains("A "),
+            "a dry run must leave the change uncommitted, got: {porcelain}"
+        );
+    }
+
+    /// A refusal must not mutate. The protection check used to sit *after*
+    /// the engine, so `ro ship` on a protected branch made the WIP commit
+    /// and then declined to push it — leaving work on disk while the
+    /// summary said `refused` and "0 committed".
+    #[test]
+    fn a_refusal_leaves_the_tree_untouched() {
+        let (_tmp, path) = repo();
+        std::fs::write(path.join("a.txt"), "x\n").unwrap();
+        let plan = plan_for_test(&path);
+        let opts = RunOptions {
+            state_dir: path.join(".state"),
+            ..Default::default()
+        };
+
+        assert!(
+            matches!(run_one(&plan, &opts), RepoOutcome::Refused { .. }),
+            "a protected branch must be refused"
+        );
+        let head = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned();
+        assert!(
+            !head.trim().is_empty(),
+            "a refused repo must have gained no commit; HEAD does not resolve"
+        );
+        let porcelain = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&path)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .into_owned();
+        assert!(
+            porcelain.contains("a.txt"),
+            "a refused repo must keep its uncommitted work, not lose it: {porcelain}"
         );
     }
 
