@@ -53,3 +53,17 @@ tempfile.workspace = true
 # `ro schema` and needs the JSON it emits.
 serde_json.workspace = true
 ro-testkit = { path = "../ro-testkit" }
+
+[features]
+# Re-export of `ro-core`'s `keychain`, so the default build reads a
+# keychain entry exactly as it always has.
+#
+# The forwarding is the point. `ro-core` is depended on with
+# `default-features = false` (see the workspace table), because a
+# `--no-default-features` build otherwise re-enables the feature through
+# this very edge — and the release build for musl then reaches
+# `libdbus-sys`, which a statically linked musl binary cannot link.
+# Stating the feature here instead means the two build modes are
+# genuinely different, and a build that asks for no defaults gets none.
+default = ["keychain"]
+keychain = ["ro-core/keychain"]

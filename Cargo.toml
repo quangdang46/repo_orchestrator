@@ -31,7 +31,20 @@ categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 # Core crates (local)
-ro-core        = { path = "crates/ro-core" }
+# `default-features = false` here, and re-exported by the `ro` binary's own
+# `keychain` feature.
+#
+# It looks redundant for a workspace whose default build wants the feature
+# anyway, and it is not: `--no-default-features` on the command line turns
+# off the defaults of the *selected* packages, not the defaults a package
+# inherits through a dependency edge. With a plain `path` dependency,
+# `cargo build --workspace --no-default-features` still pulled `keyring` in
+# — features unify, `ro` re-enables `ro-core/keychain` for itself, and the
+# release build for a statically linked musl target still reached
+# `libdbus-sys`, which a musl binary cannot link. Verified with
+# `cargo tree -p ro --no-default-features -e normal | grep keyring`, which
+# printed one entry before this line and none after it.
+ro-core        = { path = "crates/ro-core", default-features = false }
 ro-config      = { path = "crates/ro-config" }
 ro-state       = { path = "crates/ro-state" }
 ro-git         = { path = "crates/ro-git" }

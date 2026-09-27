@@ -137,6 +137,12 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
       - name: Build
+        # `bash` on every runner, including Windows. Without it the default
+        # shell there is PowerShell, where a `run:` block written in bash —
+        # which is what the conditional below is — is a ParserError, not a
+        # build failure. The error names a syntax problem in a file nobody
+        # wrote, because the step body is generated.
+        shell: bash
         env:
           # Tell the cc / cmake crates to use the ARM cross-compilers when
           # building C/C++ dependencies (e.g. libz-ng-sys) for the aarch64
