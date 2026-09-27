@@ -193,12 +193,14 @@ jobs:
           & "${{ github.workspace }}\robin\ro.exe" --help | Out-Null
 
       # A binary that installs and prints a version but cannot do the job is
-      # not installed, it is merely present. `ro doctor` is the closest thing
-      # to a self-check ro has, and it exercises config, state and the git
-      # backend for real.
+      # not installed, it is merely present. `ro init` is the closest thing
+      # to a self-check ro has: it exercises config, state and the sqlite
+      # backend for real. `--config-dir`/`--state-dir` are pointed into the
+      # workspace so the check is hermetic rather than writing to the
+      # runner image's home directory and passing on someone else's state.
       - name: The installed binary does the job
         shell: bash
         run: |
-          export RO_CONFIG_DIR="${{ github.workspace }}/.ro-check"
-          "${{ github.workspace }}/robin/ro" init
-          "${{ github.workspace }}/robin/ro" --version
+          RO="${{ github.workspace }}/robin/ro"
+          "$RO" --config-dir .ro-check --state-dir .ro-check/state init
+          "$RO" --config-dir .ro-check --state-dir .ro-check/state --version
