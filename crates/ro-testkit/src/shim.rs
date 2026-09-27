@@ -63,16 +63,16 @@ impl FakeBinary {
         let dir = TempDir::new().expect("the shim dir is creatable");
         let log = dir.path().join("argv.log");
         let body = shim_body(
-            r#"printf '%s--RO-SEP--' "$*" >> "$RO_TESTKIT_LOG""#,
-            // The separator is the byte the reader splits on, written
-            // as a decimal escape. `^Z` looked right and was not: it is
-            // cmd.exe's end-of-file marker, so the second record could
-            // never appear and a shim that ran wrote nothing the reader
-            // could see.
-            r#"@echo off
-<nul set /p="%*" >> "@LOGPATH@"
-<nul set /p= >> "@LOGPATH@"
-exit /b 0"#,
+            r##"printf '%s--RO-SEP--' "$*" >> "$RO_TESTKIT_LOG""##,
+            // `echo`, not `<nul set /p>`. A probe on a real runner
+            // showed the latter eating the first two characters of
+            // every write: `--version--RO-SEP--` arrived as
+            // `-version--RO-SEP--`. `echo` appends a newline, which
+            // the reader tolerates because it trims each record.
+            r##"@echo off
+echo %*>> "@LOGPATH@"
+echo --RO-SEP-->> "@LOGPATH@"
+exit /b 0"##,
             &log,
         );
         write_shim(dir.path(), name, &body);
