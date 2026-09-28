@@ -15,24 +15,17 @@ mod ship;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand};
 use ro_config::paths::ConfigPaths;
 use ro_sync::sync::SyncStrategy;
 
-/// Output format for commands that support it.
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-enum OutputFormat {
-    #[default]
-    Text,
-    Json,
-    /// One JSON object per line, for a consumer that reads a stream.
-    ///
-    /// Not a second machine format: it is the same objects `json` emits,
-    /// framed so a reader can process twenty repos without holding all
-    /// twenty in memory. That framing is the only difference, and it is
-    /// only worth a variant where there is more than one row.
-    Ndjson,
-}
+/// One `--format` for every command that has one.
+///
+/// It lives in `ship::summary` because that is where the fleet verbs render,
+/// and a second copy here is how the two drifted apart in the first place:
+/// the read commands had `text|json|ndjson` and the fleet verbs had
+/// `--format` not at all.
+use crate::ship::summary::OutputFormat;
 
 #[derive(Debug, Parser)]
 #[command(name = "ro", about = "GitHub-first repo orchestration CLI", version, long_about = None)]
@@ -118,6 +111,12 @@ enum Commands {
         /// Filter by owner
         #[arg(long)]
         owner: Option<String>,
+        /// Only repos carrying this tag. `--group` is the same flag.
+        #[arg(long, visible_alias = "group")]
+        tag: Option<String>,
+        /// Print each repo's local path as well as its name.
+        #[arg(long)]
+        paths: bool,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
@@ -176,6 +175,14 @@ enum Commands {
         /// was archived is a row the user said to leave alone.
         #[arg(long)]
         include_archived: bool,
+        /// Delete remote-tracking refs whose branch is gone upstream.
+        ///
+        /// `git remote prune`, not `git fetch --prune`. The narrower of the
+        /// two on purpose: this removes local bookkeeping for branches that
+        /// no longer exist and never touches the remote, so it is safe to
+        /// run across a fleet without asking first.
+        #[arg(long)]
+        prune: bool,
     },
 
     /// Show status of tracked repos
@@ -189,6 +196,15 @@ enum Commands {
         /// Restrict to repos matching a selector, e.g. `health:50`
         #[arg(long)]
         filter: Option<String>,
+        /// Only repos with uncommitted changes
+        #[arg(long)]
+        dirty: bool,
+        /// Only repos with commits the remote has not seen
+        #[arg(long)]
+        ahead: bool,
+        /// Only repos the remote has moved past
+        #[arg(long)]
+        behind: bool,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
@@ -274,6 +290,30 @@ enum Commands {
         /// be doing something they did not ask for. This is the way back.
         #[arg(long)]
         include_archived: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        /// One commit per repo, with this subject.
+        ///
+        /// The engine still reads the diff and stages; it just has one
+        /// message instead of a choice of them. There is no separate
+        /// "do not split" flag, because supplying the subject *is* that
+        /// request.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// Fold the work into HEAD rather than adding a commit.
+        ///
+        /// Refused when HEAD is already on the remote: amending a commit
+        /// someone else has seen rewrites history under a message that no
+        /// longer describes it.
+        #[arg(long)]
+        amend: bool,
+        /// The instruction handed to the agent, replacing the built-in one.
+        ///
+        /// For this run, on every repo it touches. The boundary is
+        /// unchanged: the agent still commits, and ro still pushes.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
     },
     /// Commit and push
     Push {
@@ -320,6 +360,15 @@ enum Commands {
         /// is passed. The default is the safe one.
         #[arg(long)]
         include_archived: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        /// One commit per repo, with this subject, before pushing.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// The instruction handed to the agent, replacing the built-in one.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
     },
     /// The whole thing: fetch, rebase, commit, push
     Ship {
@@ -380,6 +429,15 @@ enum Commands {
         /// The old opt-in switch. Now the default.
         #[arg(long, hide = true)]
         execute: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+        format: OutputFormat,
+        /// One commit per repo, with this subject.
+        #[arg(long, value_name = "MSG")]
+        message: Option<String>,
+        /// The instruction handed to the agent, replacing the built-in one.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
     },
 
     // ── Doctor ───────────────────────────────────────────────────────
@@ -619,6 +677,9 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = resolve_paths(&cli)?;
     let db_path = paths.state_db();
+    // `--yes` on push/ship is this same instruction under the spelling a CI
+    // script reaches for. One variable, two spellings, so there is a single
+    // place that decides whether ro may act without asking.
     let non_interactive = cli.non_interactive;
 
     match cli.command {
@@ -640,6 +701,10 @@ fn run() -> Result<()> {
             resolve,
             dry_run,
             include_archived,
+            format,
+            message,
+            amend,
+            prompt,
         } => ship::run_verb(
             &paths,
             ship::HowFar::Commit,
@@ -653,6 +718,10 @@ fn run() -> Result<()> {
             resolve,
             dry_run,
             include_archived,
+            format,
+            message,
+            amend,
+            prompt,
         ),
         Commands::Push {
             repos: named,
@@ -666,6 +735,9 @@ fn run() -> Result<()> {
             resolve,
             dry_run,
             include_archived,
+            format,
+            message,
+            prompt,
         } => ship::run_verb(
             &paths,
             ship::HowFar::Push,
@@ -679,6 +751,10 @@ fn run() -> Result<()> {
             resolve,
             dry_run,
             include_archived,
+            format,
+            message,
+            /* amend */ false,
+            prompt,
         ),
         Commands::Ship {
             repos: named,
@@ -694,6 +770,9 @@ fn run() -> Result<()> {
             resolve,
             dry_run,
             include_archived,
+            format,
+            message,
+            prompt,
         } => {
             // The old `ro sweep commit-sweep` spelling, for one release.
             // A script that breaks on a rename is a script the user has to
@@ -716,6 +795,10 @@ fn run() -> Result<()> {
                     /* resolve */ false,
                     /* dry_run */ !execute,
                     /* include_archived */ false,
+                    /* format */ OutputFormat::Text,
+                    /* message */ None,
+                    /* amend */ false,
+                    /* prompt */ None,
                 );
             }
             ship::run_verb(
@@ -731,6 +814,10 @@ fn run() -> Result<()> {
                 resolve,
                 dry_run,
                 include_archived,
+                format,
+                message,
+                /* amend */ false,
+                prompt,
             );
         }
 
@@ -879,16 +966,37 @@ fn run() -> Result<()> {
             eprintln!("Removed: {}/{}", repo.owner, repo.name);
         }
 
-        Commands::List { owner, format } => {
+        Commands::List { owner, tag, paths, format } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-            let repos = manage::list(&conn, owner.as_deref()).context("listing repos")?;
+            let mut repos = manage::list(&conn, owner.as_deref()).context("listing repos")?;
+            if let Some(t) = tag.as_deref() {
+                // A real `repo_tags` lookup. Matching the tag against the
+                // printed label is how `--filter tag:` used to select
+                // repositories by coincidence of their *name*.
+                repos.retain(|r| {
+                    ro_sync::tags::of(&conn, &format!("{}/{}", r.owner, r.name))
+                        .map(|v| v.iter().any(|x| x == t))
+                        .unwrap_or(false)
+                });
+            }
             if repos.is_empty() {
                 eprintln!("No tracked repos. Use 'ro add <spec>' to add one.");
             } else {
                 for repo in repos {
                     match format {
-                        OutputFormat::Text => println!("{}", repo),
+                        OutputFormat::Text => {
+                            // The path is the thing you paste into `cd`, and
+                            // `ro list` is where you go to find out where a
+                            // repo is. Behind a flag it is one more thing to
+                            // remember for the answer to the question the
+                            // command is asked.
+                            if paths {
+                                println!("{}  {}", repo, repo.local_path);
+                            } else {
+                                println!("{}", repo);
+                            }
+                        }
                         // One object per line, so a consumer can read the
                         // first repo without waiting for the last.
                         OutputFormat::Json | OutputFormat::Ndjson => {
@@ -913,6 +1021,7 @@ fn run() -> Result<()> {
             tag,
             all,
             include_archived,
+            prune,
         } => {
             if clone_only && pull_only {
                 anyhow::bail!("--clone-only and --pull-only cannot be used together");
@@ -986,6 +1095,7 @@ fn run() -> Result<()> {
                 dry_run,
                 clone_only,
                 pull_only,
+                prune,
             };
             let repo_labels = repo_labels_by_id(&conn);
             let results = sync::sync_all(&conn, &opts, &selected).context("syncing repos")?;
@@ -1009,6 +1119,9 @@ fn run() -> Result<()> {
             repos: named,
             tag,
             filter,
+            dirty: only_dirty,
+            ahead: only_ahead,
+            behind: only_behind,
             format,
         } => {
             let conn = ro_state::open_db(&db_path)
@@ -1039,6 +1152,24 @@ fn run() -> Result<()> {
             } else {
                 status::status_all(&conn)?
             };
+
+            // `--dirty` / `--ahead` / `--behind` narrow *after* selection,
+            // not instead of it: `ro status --tag work --dirty` is the
+            // question the flags exist for, and a filter that replaced the
+            // tag would make the two mutually exclusive for no reason.
+            //
+            // `None` on ahead/behind means unmeasurable — a repo with no
+            // upstream, or no worktree. Such a row is *excluded* from
+            // `--ahead`/`--behind` rather than counted as zero: "not ahead"
+            // and "not known" are different facts, and conflating them is
+            // how a fleet board goes green over rows nobody measured.
+            let statuses: Vec<status::RepoStatus> = statuses
+                .into_iter()
+                .filter(|s| !only_dirty || s.is_dirty)
+                .filter(|s| !only_ahead || s.ahead.unwrap_or(0) > 0)
+                .filter(|s| !only_behind || s.behind.unwrap_or(0) > 0)
+                .collect();
+
             for s in &statuses {
                 match format {
                     OutputFormat::Text => {

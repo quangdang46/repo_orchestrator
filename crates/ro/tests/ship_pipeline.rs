@@ -93,6 +93,7 @@ fn assess(path: &std::path::Path) -> Verdict {
         identity: None,
         timeout: std::time::Duration::from_secs(30),
         message_override: None,
+        subject_override: None,
         env: &[],
     };
     let oid = match engine.checkpoint(&ctx) {

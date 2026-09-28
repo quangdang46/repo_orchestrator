@@ -252,6 +252,21 @@ pub struct RunOptions {
     /// fleet run that starves itself.
     pub parallel: usize,
     pub dry_run: bool,
+    /// One commit, this subject, for every repo. `--message`.
+    ///
+    /// This is the only way to stop an agent from splitting the work, and
+    /// it is deliberately the only one: "commit it as one" is a statement
+    /// about the *message*, and the engine still does the grouping work —
+    /// it just has nothing to choose between.
+    pub message: Option<String>,
+    /// Fold the work into HEAD instead of adding a commit.
+    ///
+    /// Refused when HEAD is already pushed. Amending a commit the remote
+    /// has seen is a history rewrite published under a name that no longer
+    /// describes it, and no flag should make that one keystroke away.
+    pub amend: bool,
+    /// The instruction handed to the agent, replacing the built-in one.
+    pub prompt: Option<String>,
     /// Where locks live. Under the state directory, never in the
     /// worktree: a lock inside the repo makes `git status` report the
     /// tool's own file as uncommitted work.
@@ -278,6 +293,9 @@ impl Default for RunOptions {
             timeout: ro_engine::dispatch::default_timeout(),
             parallel: 4,
             dry_run: false,
+            message: None,
+            amend: false,
+            prompt: None,
             state_dir: std::env::temp_dir(),
             resolve_conflicts: false,
         }
@@ -423,9 +441,19 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         base_branch: plan.base_branch.clone(),
         identity: plan.identity.as_ref(),
         timeout: opts.timeout,
-        message_override: None,
+        // Two flags, two fields. `--prompt` is the agent's brief and
+        // `--message` is the subject; one field could only mean one of
+        // them, and the other engine silently got the wrong thing.
+        message_override: opts.prompt.as_deref(),
+        subject_override: opts.message.as_deref(),
         env: &[],
     };
+
+    // Remembered before the engine runs, so "amend" can tell an actual
+    // rewrite from a no-op. Without it, a run with nothing to commit would
+    // still rewrite HEAD — an empty commit that says nothing happened and
+    // moves the branch anyway.
+    let head_before = ro_git::read::head_oid(repo).ok().flatten();
 
     let oid = match plan.engine.checkpoint(&ctx) {
         EngineOutcome::Committed { commits } => match commits.last() {
@@ -448,6 +476,29 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             };
         }
         EngineOutcome::Failed { error, .. } => return RepoOutcome::Failed { error },
+    };
+
+    // `--amend`: fold what the engine just committed into the commit
+    // underneath, so the branch moves by one commit holding the new tree
+    // rather than by N. Applied after the engine, so it is one code path for
+    // the `git` engine and for an agent that produced several.
+    let oid = if opts.amend {
+        let subject = opts
+            .message
+            .clone()
+            .or_else(|| subject_of(repo, &oid))
+            .unwrap_or_else(|| "amend".to_string());
+        let author = plan.identity.as_ref().map(|i| (i.name.as_str(), i.email.as_str()));
+        match ro_git::primitives::amend_tree(repo, head_before.as_deref(), &subject, author) {
+            Ok(new) => new,
+            Err(e) => {
+                return RepoOutcome::Failed {
+                    error: format!("amending HEAD failed: {e:#}"),
+                }
+            }
+        }
+    } else {
+        oid
     };
 
     if !opts.how_far.pushes() {
@@ -1417,4 +1468,14 @@ mod verb_shape_tests {
         }
         assert!(!HowFar::Commit.pushes(), "commit never touches the remote");
     }
+}
+
+/// The subject of a commit, for `--amend` when the user gave no `--message`.
+///
+/// An amend with no subject of its own must keep the one the commit already
+/// had — that is what "amend" means to everyone who has used `git commit
+/// --amend` without `-m`, and replacing it with a placeholder would be a
+/// silent rewrite of a message the user wrote.
+fn subject_of(repo: &std::path::Path, oid: &str) -> Option<String> {
+    ro_git::read::commit_subject(repo, oid)
 }

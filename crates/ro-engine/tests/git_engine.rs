@@ -211,7 +211,7 @@ fn a_non_repository_fails_with_a_reason() {
     }
 }
 
-/// `message_override` is honoured; the default is not a conventional commit.
+/// `subject_override` is honoured; the default is not a conventional commit.
 ///
 /// The auto-generated subjects are what Phase 4 removes: they produced
 /// plausible messages for changes that did not fit them, and a user who
@@ -223,7 +223,7 @@ fn the_message_is_the_override_or_an_explicit_wip() {
     let engine = GitEngine::new();
 
     let override_msg = "the user's own words";
-    let ctx = EngineContext::new(w.path(), "main").with_message(Some(override_msg));
+    let ctx = EngineContext::new(w.path(), "main").with_subject(Some(override_msg));
     let EngineOutcome::Committed { commits } = engine.checkpoint(&ctx) else {
         panic!("expected a commit");
     };
@@ -383,4 +383,39 @@ fn the_git_backend_makes_one_commit_where_an_agent_makes_two() {
         "got: {}",
         commits[0].message
     );
+}
+
+/// A prompt is not a subject.
+///
+/// `ro commit --prompt` is the agent's brief and `--message` is the commit
+/// subject. They were one field until both flags existed, and a raw `git`
+/// commit has no brief — it has a message. Wiring both flags to one field
+/// meant whichever the caller meant won for the other engine.
+#[test]
+fn the_git_engine_reads_a_subject_and_ignores_a_prompt() {
+    let w = Worktree::with_one_commit();
+    w.write("a.txt", "x\n");
+    let engine = GitEngine::new();
+
+    // A prompt alone must not become the commit message.
+    let ctx = EngineContext::new(w.path(), "main").with_message(Some("think about the code"));
+    let EngineOutcome::Committed { commits } = engine.checkpoint(&ctx) else {
+        panic!("expected a commit");
+    };
+    assert!(
+        !commits[0].message.contains("think about the code"),
+        "a prompt is an instruction, not a commit subject; got {:?}",
+        commits[0].message
+    );
+
+    // Both together: the subject wins, because that is the one this engine
+    // has a use for.
+    w.write("b.txt", "y\n");
+    let ctx = EngineContext::new(w.path(), "main")
+        .with_message(Some("think about the code"))
+        .with_subject(Some("fix: the actual thing"));
+    let EngineOutcome::Committed { commits } = engine.checkpoint(&ctx) else {
+        panic!("expected a second commit");
+    };
+    assert_eq!(commits[0].message, "fix: the actual thing");
 }

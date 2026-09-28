@@ -1086,3 +1086,54 @@ mod author_tests {
         );
     }
 }
+
+/// Replace the **tree** of the last commit, keeping its position in history.
+///
+/// This is what `--amend` means and it is not the same thing as "add
+/// another commit": the result is one commit at the old position holding the
+/// new tree, so a branch that was three commits behind is now one.
+///
+/// The caller passes the old HEAD so the rewrite is a no-op when nothing was
+/// committed on top — an amend with no changes would otherwise create an
+/// empty commit that says nothing happened and moves the branch anyway.
+pub fn amend_tree(
+    repo: &Path,
+    previous_head: Option<&str>,
+    subject: &str,
+    author: Option<(&str, &str)>,
+) -> Result<String> {
+    if let Some(prev) = previous_head {
+        let head = head_short(repo)?;
+        if head == prev {
+            bail!("nothing to amend: HEAD has not moved");
+        }
+        // Uncommit whatever landed on top, keeping every change staged, then
+        // amend the commit underneath. One rewrite, not N.
+        run_in(
+            Some(repo),
+            &["reset", "--soft", prev],
+            &RunOpts::none(),
+        )?;
+    }
+
+    let mut argv: Vec<String> = Vec::new();
+    if let Some((name, email)) = author {
+        argv.push("-c".to_string());
+        argv.push(format!("user.name={name}"));
+        argv.push("-c".to_string());
+        argv.push(format!("user.email={email}"));
+    }
+    argv.extend([
+        "commit".to_string(),
+        "--amend".to_string(),
+        "--no-gpg-sign".to_string(),
+        "-m".to_string(),
+        subject.to_string(),
+    ]);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = run_in(Some(repo), &argv, &RunOpts::none())?;
+    if !out.ok() {
+        bail!("git commit --amend failed: {}", out.stderr.trim());
+    }
+    head_short(repo)
+}

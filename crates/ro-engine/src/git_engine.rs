@@ -97,7 +97,9 @@ impl Engine for GitEngine {
         // One message for the whole worktree. Splitting is the agent's job;
         // doing it here would mean re-deriving the bucket rules that this
         // crate is removing.
-        let message = match ctx.message_override {
+        // The subject, not the prompt. `ro commit --prompt` is the agent's
+        // brief and has nothing to do with what a raw `git commit` is called.
+        let message = match ctx.subject_override {
             Some(m) if !m.trim().is_empty() => m.to_string(),
             _ => default_message(root),
         };

@@ -45,6 +45,13 @@ pub struct SyncOptions {
     pub clone_only: bool,
     /// Only pull existing repos; skip cloning missing.
     pub pull_only: bool,
+    /// Delete remote-tracking refs whose branch is gone upstream.
+    ///
+    /// `git remote prune`, not `git fetch --prune`. The narrower of the
+    /// two on purpose: this removes local bookkeeping for branches that no
+    /// longer exist and never touches the remote, so it is safe to run
+    /// across a fleet without asking first.
+    pub prune: bool,
 }
 
 impl Default for SyncOptions {
@@ -56,6 +63,7 @@ impl Default for SyncOptions {
             dry_run: false,
             clone_only: false,
             pull_only: false,
+            prune: false,
         }
     }
 }
@@ -87,6 +95,21 @@ pub fn sync_repo(
     } else {
         None
     };
+
+    // `git remote prune` removes local remote-tracking refs for branches
+    // the remote no longer has. It touches only local bookkeeping, so it is
+    // run before the pull rather than after: the pull refetches what is
+    // still there, and anything the prune deleted was already gone upstream.
+    if opts.prune && !opts.dry_run && local.join(".git").exists() {
+        // Best-effort and silent on failure. A prune that cannot run is not
+        // a reason to fail a sync — the pull is the work, and the prune is
+        // housekeeping the user asked for once, not on every run.
+        let _ = ro_git::mutation::run_in(
+            Some(local),
+            &["remote", "prune"],
+            &ro_git::mutation::RunOpts::none(),
+        );
+    }
 
     if opts.dry_run {
         let action = if local.join(".git").exists() {
@@ -717,8 +740,20 @@ mod tests {
         // First sync clones.
         sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
 
-        // Local commits something the remote does not have, so a
-        // fast-forward pull must refuse.
+        // Both sides move, so the branch genuinely diverges and a
+        // fast-forward pull has no answer.
+        //
+        // This used to move only the *local* side and assert the pull was
+        // refused. It was refused — because `git pull` was being handed the
+        // branch name where the remote goes, so every pull errored with "does
+        // not appear to be a git repository". The test was reading a bug as
+        // the behaviour it wanted, and passed for the wrong reason.
+        //
+        // Local ahead on its own is *not* a failed pull: `git pull --ff-only`
+        // with a local commit and a remote that has not moved says "Already
+        // up to date" and exits 0, correctly. There is nothing to fetch, and
+        // an unpushed local commit is not an error.
+        commit_to_remote(tmp.path(), &remote, "c.txt", "remote moved on");
         std::fs::write(local_path.join("b.txt"), "local only\n").unwrap();
         run_git(&local_path, &["add", "."]);
         run_git(&local_path, &["commit", "-m", "local commit"]);

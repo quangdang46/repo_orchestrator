@@ -413,6 +413,21 @@ pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
         args.push(remote.clone());
     }
     if let Some(branch) = &opts.branch {
+        // `git pull` takes `[remote] [branch]` positionally, so a branch
+        // with no remote lands in the **remote** slot. `ro sync` builds
+        // `PullOpts { branch: Some(current), ..Default::default() }`,
+        // `remote` is `None` by derive, and the result was
+        // `git pull --ff-only feat/x` — git reads `feat/x` as a remote
+        // name, and every sync failed with "does not appear to be a git
+        // repository".
+        //
+        // Fixed here rather than at the call site because this is the layer
+        // that knows git's argument grammar: any caller naming a branch
+        // without naming a remote makes the same mistake, and the compiler
+        // cannot tell the two cases apart.
+        if opts.remote.is_none() {
+            args.push("origin".to_string());
+        }
         args.push(branch.clone());
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1351,7 +1366,7 @@ echo PROBE_ARGS=%*
         assert!(dest.join(".git").exists(), "the clone should have landed");
     }
 
-    fn temp_repo() -> (TempDir, PathBuf) {
+    pub(crate) fn temp_repo() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().to_path_buf();
         run_git(&path, &["init", "-q", "-b", "main"]);
@@ -1447,5 +1462,54 @@ echo PROBE_ARGS=%*
         };
         let r = push(&work, &push_opts).unwrap();
         assert!(r.ok(), "push failed: {} / {}", r.stdout, r.stderr);
+    }
+}
+
+/// A branch with no remote must not land in git's *remote* slot.
+///
+/// `git pull` is `git pull [remote] [branch]` positionally. Every call site
+/// that names a branch and leaves `remote` at its derived `None` therefore
+/// produced `git pull <branch>`, and git read the branch as a remote name
+/// and failed — which is how `ro sync` ended up erroring on every repo in
+/// the fleet with "does not appear to be a git repository".
+#[cfg(test)]
+mod pull_arg_tests {
+    use super::*;
+
+    use super::tests::temp_repo;
+    #[test]
+    fn a_branch_without_a_remote_still_pulls_from_origin() {
+        let (_tmp, repo) = temp_repo();
+        let opts = PullOpts {
+            remote: None,
+            branch: Some("feat/x".into()),
+            strategy: PullStrategy::FastForwardOnly,
+        };
+        let out = pull(&repo, &opts).unwrap();
+        let argv = out.result.args.join(" ");
+        // The failure mode is the shape of the argument list, not the exit
+        // code: a repo with no `origin` cannot pull from one, but it must
+        // fail saying *that*, not claiming a branch is a remote.
+        assert!(
+            !out.result.stderr.contains("'feat/x' does not appear to be a git repository"),
+            "the branch was passed in git's remote slot: {argv}\n{}",
+            out.result.stderr
+        );
+    }
+
+    #[test]
+    fn an_explicit_remote_is_not_overridden_by_the_default() {
+        let (_tmp, repo) = temp_repo();
+        let opts = PullOpts {
+            remote: Some("upstream".into()),
+            branch: Some("main".into()),
+            strategy: PullStrategy::Rebase,
+        };
+        let out = pull(&repo, &opts).unwrap();
+        assert!(
+            out.result.stderr.contains("'upstream'") || !out.result.stderr.contains("'main' does not appear"),
+            "an explicit remote must be used as given: {}",
+            out.result.stderr
+        );
     }
 }

@@ -174,7 +174,16 @@ pub struct EngineContext<'a> {
     pub base_branch: String,
     pub identity: Option<&'a CommitIdentity>,
     pub timeout: Duration,
+    /// The instruction given to an agent, replacing the built-in one.
+    ///
+    /// Deliberately **not** the same field as the commit subject. They were
+    /// one field until `ro commit --prompt` and `--message` both existed, and
+    /// one field cannot mean both: the agent reads this as its brief, while
+    /// the `git` engine reads a subject and never sees a prompt. Sharing it
+    /// meant whichever the caller meant won for the other engine.
     pub message_override: Option<&'a str>,
+    /// The subject every commit is written with, when the user supplied one.
+    pub subject_override: Option<&'a str>,
     /// Merged into the child env — AFTER subtraction, not instead of it.
     pub env: &'a [(String, String)],
 }
@@ -194,6 +203,7 @@ impl<'a> EngineContext<'a> {
             identity: None,
             timeout: Duration::from_secs(600),
             message_override: None,
+            subject_override: None,
             env: &[],
         }
     }
@@ -208,8 +218,16 @@ impl<'a> EngineContext<'a> {
         self
     }
 
+    /// The agent's brief. Named for what it is rather than for the flag:
+    /// `--prompt`.
     pub fn with_message(mut self, message: Option<&'a str>) -> Self {
         self.message_override = message;
+        self
+    }
+
+    /// The commit subject. `--message`.
+    pub fn with_subject(mut self, subject: Option<&'a str>) -> Self {
+        self.subject_override = subject;
         self
     }
 

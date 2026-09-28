@@ -15,7 +15,30 @@
 
 use std::fmt::Write;
 
+use clap::ValueEnum;
+
 use crate::ship::orchestrator::RepoOutcome;
+
+/// How a run's result is written out.
+///
+/// One type for every command that takes `--format`, so the fleet verbs and
+/// the read commands cannot drift into two enums with the same variants and
+/// different meanings — which is exactly what happened when the fleet verbs
+/// grew their own.
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// The aligned table, for a person.
+    #[default]
+    Text,
+    Json,
+    /// One JSON object per line, for a consumer that reads a stream.
+    ///
+    /// Not a second machine format: it is the same objects `json` emits,
+    /// framed so a reader can process twenty repos without holding all
+    /// twenty in memory. That framing is the only difference, and it is
+    /// only worth a variant where there is more than one row.
+    Ndjson,
+}
 
 /// One repo's line.
 #[derive(Debug, Clone)]
@@ -36,6 +59,62 @@ pub struct Summary {
 impl Summary {
     pub fn new(rows: Vec<SummaryRow>) -> Self {
         Self { rows }
+    }
+
+    /// The machine-readable form.
+    ///
+    /// The text table is padded for a terminal, which is exactly what a
+    /// script does not want: it has to strip columns, and a column that
+    /// changes width between runs breaks the strip. These are the stable
+    /// shapes — one object per repo with named fields, and a summary
+    /// object carrying the same counts the exit code is derived from, so a
+    /// script reading the result and the process status can never disagree.
+    pub fn render_json(&self, format: OutputFormat) -> String {
+        let rows: Vec<serde_json::Value> = self
+            .rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "label": r.label,
+                    "branch": r.branch,
+                    "engine": r.engine,
+                    "account": r.account,
+                    "outcome": r.outcome.render(),
+                    "failed": r.outcome.is_failure(),
+                })
+            })
+            .collect();
+        let (succeeded, failed) = self.counts();
+        let summary = serde_json::json!({
+            "committed": self.committed(),
+            "pushed": self.pushed(),
+            "failed": self.failures(),
+            "exit": crate::exit::RunExit::from_counts(succeeded, failed).code(),
+        });
+
+        match format {
+            OutputFormat::Ndjson => {
+                let mut out = String::new();
+                for row in &rows {
+                    out.push_str(&row.to_string());
+                    out.push('\n');
+                }
+                let mut last = summary.as_object().expect("a json object").clone();
+                last.insert("summary".into(), serde_json::Value::Bool(true));
+                out.push_str(&serde_json::Value::Object(last).to_string());
+                out.push('\n');
+                out
+            }
+            OutputFormat::Json => {
+                let doc = serde_json::json!({ "repos": rows, "summary": summary });
+                serde_json::to_string_pretty(&doc)
+                    .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"))
+            }
+            // The caller renders text itself. Reaching here would mean a new
+            // variant was added with no branch, and handing back a table a
+            // script would try to parse is the failure that hides.
+            OutputFormat::Text => self.render(),
+        }
     }
 
     /// How many repos failed.

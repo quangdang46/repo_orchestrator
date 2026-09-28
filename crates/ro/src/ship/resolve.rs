@@ -131,6 +131,7 @@ pub fn resolve_after_rebase(
         identity: None,
         timeout: std::time::Duration::from_secs(600),
         message_override: Some(RESOLVE_PROMPT),
+        subject_override: None,
         env: &[],
     };
     let _ = engine.checkpoint(&ctx);

@@ -38,6 +38,7 @@ pub mod summary;
 
 pub use emit::{plan_for, run};
 pub use orchestrator::{HowFar, RunOptions};
+pub use summary::OutputFormat;
 // `Summary` is built by `run`, and nothing else here names it. The
 // re-export existed for the dry-run branch that fabricated rows by hand.
 
@@ -66,6 +67,10 @@ pub fn run_verb(
     resolve: bool,
     dry_run: bool,
     include_archived: bool,
+    format: summary::OutputFormat,
+    message: Option<String>,
+    amend: bool,
+    prompt: Option<String>,
 ) -> ! {
     // The engine the user named, else the config, else an error naming
     // the three. Never a silent fall-through to `git`: a user who asked
@@ -206,11 +211,19 @@ pub fn run_verb(
         // what the run would say; building it here instead of there made
         // it a guess, and a guess is not a preview.
         dry_run,
+        message: message.clone(),
+        amend,
+        prompt: prompt.clone(),
         ..Default::default()
     };
     let summary = run(&plans, &opts);
 
-    print!("{}", summary.render());
+    // The text table and the machine shapes come from the same summary, so a
+    // script and a person are never reading two different runs.
+    match format {
+        OutputFormat::Text => print!("{}", summary.render()),
+        other => print!("{}", summary.render_json(other)),
+    }
     // The summary counts; the table decides. A summary that assigned a
     // code itself would collapse "all failed" and "some failed", which
     // is the distinction the table exists for.
