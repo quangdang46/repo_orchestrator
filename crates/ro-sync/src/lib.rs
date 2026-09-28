@@ -5,5 +5,6 @@
 pub mod manage;
 pub mod prune;
 pub mod status;
+pub mod tags;
 pub mod sync;
 pub mod targets;

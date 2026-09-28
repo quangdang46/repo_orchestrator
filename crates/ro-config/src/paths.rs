@@ -128,6 +128,21 @@ layout = "flat"            # flat | nested
 parallel = 8
 timeout_secs = 30
 
+# [identity] — the commit author, and the named profiles a repo picks
+# from. The row's `author_ref` names a profile here; no row ever carries
+# an address, so renaming one is a single edit rather than a migration.
+# A row with no `author_ref` gets `default`; if exactly one profile is
+# defined, `default` is unnecessary.
+#
+#   [identity.work]
+#   name  = "Your Name"
+#   email = "you@company.com"
+#   [identity.personal]
+#   name  = "Your Name"
+#   email = "you@gmail.com"
+#   # [identity]
+#   # default = "personal"
+
 # [auth] — the credential SOURCE for any repo that does not override it.
 # The key name IS the transport; the value is a *reference* to a secret,
 # never the secret.
@@ -187,7 +202,7 @@ sse_port = 7300
 # The prompt is built from diff text and file paths, and passing any of it
 # through a shell is a command-injection path into the user's own account.
 [agent]
-# engine = "claude"
+engine = "claude"   # claude | codex | git — the default; git is the raw backend, not a fallback
 # command = 'codex exec "{prompt}"'   # optional: a different binary entirely
 # prompt  = "..."                     # optional: a different instruction
 #

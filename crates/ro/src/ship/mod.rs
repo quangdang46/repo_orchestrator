@@ -72,19 +72,22 @@ pub fn run_verb(
     // for an agent and got the raw backend would get one commit per repo
     // and have no way to tell why.
     let config = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
-    let engine_name = match engine.or(config.agent.engine.as_deref()) {
-        Some(e) => e.to_string(),
-        None => {
-            eprintln!(
-                "no engine selected. Pass --engine claude|codex|git, or set \\
-                 `agent.engine` in the config.\n\\
-                 A typo'd name is an error rather than a default, because \\
-                 falling back silently would commit with the raw backend \\
-                 while you believed an agent was reading the diff."
-            );
-            std::process::exit(crate::exit::EX_USAGE as i32);
-        }
-    };
+    // The engine the user named, else the config, else `claude`.
+    //
+    // The default is `claude` and deliberately **not** `git`. A silent
+    // fall-through to the raw backend would commit one message per repo
+    // while the user believed an agent was reading the diff. A missing
+    // `claude` is reported per repo, by name, at dispatch — which is a
+    // different thing from downgrading.
+    //
+    // There was no default at all before this, which is worse than
+    // either: the tool refused to run until you passed `--engine` or
+    // edited a config file, so the first thing every new user had to
+    // discover was the flag.
+    let engine_name = engine
+        .or(config.agent.engine.as_deref())
+        .unwrap_or("claude")
+        .to_string();
 
     let conn = match ro_state::open_db(&paths.state_db()) {
         Ok(c) => c,
@@ -140,7 +143,16 @@ pub fn run_verb(
     }
 
     let slots = ro_engine::EngineSlots::default();
-    let global_identity = None::<ro_core::CommitIdentity>;
+    // The global identity is the `[identity] default` profile, resolved here
+    // rather than per row. It was hardcoded to `None` while the config
+    // carried an `[agent]` table nobody read, so `ro config set` of an
+    // author was a no-op and every commit fell through to git's own
+    // config — the per-repo author feature was advertised and inert.
+    let global_identity: Option<ro_core::CommitIdentity> =
+        config.identity.fallback().map(|p| ro_core::CommitIdentity {
+            name: p.name,
+            email: p.email,
+        });
     let mut plans = Vec::with_capacity(targets.len());
     for t in &targets {
         match ro_sync::manage::find_repo(&conn, &t.repo_id) {
@@ -149,6 +161,7 @@ pub fn run_verb(
                 &slots,
                 &engine_name,
                 engine_bin,
+                &config.identity,
                 global_identity.as_ref(),
             ) {
                 Ok(mut p) => {

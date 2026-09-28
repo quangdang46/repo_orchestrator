@@ -94,6 +94,7 @@ pub fn plan_for(
     slots: &ro_engine::EngineSlots,
     engine_name: &str,
     engine_bin: Option<&str>,
+    profiles: &ro_config::schema::IdentityConfig,
     global_identity: Option<&ro_core::CommitIdentity>,
 ) -> Result<RepoPlan> {
     let local_path = std::path::PathBuf::from(&repo.local_path);
@@ -106,11 +107,53 @@ pub fn plan_for(
     // A row with no `author_ref` inherits the global identity, which is
     // how adding one upgrades every existing repo without touching a
     // row.
-    let identity = match repo.author_ref.as_deref() {
-        Some(name) => Some(ro_core::CommitIdentity {
-            name: name.to_string(),
-            email: format!("{name}@localhost"),
-        }),
+    //
+    // A row WITH `author_ref` names a **profile** in `[identity.*]`, and an
+    // unknown name is an error. This used to synthesise
+    // `name = "work", email = "work@localhost"` — a real commit attributed
+    // to a host that does not exist, reported as success, with nothing
+    // anywhere saying the author was invented. That is worse than refusing:
+    // the commit lands and the author is wrong.
+    // The per-repo file outranks the row. It is loaded here rather than in
+    // the registry so there is exactly one place the two layers meet.
+    //
+    // A missing file is not an error: most repos will not have one, and
+    // that is the design rather than a gap.
+    let local = ro_config::local::RepoLocalConfig::load(&local_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e:#}", local_path.join(".ro/config.local.toml").display()))?;
+    let mut author_ref = repo.author_ref.clone();
+    let mut credential_ref = repo.credential_ref.clone();
+    let mut engine_row = repo.engine.clone();
+    let mut engine_args = repo.engine_args.clone();
+    if let Some(l) = &local {
+        l.apply_to(
+            &mut author_ref,
+            &mut credential_ref,
+            &mut engine_row,
+            &mut engine_args,
+        );
+    }
+
+    let identity = match author_ref.as_deref() {
+        Some(name) => {
+            let p = profiles.resolve(name).ok_or_else(|| {
+                let known = profiles.names();
+                anyhow::anyhow!(
+                    "repo {}/{}: author_ref = {name:?} is not a profile in [identity.*]\n  {}",
+                    repo.owner,
+                    repo.name,
+                    if known.is_empty() {
+                        "no profiles are defined".to_string()
+                    } else {
+                        format!("known profiles: {}", known.join(", "))
+                    }
+                )
+            })?;
+            Some(ro_core::CommitIdentity {
+                name: p.name,
+                email: p.email,
+            })
+        }
         None => global_identity.cloned(),
     };
 

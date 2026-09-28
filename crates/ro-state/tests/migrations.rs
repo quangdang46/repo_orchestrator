@@ -23,16 +23,17 @@ use rusqlite::{Connection, params};
 /// within a release, and a test that proves nothing is worse than no test.
 fn database_at(version: i64) -> Connection {
     let conn = Connection::open_in_memory().unwrap();
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);")
-        .unwrap();
-    conn.execute_batch(migrate::V1_INITIAL_SCHEMA).unwrap();
-    conn.execute_batch(migrate::V2_REPO_TAGS).unwrap();
-    conn.execute_batch(migrate::V3_DROP_INBOX).unwrap();
-    conn.execute(
-        "INSERT OR REPLACE INTO _meta (key, value) VALUES ('version', ?1)",
-        [version.to_string()],
-    )
-    .unwrap();
+    migrate::build_at_version(&conn, version).unwrap();
+    // The assertion this helper exists to make safe. It used to replay
+    // V1–V3 and then *write* `version = 5`, so a "V5 database" had none of
+    // the columns V4 and V5 add. Every query against one failed on a missing
+    // column, `find_repo` swallowed that into "repo not found", and the
+    // test blamed the product it was supposed to be checking.
+    assert_eq!(
+        migrate::current_version(&conn).unwrap(),
+        version,
+        "the fixture must actually be at the version it claims"
+    );
     conn
 }
 
@@ -86,7 +87,7 @@ fn a_v3_database_upgrades_to_v4_and_loses_the_dropped_things() {
 
     migrate::run(&conn).unwrap();
 
-    assert_eq!(migrate::current_version(&conn).unwrap(), 5);
+    assert_eq!(migrate::current_version(&conn).unwrap(), 6);
     let plans_after: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='plans'",
@@ -130,7 +131,7 @@ fn a_v4_database_upgrades_to_v5_and_every_row_keeps_the_global_credential() {
     assert_eq!(before, 0, "a V4 database must not have credential_ref yet");
 
     migrate::run(&conn).unwrap();
-    assert_eq!(migrate::current_version(&conn).unwrap(), 5);
+    assert_eq!(migrate::current_version(&conn).unwrap(), 6);
 
     // Every row NULL means "inherit the global [auth] default", which is
     // the correct back-compat outcome — not merely the absence of a
@@ -164,7 +165,7 @@ fn v5_survives_being_run_twice() {
     insert_repo(&conn, "r1", "acme", "api");
 
     migrate::run(&conn).unwrap();
-    assert_eq!(migrate::current_version(&conn).unwrap(), 5);
+    assert_eq!(migrate::current_version(&conn).unwrap(), 6);
 
     // Directly re-running the step, bypassing the version gate, is what
     // catches an unguarded `ADD COLUMN`. Skipping this leaves the guard
@@ -173,7 +174,7 @@ fn v5_survives_being_run_twice() {
     migrate::v5_add_repo_config(&conn).unwrap();
     migrate::v5_add_repo_config(&conn).unwrap();
 
-    assert_eq!(migrate::current_version(&conn).unwrap(), 5);
+    assert_eq!(migrate::current_version(&conn).unwrap(), 6);
     let rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM repos WHERE id='r1'", [], |r| r.get(0))
         .unwrap();
@@ -246,4 +247,101 @@ fn a_v3_database_is_usable_through_the_real_api_after_upgrading() {
         Some("not cloned"),
         "a row whose worktree was never cloned is unmeasurable, not clean"
     );
+}
+
+/// The V6 path, against a database that actually has the five tables V6
+/// drops, and with real rows in the two tables that must survive.
+///
+/// This is the same reasoning as the V4 test, and it matters more here.
+/// V6 drops tables, so on a fresh database it is a no-op and every
+/// assertion below would pass against a migration that did nothing at all.
+/// The only version that can catch that is a database built by the *old*
+/// schema, with data in it.
+///
+/// The surviving rows are the other half. A migration that drops the right
+/// tables and also drops the inventory would look perfect to a test that
+/// only counted tables.
+#[test]
+fn a_v5_database_upgrades_to_v6_and_keeps_what_is_still_read() {
+    let conn = database_at(5);
+    insert_repo(&conn, "r1", "acme", "api");
+
+    // Preconditions, so a typo in this fixture fails here rather than
+    // making the assertions below prove nothing.
+    for present in ["jobs", "job_events", "failures", "audit_log", "context_cache"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [present],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "a V5 database must have the {present} table");
+    }
+    conn.execute(
+        "INSERT INTO runs (id, command, started_at, args_json)
+         VALUES ('run1', 'sync', 0, '[]')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_results (run_id, repo_id, action, status, duration_ms)
+         VALUES ('run1', 'r1', 'pull', 'success', 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate::run(&conn).unwrap();
+    assert_eq!(migrate::current_version(&conn).unwrap(), 6);
+
+    for gone in ["jobs", "job_events", "failures", "audit_log", "context_cache"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [gone],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "V6 must drop the {gone} table");
+    }
+
+    // What must not have gone with them.
+    let repos: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(repos, 1, "the inventory is not part of the cleanup");
+    let sync_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM sync_results", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sync_rows, 1, "a sync result that already happened is history");
+    let run_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(run_rows, 1, "a run row is what `ro sync` still writes");
+}
+
+/// The FK-cascade list in `manage.rs` names tables as **string literals**,
+/// which is the one thing in this migration that no static check can see.
+///
+/// A name left behind after its table is gone issues a statement against a
+/// table that does not exist — green in every test in the workspace, and a
+/// runtime error the first time a user runs `ro remove`. So the check that
+/// matters is: run the real cascade against a real migrated database.
+#[test]
+fn ro_remove_works_against_a_database_that_has_gone_through_v6() {
+    let conn = database_at(5);
+    insert_repo(&conn, "r1", "acme", "api");
+    migrate::run(&conn).unwrap();
+
+    // The row exists, so the cascade has work to do, and it touches both
+    // `CHILD_TABLES` and `NULLABLE_FK_TABLES` on the way.
+    let deleted = ro_sync::manage::remove(&conn, "acme/api");
+    assert!(
+        deleted.is_ok(),
+        "`ro remove` must not fail on a migrated database: {deleted:?}"
+    );
+    let left: i64 = conn
+        .query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0, "and it must actually remove the row");
 }

@@ -3,6 +3,7 @@
 //! Reads `$XDG_CONFIG_HOME/ro/config.toml`, applies defaults, validates.
 
 pub mod loader;
+pub mod local;
 pub mod paths;
 pub mod schema;
 pub mod validate;

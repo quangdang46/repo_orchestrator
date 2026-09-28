@@ -517,16 +517,17 @@ pub fn remove(conn: &Connection, key: &str) -> Result<TrackedRepo> {
 pub fn delete_repo_cascade(conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
     // Tables with a NOT NULL FK to repos(id) — these would block the parent
     // delete outright and must be cleared first.
-    const CHILD_TABLES: &[&str] = &["sync_results", "repo_health_snapshots", "context_cache"];
+    const CHILD_TABLES: &[&str] = &["sync_results", "repo_health_snapshots"];
     // Tables with a nullable FK to repos(id). We null them out so historical
     // run/job records survive a prune (audit-friendly) but no longer
     // hold a reference to a row that's about to disappear.
     //
-    // "plans" was here and is now gone with the V4 migration that drops its
-    // table. Leaving the name in would make `ro remove` issue an UPDATE
-    // against a table that no longer exists — green in every static check,
-    // broken at runtime.
-    const NULLABLE_FK_TABLES: &[&str] = &["jobs"];
+    // Both entries that were here are gone: "plans" with V4, and "jobs" with
+    // V6. Leaving a name in after its table has been dropped would make
+    // `ro remove` issue a statement against a table that does not exist —
+    // green in every static check, broken at runtime. That array is the reason
+    // this crate checks for the tables rather than trusting the list.
+    const NULLABLE_FK_TABLES: &[&str] = &[];
 
     let tx = conn.unchecked_transaction()?;
     for table in CHILD_TABLES {
@@ -665,6 +666,35 @@ pub fn find_repo(conn: &Connection, key: &str) -> Result<TrackedRepo> {
     ) {
         return Ok(r);
     }
+    // Try a bare name, last — after the spellings that are unambiguous.
+    //
+    // The fleet verbs have always accepted `ro ship alpha`; this verb's own
+    // help says "name, alias, or owner/name". Both were true and neither
+    // worked here, so `ro tag alpha work` failed on a repo that
+    // `ro status alpha` printed a moment earlier.
+    //
+    // A bare name is the only one of the four that can match more than one
+    // row, so it is also the only one that has to check: `api` under two
+    // owners is a question, and answering it by picking the first row would
+    // tag a repo the user never named.
+    if !key.contains('/') {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {REPO_COLUMNS} FROM repos WHERE LOWER(name)=LOWER(?1) ORDER BY owner"
+        ))?;
+        let mut hits = stmt.query_map(params![key], row_to_tracked)?;
+        let first = match hits.next() {
+            Some(Ok(r)) => r,
+            _ => bail!("repo '{key}' not found"),
+        };
+        if let Some(Ok(second)) = hits.next() {
+            bail!(
+                "'{key}' matches more than one repo: {}/{} and {}/{}. \
+                 Use owner/name.",
+                first.owner, first.name, second.owner, second.name
+            );
+        }
+        return Ok(first);
+    }
     bail!("repo '{key}' not found")
 }
 
@@ -708,6 +738,44 @@ mod tests {
 
     fn projects_dir(tmp: &TempDir) -> PathBuf {
         tmp.path().join("projects")
+    }
+
+    /// A bare name is the one spelling that can be ambiguous, and the
+    /// resolver has to say so rather than pick. Two owners can both have
+    /// an `api`; answering that with whichever row came back first would act
+    /// on a repository the user never named — and the inventory is what
+    /// decides whose credentials a push uses.
+    #[test]
+    fn a_bare_name_matching_two_owners_is_an_ambiguity_not_a_coin_flip() {
+        let (_tmp, conn) = setup();
+        let root = projects_dir(&TempDir::new().unwrap());
+        add(&conn, "acme/api", &root).unwrap();
+        add(&conn, "globex/api", &root).unwrap();
+
+        let err = find_repo(&conn, "api").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("acme/api") && msg.contains("globex/api"),
+            "the error must name both candidates so the user can pick, got: {msg}"
+        );
+        assert!(msg.contains("owner/name"), "and say what to type instead");
+
+        // The unambiguous spellings still work.
+        assert_eq!(find_repo(&conn, "acme/api").unwrap().owner, "acme");
+    }
+
+    /// And a bare name that is unique resolves, case-insensitively, the way
+    /// the `owner/name` branch already did.
+    #[test]
+    fn a_unique_bare_name_resolves() {
+        let (_tmp, conn) = setup();
+        let root = projects_dir(&TempDir::new().unwrap());
+        add(&conn, "acme/api", &root).unwrap();
+        add(&conn, "globex/web", &root).unwrap();
+
+        assert_eq!(find_repo(&conn, "api").unwrap().owner, "acme");
+        assert_eq!(find_repo(&conn, "API").unwrap().owner, "acme");
+        assert!(find_repo(&conn, "missing").is_err());
     }
 
     fn run_git(dir: &std::path::Path, args: &[&str]) {

@@ -45,7 +45,7 @@ use tempfile::TempDir;
 /// trail instead.
 const EXPECTED_COMMANDS: &[&str] = &[
     "init", "add", "remove", "list", "sync", "status", "commit", "push", "ship", "doctor",
-    "config", "schema",
+    "config", "schema", "tag", "untag", "tags",
 ];
 
 fn schema() -> Value {

@@ -95,15 +95,12 @@ pub fn score_repo_health(conn: &Connection, repo_id: &str) -> Result<HealthSnaps
         .unwrap_or(0);
     score -= (failed_runs * 5).min(30);
 
-    // Recent failures penalty
-    let recent_failures: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(count), 0) FROM failures WHERE last_seen_at > ?1",
-            params![now - 86400],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap_or(0);
-    score -= (recent_failures * 3).min(20);
+    // A "recent failures" penalty used to live here, worth up to 20 points,
+    // reading a `failures` table that **nothing had ever written to**. The
+    // term was therefore permanently zero: every repository silently lost a
+    // fifth of its possible penalty, and the score looked like evidence
+    // rather than like a gap. The table is dropped in V6 and the term with
+    // it. A metric that cannot move is worse than no metric.
 
     score = score.clamp(0, 100);
     let class = HealthClass::from_score(score);
@@ -113,7 +110,6 @@ pub fn score_repo_health(conn: &Connection, repo_id: &str) -> Result<HealthSnaps
         "archived": archived,
         "disabled": disabled,
         "failed_syncs": failed_runs,
-        "recent_failures": recent_failures,
     })
     .to_string();
 

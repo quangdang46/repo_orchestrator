@@ -12,6 +12,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub core: CoreConfig,
     #[serde(default)]
+    pub identity: IdentityConfig,
+    #[serde(default)]
     pub auth: AuthConfig,
     #[serde(default)]
     pub github: GitHubConfig,
@@ -223,6 +225,73 @@ pub struct AuthConfig {
     /// cannot get wrong; it is the account the remote sees, which ro does not
     /// control.
     pub expected_login: Option<String>,
+}
+
+/// `[identity]` — the commit author, and the named profiles a repo picks from.
+///
+/// The reason this is a **map of profiles** rather than a single
+/// `name`/`email` pair is that the whole feature is per-repo. A developer with
+/// a work address and a personal one has two identities, and which one
+/// applies is a property of the repository, not of the machine. The row's
+/// `author_ref` names a profile here; nothing carries the address itself, so
+/// renaming an address is one edit in one file rather than a migration of
+/// every row that referenced it.
+///
+/// ```toml
+/// [identity]
+/// default = "personal"
+///
+/// [identity.work]
+/// name  = "Dang Tran Quang"
+/// email = "quang@company.com"
+///
+/// [identity.personal]
+/// name  = "Dang Tran Quang"
+/// email = "me@gmail.com"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IdentityConfig {
+    /// Which profile a repo with no `author_ref` gets. Falls back to the only
+    /// profile if exactly one is defined, so a single-identity setup needs
+    /// no `default` key at all.
+    pub default: Option<String>,
+    /// Named profiles, keyed by the name a row's `author_ref` holds.
+    #[serde(flatten)]
+    pub profiles: std::collections::BTreeMap<String, CommitIdentityConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitIdentityConfig {
+    pub name: String,
+    pub email: String,
+}
+
+impl IdentityConfig {
+    /// Resolve a profile name to an address.
+    ///
+    /// A name that is not a defined profile is an **error**, not a fallback
+    /// and not a synthesised address. Synthesising one — which is what this
+    /// did before — produces a commit attributed to `work@localhost` and
+    /// calls it success, which is worse than refusing: the commit is real,
+    /// the author is wrong, and nothing reports it.
+    pub fn resolve(&self, name: &str) -> Option<CommitIdentityConfig> {
+        self.profiles.get(name).cloned()
+    }
+
+    /// The profile a repo with no explicit `author_ref` gets.
+    pub fn fallback(&self) -> Option<CommitIdentityConfig> {
+        if let Some(d) = &self.default {
+            return self.resolve(d);
+        }
+        // One profile needs no `default` key. More than one is ambiguous.
+        (self.profiles.len() == 1).then(|| self.profiles.values().next().cloned()).flatten()
+    }
+
+    /// Every profile name, for error messages that have to say what *is*
+    /// available.
+    pub fn names(&self) -> Vec<&str> {
+        self.profiles.keys().map(String::as_str).collect()
+    }
 }
 
 /// `[core]` — global runtime knobs.

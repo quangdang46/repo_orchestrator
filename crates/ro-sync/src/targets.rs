@@ -75,9 +75,12 @@ pub fn resolve_targets(
             continue;
         }
         let label = format!("{}/{}", repo.owner, repo.name);
-        let matches = if all {
-            true
-        } else if !tokens.is_empty() {
+        // Most specific selector wins. `--all` used to be checked first, so
+        // a run that passed both `--all` and a filter selected the whole
+        // fleet and silently ignored the filter — the one case where a
+        // narrower request does something wider. `--all` means "no
+        // narrower request given", not "ignore any that was".
+        let matches = if !tokens.is_empty() {
             // A token selects a repo three ways, because three things are
             // things a user types: the glob, the name they gave it, and the
             // `owner/name` the registry knows it by. The help text promises
@@ -93,7 +96,7 @@ pub fn resolve_targets(
         } else if let Some(f) = filter {
             matches_filter(conn, &repo.id, &label, f)?
         } else {
-            false
+            all
         };
 
         if !matches {
@@ -164,7 +167,14 @@ fn matches_filter(
     // meant the tag filtered by coincidence of the repository's *name*:
     // `tag:api` selected everything called `api-service` and nothing
     // actually carrying the tag.
-    if let Some(tag) = filter.strip_prefix("tag:") {
+    // "group" and "tag" are the same thing and say so. The vocabulary in
+    // use is "--group work"; there is deliberately no second concept and no
+    // second table, because two mechanisms for one selection produce two
+    // answers to "which repos does this run touch?".
+    let tag_filter = filter
+        .strip_prefix("tag:")
+        .or_else(|| filter.strip_prefix("group:"));
+    if let Some(tag) = tag_filter {
         let found = conn
             .query_row(
                 "SELECT 1 FROM repo_tags WHERE repo_id = ?1 AND tag = ?2",
@@ -358,6 +368,101 @@ mod tests {
             t[0].local_path,
             std::path::PathBuf::from("/state/projects/acme/api"),
             "an empty local_path must not become the current directory"
+        );
+    }
+
+    fn conn_with_two_tagged() -> (tempfile::TempDir, ro_state::Connection) {
+        let (tmp, conn) = setup();
+        track(&conn, "acme", "api");
+        track(&conn, "acme", "web");
+        conn.execute(
+            "INSERT INTO repo_tags (repo_id, tag) VALUES ('id-acme-api', 'work')",
+            [],
+        )
+        .unwrap();
+        (tmp, conn)
+    }
+
+    /// `--all` used to be tested first, so a run passing both `--all` and
+    /// a filter selected the **whole fleet** and dropped the filter without
+    /// a word. That is the worst direction for this bug to fail in: the
+    /// request was the narrower one, and the tool acted on the wider one
+    /// with the user's credentials.
+    ///
+    /// `--all` means "no narrower request given", not "ignore any that was".
+    #[test]
+    fn all_does_not_override_an_explicit_filter() {
+        let (_t, conn) = conn_with_two_tagged();
+        let got = resolve_targets(
+            &conn,
+            None,
+            Some("tag:work"),
+            true, // --all AND --filter, which is the case that was wrong
+            std::path::Path::new("/projects"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            labels(&got),
+            vec!["acme/api"],
+            "--all must not widen a filter; only the tagged repo should match"
+        );
+    }
+
+    /// The negative control for the test above: with the filter gone, the
+    /// same `--all` does mean everything. Without this, the fix would also
+    /// pass if `--all` had simply stopped working.
+    #[test]
+    fn all_alone_still_selects_everything() {
+        let (_t, conn) = conn_with_two_tagged();
+        let got = resolve_targets(
+            &conn,
+            None,
+            None,
+            true,
+            std::path::Path::new("/projects"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    /// A filter that matches nothing selects nothing. This is what makes a
+    /// typo visible: `ro status --tag wrok` prints nothing rather than the
+    /// whole fleet, so the user can tell the tag was not found.
+    #[test]
+    fn a_filter_matching_nothing_selects_nothing() {
+        let (_t, conn) = conn_with_two_tagged();
+        let got = resolve_targets(
+            &conn,
+            None,
+            Some("tag:wrok"),
+            true,
+            std::path::Path::new("/projects"),
+            false,
+        )
+        .unwrap();
+        assert!(got.is_empty(), "a mistyped tag must not fall back to --all");
+    }
+
+    /// A name beats a filter, and the narrowest selector is the one that
+    /// applies. Naming a repo is the most specific request a user can make.
+    #[test]
+    fn a_named_repo_beats_a_filter() {
+        let (_t, conn) = conn_with_two_tagged();
+        let got = resolve_targets(
+            &conn,
+            Some("acme/web"),
+            Some("tag:work"),
+            false,
+            std::path::Path::new("/projects"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            labels(&got),
+            vec!["acme/web"],
+            "the named repo is untagged; a name is the more specific request"
         );
     }
 }

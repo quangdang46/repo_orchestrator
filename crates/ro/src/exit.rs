@@ -104,6 +104,22 @@ impl FatalError {
         }
     }
 
+    /// A bad invocation — the command cannot do what it was asked, and
+    /// retrying it unchanged cannot work either.
+    ///
+    /// This exists so a usage error raised anywhere below `main` keeps its
+    /// own code. A bare `anyhow::bail!` out of a helper is caught by the
+    /// top-level handler, which has nothing to downcast to and reports
+    /// `EX_FATAL` — so asking for two conflicting selectors reported a
+    /// *fatal* error, which sends the reader looking for a broken install
+    /// instead of a mistyped command line.
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EX_USAGE,
+        }
+    }
+
     /// The code, for the top-level handler and for tests.
     ///
     /// A method rather than a bare field so every exit goes through one
@@ -184,10 +200,33 @@ mod tests {
     /// usage one.
     #[test]
     fn a_duplicate_add_is_a_usage_problem_not_a_crash() {
-        let e = FatalError {
-            message: "already tracked".into(),
-            code: EX_USAGE,
-        };
-        assert_ne!(e.code, EX_FATAL, "a duplicate add must not read as a crash");
+        let e = FatalError::usage("already tracked");
+        assert_ne!(e.code(), EX_FATAL, "a duplicate add must not read as a crash");
+        assert_eq!(e.code(), EX_USAGE);
+    }
+
+    /// The mechanism `main` actually relies on.
+    ///
+    /// A usage error raised in a helper is returned as `anyhow::Error`, and
+    /// the top-level handler recovers the code with `downcast_ref`. If that
+    /// downcast ever failed, every usage error in the tool would be reported
+    /// as `EX_FATAL` — which sends the reader looking for a broken install
+    /// rather than a mistyped command line. Nothing else in the suite
+    /// exercises that path, and the symptom is a wrong number, not a crash.
+    #[test]
+    fn a_usage_error_survives_the_anyhow_wrap_that_main_uses() {
+        let err: anyhow::Error = FatalError::usage("two selectors").into();
+        let found = err
+            .downcast_ref::<FatalError>()
+            .expect("main recovers the code by downcasting to FatalError");
+        assert_eq!(found.code(), EX_USAGE);
+    }
+
+    /// The negative control: a plain fatal must still be fatal, or the test
+    /// above would pass for the wrong reason.
+    #[test]
+    fn a_plain_fatal_is_still_fatal() {
+        let err: anyhow::Error = FatalError::new("config will not parse").into();
+        assert_eq!(err.downcast_ref::<FatalError>().unwrap().code(), EX_FATAL);
     }
 }

@@ -81,9 +81,31 @@ Stop tracking a repo. Cascades through dependent rows so the foreign keys stay
 consistent.
 
 ### `ro list [--owner <OWNER>]`
-Print the inventory. Use `--format json` or `--format toon` to read it from a
-script or an agent. Output is one JSON object per line, which makes it
-streamable and append-friendly.
+Print the inventory. Use `--format json` to read it from a script or an
+agent. Output is one JSON object per line, which makes it streamable and
+append-friendly.
+
+### `ro tag <REPO> <TAG>…` · `ro untag <REPO> <TAG>…` · `ro tags [<REPO>]`
+
+Group repositories. A tag is a row in `repo_tags`; `--tag <T>` on a fleet
+verb selects on it.
+
+```bash
+ro tag cass work personal       # both tags
+ro untag cass personal          # one comes off
+ro tags                         # every tag, with how many repos carry it
+ro tags cass                    # one repo's tags
+```
+
+Tagging twice is a no-op and removing a tag that was never there is a no-op,
+both at exit 0. "Make it so" is idempotent; the row is already in the state
+you asked for, and an error would only make shell loops awkward. The count is
+printed either way, so a run that changed nothing still says so.
+
+`ro add --tag` sets tags at enrolment. These three verbs are everything
+after that — re-tagging a repo, and taking a tag off, which is the half that
+is easy to leave out: a table with a writer and no remover grows forever and
+the only remedy is editing SQLite by hand.
 
 ---
 

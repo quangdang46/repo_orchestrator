@@ -39,6 +39,21 @@ enum Migration {
 }
 
 fn apply(conn: &Connection, from: i64) -> Result<()> {
+    apply_up_to(conn, from, i64::MAX)
+}
+
+/// Apply migrations above `from`, stopping after `up_to`.
+///
+/// `up_to` exists for one caller: building a database *as the binary of
+/// version N left it*, so the upgrade path can be tested against a real
+/// schema. The alternative — replaying a hand-picked list of constants —
+/// produces a fixture that drifts from the real one within a release, and
+/// the failure it causes is a fixture that is quietly wrong: the earlier
+/// version of this helper applied V1–V3 and then *wrote* `version = 5`, so
+/// every column V4 and V5 add was missing from a database that claimed to
+/// have them. Queries against it fail on the missing column, the error gets
+/// swallowed into "repo not found", and the test blames the product.
+fn apply_up_to(conn: &Connection, from: i64, up_to: i64) -> Result<()> {
     let migrations: &[Migration] = &[
         // v1: full initial schema (PLAN.md §13)
         Migration::Sql(V1_INITIAL_SCHEMA),
@@ -50,11 +65,13 @@ fn apply(conn: &Connection, from: i64) -> Result<()> {
         Migration::Sql(V4_DROP_PLANS),
         // v5: per-repo config columns
         Migration::Guarded(v5_add_repo_config),
+        // v6: drop the five tables nothing reads
+        Migration::Guarded(v6_drop_unread_tables),
     ];
 
     for (i, migration) in migrations.iter().enumerate() {
         let version = (i + 1) as i64;
-        if version > from {
+        if version > from && version <= up_to {
             tracing::info!(version, "applying migration");
             match migration {
                 Migration::Sql(sql) => conn
@@ -71,6 +88,18 @@ fn apply(conn: &Connection, from: i64) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build a database at `version`, the way the binary of that day left it.
+///
+/// Test-only, and the reason it exists is the V6 test: a fresh database has
+/// none of the tables V6 drops, so V6 is a no-op on it and every assertion
+/// about the drops passes against a migration that did nothing.
+#[doc(hidden)]
+pub fn build_at_version(conn: &Connection, version: i64) -> Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS _meta (key TEXT PRIMARY KEY, value TEXT);")
+        .context("ensuring _meta table exists")?;
+    apply_up_to(conn, 0, version)
 }
 
 /// Does `table` have a column named `column`?
@@ -116,6 +145,37 @@ pub fn v5_add_repo_config(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch(&format!("ALTER TABLE repos ADD COLUMN {column} TEXT;"))
             .with_context(|| format!("adding repos.{column}"))?;
+    }
+    Ok(())
+}
+
+/// v6 drops five tables nothing reads.
+///
+/// Measured before the removal, across every `.rs` outside this file:
+///
+/// ```text
+///   jobs             0 writers, 0 readers
+///   job_events       0 writers, 0 readers
+///   audit_log        0 writers, 0 readers
+///   context_cache    0 writers, 0 readers  (named in manage::CHILD_TABLES
+///                                             and nothing else)
+///   failures         0 writers, 1 reader — the health scorer's "recent
+///                     failures" term, worth up to 20 points, which no
+///                     writer could ever make non-zero
+/// ```
+///
+/// `failures` is the one worth naming. It had a reader and no writer, so the
+/// health score quietly forfeited a fifth of its penalty for every repository,
+/// permanently. That is the same shape as the failed-sync penalty that was
+/// permanently zero before the sync FK fix: a metric that cannot move is worse
+/// than no metric, because it looks like evidence.
+///
+/// `runs` and `sync_results` stay. `ro sync` opens a run and finalises it with
+/// the fleet's exit code, so those have live writers.
+fn v6_drop_unread_tables(conn: &Connection) -> Result<()> {
+    for table in ["jobs", "job_events", "failures", "audit_log", "context_cache"] {
+        conn.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
+            .with_context(|| format!("dropping unread table {table}"))?;
     }
     Ok(())
 }
@@ -344,7 +404,7 @@ mod tests {
     fn migration_records_version() {
         let conn = fresh();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
     }
 
     #[test]
@@ -353,7 +413,7 @@ mod tests {
         run(&conn).unwrap();
         run(&conn).unwrap();
         let v = current_version(&conn).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
     }
 
     /// The upgrade path, which no other test in the workspace exercises.
@@ -408,7 +468,7 @@ mod tests {
         // `run` applies every pending migration, so it carries this fixture
         // to the current version, not just to 4. The V4-specific assertions
         // below are what this test is about.
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
         assert!(
             !table_exists(&conn, "plans"),
             "V4 must drop the plans table"
@@ -426,7 +486,7 @@ mod tests {
 
         // Re-running must not fail on the already-dropped column.
         run(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
     }
 
     fn table_exists(conn: &Connection, name: &str) -> bool {
@@ -463,7 +523,7 @@ mod tests {
         // step itself is re-runnable, which is what the gate does not protect.
         v5_add_repo_config(&conn).unwrap();
         v5_add_repo_config(&conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
     }
 
     /// An existing row must land on the global configuration, not on a value
@@ -497,7 +557,7 @@ mod tests {
 
         run(&conn).unwrap();
 
-        assert_eq!(current_version(&conn).unwrap(), 5);
+        assert_eq!(current_version(&conn).unwrap(), 6);
         let row: (
             Option<String>,
             Option<String>,
@@ -530,11 +590,6 @@ mod tests {
             .collect();
         for expected in [
             "_meta",
-            "audit_log",
-            "context_cache",
-            "failures",
-            "job_events",
-            "jobs",
             "repo_health_snapshots",
             "repo_tags",
             "repos",
@@ -545,6 +600,23 @@ mod tests {
             assert!(
                 tables.iter().any(|t| t == expected),
                 "expected table {expected} not found in {tables:?}",
+            );
+        }
+
+        // And the other direction, which is what V6 is *for*. Asserting the
+        // survivors exist does not prove the cuts happened; a migration that
+        // silently did nothing would pass this list just as happily.
+        for gone in [
+            "audit_log",
+            "context_cache",
+            "failures",
+            "job_events",
+            "jobs",
+            "plans",
+        ] {
+            assert!(
+                !tables.iter().any(|t| t == gone),
+                "{gone} was dropped in V6 and must not come back",
             );
         }
     }
@@ -561,11 +633,8 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         for expected in [
-            "idx_audit_ts",
-            "idx_failures_class",
             "idx_health_repo_ts",
-            "idx_job_events_job_ts",
-            "idx_jobs_status_created",
+            "idx_repo_tags_tag",
             "idx_repos_owner_name",
             "idx_run_events_run_ts",
             "idx_runs_started_at",
@@ -573,6 +642,20 @@ mod tests {
             assert!(
                 indexes.iter().any(|i| i == expected),
                 "expected index {expected} not found in {indexes:?}",
+            );
+        }
+
+        // SQLite drops an index with its table, so the ones V6 removed are
+        // the proof the drops happened rather than being renamed or copied.
+        for gone in [
+            "idx_audit_ts",
+            "idx_failures_class",
+            "idx_job_events_job_ts",
+            "idx_jobs_status_created",
+        ] {
+            assert!(
+                !indexes.iter().any(|i| i == gone),
+                "{gone} belonged to a table V6 dropped and must not survive it",
             );
         }
     }

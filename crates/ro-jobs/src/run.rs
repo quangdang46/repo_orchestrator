@@ -93,71 +93,6 @@ pub fn finalize_run(conn: &Connection, run_id: &str, exit_code: i32) -> Result<(
     Ok(())
 }
 
-/// Fetch a run record by id, or `None` if it doesn't exist.
-pub fn get_run(conn: &Connection, run_id: &str) -> Result<Option<RunRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, command, started_at, ended_at, exit_code, args_json, user, host
-             FROM runs WHERE id = ?1",
-        )
-        .context("preparing run lookup")?;
-    let mut rows = stmt
-        .query_map(params![run_id], row_to_run)
-        .context("querying run by id")?;
-    match rows.next() {
-        Some(row) => Ok(Some(row?)),
-        None => Ok(None),
-    }
-}
-
-/// List the most recent `limit` runs, newest first.
-pub fn recent_runs(conn: &Connection, limit: usize) -> Result<Vec<RunRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, command, started_at, ended_at, exit_code, args_json, user, host
-             FROM runs ORDER BY started_at DESC LIMIT ?1",
-        )
-        .context("preparing recent runs query")?;
-    let rows = stmt
-        .query_map(params![limit as i64], row_to_run)
-        .context("querying recent runs")?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-/// List runs that are still open (no `ended_at`).
-pub fn open_runs(conn: &Connection) -> Result<Vec<RunRecord>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, command, started_at, ended_at, exit_code, args_json, user, host
-             FROM runs WHERE ended_at IS NULL ORDER BY started_at ASC",
-        )
-        .context("preparing open runs query")?;
-    let rows = stmt
-        .query_map([], row_to_run)
-        .context("querying open runs")?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-fn row_to_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunRecord> {
-    Ok(RunRecord {
-        id: row.get(0)?,
-        command: row.get(1)?,
-        started_at: row.get(2)?,
-        ended_at: row.get(3)?,
-        exit_code: row.get(4)?,
-        args_json: row.get(5)?,
-        user: row.get(6)?,
-        host: row.get(7)?,
-    })
-}
 
 fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -202,11 +137,37 @@ fn current_host() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{EventLevel, append_event, events_for_run};
     use ro_state::open_memory;
 
     fn db() -> Connection {
         open_memory().expect("memory db")
+    }
+
+    /// Read a run row back directly.
+    ///
+    /// `get_run` was removed along with the rest of the crate's read side —
+    /// it had no caller outside this file — so the tests that assert on
+    /// persisted state query the table themselves. That is the point of a
+    /// test: it should not depend on the same function it is checking.
+    fn stored_run(c: &Connection, id: &str) -> RunRecord {
+        c.query_row(
+            "SELECT id, command, started_at, ended_at, exit_code, args_json, user, host
+             FROM runs WHERE id = ?1",
+            [id],
+            |row| {
+                Ok(RunRecord {
+                    id: row.get(0)?,
+                    command: row.get(1)?,
+                    started_at: row.get(2)?,
+                    ended_at: row.get(3)?,
+                    exit_code: row.get(4)?,
+                    args_json: row.get(5)?,
+                    user: row.get(6)?,
+                    host: row.get(7)?,
+                })
+            },
+        )
+        .expect("run row should exist")
     }
 
     #[test]
@@ -218,8 +179,7 @@ mod tests {
         assert!(r.ended_at.is_none());
         assert_eq!(r.exit_code, None);
         assert!(!r.is_finished());
-        let stored = get_run(&c, &r.id).unwrap().unwrap();
-        assert_eq!(stored, r);
+        assert_eq!(stored_run(&c, &r.id), r);
     }
 
     #[test]
@@ -227,7 +187,7 @@ mod tests {
         let c = db();
         let r = open_run(&c, "commit", &[]).unwrap();
         finalize_run(&c, &r.id, 0).unwrap();
-        let stored = get_run(&c, &r.id).unwrap().unwrap();
+        let stored = stored_run(&c, &r.id);
         assert_eq!(stored.exit_code, Some(0));
         assert!(stored.ended_at.is_some());
         assert!(stored.is_finished());
@@ -242,69 +202,10 @@ mod tests {
     }
 
     #[test]
-    fn recent_runs_returns_newest_first() {
-        let c = db();
-        let r1 = open_run(&c, "sync", &[]).unwrap();
-        // Bump started_at on second run to guarantee ordering even when
-        // the test runs in <1s.
-        let r2 = open_run(&c, "commit", &[]).unwrap();
-        c.execute(
-            "UPDATE runs SET started_at = ?1 WHERE id = ?2",
-            rusqlite::params![r2.started_at + 5, r2.id],
-        )
-        .unwrap();
-        let recent = recent_runs(&c, 10).unwrap();
-        assert_eq!(recent.len(), 2);
-        assert_eq!(recent[0].id, r2.id);
-        assert_eq!(recent[1].id, r1.id);
-    }
-
-    #[test]
-    fn open_runs_filters_finished() {
-        let c = db();
-        let r1 = open_run(&c, "sync", &[]).unwrap();
-        let r2 = open_run(&c, "commit", &[]).unwrap();
-        finalize_run(&c, &r1.id, 0).unwrap();
-        let open = open_runs(&c).unwrap();
-        assert_eq!(open.len(), 1);
-        assert_eq!(open[0].id, r2.id);
-    }
-
-    #[test]
     fn run_args_serialise_to_json() {
         let c = db();
         let r = open_run(&c, "sync", &["--branch".into(), "main".into()]).unwrap();
         let parsed: Vec<String> = serde_json::from_str(&r.args_json).unwrap();
         assert_eq!(parsed, vec!["--branch", "main"]);
-    }
-
-    #[test]
-    fn events_attach_to_run() {
-        let c = db();
-        let r = open_run(&c, "sync", &[]).unwrap();
-        append_event(&c, &r.id, EventLevel::Info, "starting fetch", None).unwrap();
-        append_event(
-            &c,
-            &r.id,
-            EventLevel::Warn,
-            "remote slow",
-            Some(&serde_json::json!({"latency_ms": 1234})),
-        )
-        .unwrap();
-        let events = events_for_run(&c, &r.id).unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].level, EventLevel::Info);
-        assert_eq!(events[0].message, "starting fetch");
-        assert!(events[0].data_json.is_none());
-        assert_eq!(events[1].level, EventLevel::Warn);
-        assert!(events[1].data_json.is_some());
-        assert!(events[1].data_json.as_ref().unwrap().contains("1234"));
-    }
-
-    #[test]
-    fn event_level_parses_aliases() {
-        assert_eq!("warning".parse::<EventLevel>().unwrap(), EventLevel::Warn);
-        assert_eq!("ERR".parse::<EventLevel>().unwrap(), EventLevel::Error);
-        assert!("nope".parse::<EventLevel>().is_err());
     }
 }

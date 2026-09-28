@@ -986,7 +986,7 @@ echo PROBE_ARGS=%*
                 ),
             )
             .expect("the shim is writable");
-            return path;
+            path
         }
         #[cfg(not(windows))]
         {
