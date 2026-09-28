@@ -135,14 +135,26 @@ http_get() {
     # could not reach a local server at all and the seam would be
     # decorative. Plaintext can only come from an explicit RO_BASE_URL;
     # the default base is always https.
+    # The gate narrows rather than removes: even the http branch keeps an
+    # explicit allowlist, with --proto-redir so a local server cannot bounce
+    # the request to a wider scheme. The review that asked for this was
+    # right — a bare `-fsSL` would follow a redirect anywhere, which for a
+    # script whose whole job is downloading binaries is a liability.
+    #
+    # Two fixed words, written out rather than joined and split: a
+    # `--proto '=x'` inside a variable is one argument to bash but can
+    # arrive as two (or as `'=x'` with the quotes intact) once expanded,
+    # which curl reports as "unrecognized protocol".
     local https_only=1
-    case "$1" in http://*) https_only=0 ;; esac
+    case "$1" in
+        http://*) https_only=0 ;;
+    esac
 
     if command -v curl >/dev/null 2>&1; then
         if [ "$https_only" = 1 ]; then
             curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"
         else
-            curl -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"
+            curl --proto '=http,https' --proto-redir '=http,https' -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"
         fi
     elif command -v wget >/dev/null 2>&1; then
         if [ "$https_only" = 1 ]; then
