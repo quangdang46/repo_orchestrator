@@ -172,6 +172,18 @@ pub enum RepoOutcome {
 
 impl RepoOutcome {
     /// Is this a failure that should make the whole run exit non-zero?
+    /// Whether this row should make the run a failure.
+    ///
+    /// A mid-conflict repo is deliberately **not** here. ro is not failing
+    /// when it declines to act on a repository a person already left
+    /// mid-merge, and that person knows. Making it a failure means a
+    /// twenty-repo fleet with one long-wedged repo exits non-zero, and a
+    /// signal that fires for a known, already-diagnosed condition is a
+    /// signal people learn to ignore.
+    ///
+    /// It is still counted, and still printed — see `Summary::render`. The
+    /// claim is only that the exit code answers "did ro do its job", and a
+    /// skip is not a job ro declined.
     pub fn is_failure(&self) -> bool {
         matches!(
             self,

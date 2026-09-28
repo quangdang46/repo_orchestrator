@@ -117,6 +117,19 @@ impl Summary {
         }
     }
 
+    /// Repos that were not acted on and that need a person to.
+    ///
+    /// Distinct from a failure — ro did not fail, it declined — and
+    /// distinct from `NothingToCommit`, which needs nobody. A conflict
+    /// stops the pipeline because continuing would pick a side, and
+    /// picking a side is the one thing this tool must never do on its own.
+    pub fn skipped_needing_action(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.outcome, RepoOutcome::SkippedConflict { .. }))
+            .count()
+    }
+
     /// How many repos failed.
     pub fn failures(&self) -> usize {
         self.rows.iter().filter(|r| r.outcome.is_failure()).count()
@@ -172,13 +185,25 @@ impl Summary {
                 r.outcome.render()
             );
         }
-        let _ = writeln!(
+        // Skips are counted and named. The exit code deliberately does not
+        // turn on them — see `RepoOutcome::is_failure` — but "0 failed" over
+        // a fleet where three repos are wedged mid-merge is a sentence
+        // nobody believes, and this is the number a reader takes away.
+        let _ = write!(
             out,
-            "\n{} committed, {} pushed, {} failed.",
+            "\n{} committed, {} pushed, {} failed",
             self.committed(),
             self.pushed(),
             self.failures()
         );
+        if self.skipped_needing_action() > 0 {
+            let _ = write!(
+                out,
+                ", {} skipped (need a human)",
+                self.skipped_needing_action()
+            );
+        }
+        out.push_str(".\n");
         out
     }
 }
@@ -274,5 +299,65 @@ mod tests {
     fn an_empty_selection_says_so() {
         assert!(Summary::default().render().contains("no repos selected"));
         assert_eq!(Summary::default().counts(), (0, 0));
+    }
+}
+
+
+/// The summary line must not read "0 failed" over a fleet that needs help.
+#[cfg(test)]
+mod skip_reporting_tests {
+    use super::*;
+    use crate::ship::orchestrator::RepoOutcome;
+
+    fn row(label: &str, outcome: RepoOutcome) -> SummaryRow {
+        SummaryRow {
+            label: label.into(),
+            branch: "main".into(),
+            engine: "git".into(),
+            account: None,
+            outcome,
+        }
+    }
+
+    /// The exit code deliberately ignores a mid-conflict — ro did not fail,
+    /// and a signal that fires for an already-diagnosed condition is one
+    /// people learn to ignore. The **sentence** is a different question, and
+    /// "0 failed" over three wedged repos is one nobody believes.
+    #[test]
+    fn a_wedged_fleet_says_so_even_though_the_exit_code_is_clean() {
+        let s = Summary::new(vec![
+            row(
+                "acme/a",
+                RepoOutcome::SkippedConflict {
+                    detail: "merge".into(),
+                },
+            ),
+            row(
+                "acme/b",
+                RepoOutcome::SkippedConflict {
+                    detail: "merge".into(),
+                },
+            ),
+            row("acme/c", RepoOutcome::NothingToCommit),
+        ]);
+        let text = s.render();
+        assert!(
+            text.contains("2 skipped (need a human)"),
+            "the line must name what still needs doing, got:\n{text}"
+        );
+        // And it is counted separately from failures, which stays the
+        // deliberate answer above.
+        assert_eq!(s.skipped_needing_action(), 2);
+        assert_eq!(s.failures(), 0);
+        assert_eq!(s.counts(), (3, 0), "the exit code is a separate question");
+    }
+
+    /// A clean fleet says nothing extra — no line, no noise.
+    #[test]
+    fn a_clean_fleet_names_no_skips() {
+        let s = Summary::new(vec![row("acme/a", RepoOutcome::NothingToCommit)]);
+        let text = s.render();
+        assert!(!text.contains("skipped"), "got:\n{text}");
+        assert!(text.contains("0 failed."), "got:\n{text}");
     }
 }
