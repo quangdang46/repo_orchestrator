@@ -391,7 +391,17 @@ fn check_github_auth() -> CheckResult {
 /// A *section*, not a key: every field inside already defaults, so creating an
 /// empty `[auth]` is enough for the schema to see the table and for the user to
 /// discover it exists by opening their own file.
-const EXPECTED_SECTIONS: &[&str] = &["core", "auth", "git", "safety"];
+/// The sections a config is expected to carry.
+///
+/// This list is the set of tables something **reads**, and it has to be
+/// maintained as one: a section here that nothing reads makes `--fix` write
+/// an empty table into the user's file that they then set values into, and
+/// those values do nothing. A section missing here means `--fix` does not
+/// add a table that would have been used.
+///
+/// It was both wrong at once until now: it listed `git` and `safety` (read by
+/// nothing) and omitted `github`, `agent` and `identity` (all read).
+const EXPECTED_SECTIONS: &[&str] = &["core", "auth", "github", "agent", "identity"];
 
 /// Add the sections a config predating them is missing, leaving everything
 /// else alone.
@@ -529,15 +539,25 @@ fn check_and_optionally_fix_config(paths: &ConfigPaths, fix: bool) -> (CheckResu
     }
 
     match write_default_config(&cfg_path) {
-        Ok(_) => (
-            CheckResult::ok(
-                "config",
-                Severity::Required,
-                format!("wrote default config to {}", cfg_path.display()),
+        Ok(_) => {
+            // Writing the template is not the same as writing a *complete*
+            // config. The template leaves `[identity]` commented out because
+            // most installs never need it, so a fresh `--fix` left a file
+            // that the very next `--fix` wanted to change again. A repair
+            // command that needs a second run to finish is one a user stops
+            // running, and the check then reports a config it would still
+            // "fix" on the next invocation.
+            let (_, added) = upgrade_existing_config(&cfg_path);
+            (
+                CheckResult::ok(
+                    "config",
+                    Severity::Required,
+                    format!("wrote default config to {}", cfg_path.display()),
+                )
+                .with_applied_fix(format!("created {}", cfg_path.display())),
+                1 + added,
             )
-            .with_applied_fix(format!("created {}", cfg_path.display())),
-            1,
-        ),
+        }
         Err(e) => (
             CheckResult::fail(
                 "config",
@@ -685,8 +705,9 @@ mod tests {
 
         let (result, added) = check_and_optionally_fix_config(&paths, true);
         assert_eq!(
-            added, 3,
-            "the fixture has [core] only, so auth, git, safety"
+            added,
+            EXPECTED_SECTIONS.len() - 1,
+            "the fixture has [core] only, so every other live section is added"
         );
         assert_eq!(
             result.status,
@@ -695,7 +716,7 @@ mod tests {
         );
 
         let after = fs::read_to_string(&cfg_path).unwrap();
-        for section in ["[auth]", "[git]", "[safety]"] {
+        for section in EXPECTED_SECTIONS.iter().filter(|s| **s != "core") {
             assert!(
                 after.contains(section),
                 "{section} should have been added, got:\n{after}"
@@ -753,20 +774,76 @@ mod tests {
         assert_eq!(fs::read_to_string(&cfg_path).unwrap(), original);
     }
 
-    /// A file that already has every expected section is a no-op, and reports
-    /// a count of zero rather than a fix that changed nothing.
+    /// A second `--fix` on an already-repaired config changes nothing.
+    ///
+    /// The first run writes the shipped template, which leaves `[identity]`
+    /// commented out; the second adds that one empty table and stops. What
+    /// matters is that the third is a no-op — a repair command that keeps
+    /// "repairing" the same file is one a user stops running.
     #[test]
-    fn fix_on_a_current_config_changes_nothing() {
+    fn fix_converges_after_one_pass() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
         paths.ensure_all().unwrap();
         let cfg_path = paths.config_toml();
         fs::write(&cfg_path, ro_config::paths::default_config_toml()).unwrap();
-        let before = fs::read_to_string(&cfg_path).unwrap();
 
         let (_, added) = check_and_optionally_fix_config(&paths, true);
-        assert_eq!(added, 0);
-        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), before);
+        let after_first = fs::read_to_string(&cfg_path).unwrap();
+
+        let (_, added_again) = check_and_optionally_fix_config(&paths, true);
+        assert_eq!(
+            added_again, 0,
+            "a converged config must not be repaired again; first pass added {added}"
+        );
+        assert_eq!(fs::read_to_string(&cfg_path).unwrap(), after_first);
+    }
+
+    /// `--fix` must never add a table nothing reads.
+    ///
+    /// The list it walked listed `git` and `safety` and omitted `github`,
+    /// `agent` and `identity`, so the repair command was writing empty
+    /// tables a user would then fill in — and nothing would read what they
+    /// wrote. A repair that produces config you cannot use is worse than no
+    /// repair.
+    #[test]
+    fn fix_only_adds_sections_that_are_actually_read() {
+        for gone in ["git", "jobs", "mcp", "safety", "checkpoint", "review", "providers", "engines"] {
+            assert!(
+                !EXPECTED_SECTIONS.contains(&gone),
+                "--fix would add [{gone}], which nothing reads"
+            );
+        }
+        for live in ["core", "auth", "github", "agent", "identity"] {
+            assert!(
+                EXPECTED_SECTIONS.contains(&live),
+                "--fix would not add [{live}], which is read"
+            );
+        }
+    }
+
+    /// And end to end: a config with none of them gets exactly the live set
+    /// and nothing more.
+    #[test]
+    fn fix_on_a_bare_config_adds_only_live_sections() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        fs::write(paths.config_toml(), "[core]
+layout = \"flat\"
+").unwrap();
+
+        let (_, added) = check_and_optionally_fix_config(&paths, true);
+        assert_eq!(added, EXPECTED_SECTIONS.len() - 1, "everything but [core]");
+
+        let doc: toml::Value =
+            toml::from_str(&fs::read_to_string(paths.config_toml()).unwrap()).unwrap();
+        for gone in ["git", "safety", "jobs", "mcp", "checkpoint"] {
+            assert!(
+                doc.get(gone).is_none(),
+                "--fix wrote [{gone}], which nothing reads"
+            );
+        }
     }
 
     #[test]
@@ -821,12 +898,18 @@ mod tests {
         let (result, applied) = check_and_optionally_fix_config(&paths, true);
         assert_eq!(result.status, Status::Ok);
         assert!(result.applied_fix.is_some());
-        assert_eq!(applied, 1);
+        assert!(
+            applied >= 1,
+            "writing a missing config is at least one repair action"
+        );
         assert!(paths.config_toml().exists());
         // running again should be ok (file already valid)
         let (result2, applied2) = check_and_optionally_fix_config(&paths, true);
         assert_eq!(result2.status, Status::Ok);
-        assert_eq!(applied2, 0);
+        assert_eq!(
+            applied2, 0,
+            "a second --fix must be a no-op; the list and the file agree"
+        );
     }
 
     #[test]

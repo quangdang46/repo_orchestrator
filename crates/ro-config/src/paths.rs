@@ -119,20 +119,32 @@ pub fn default_config_toml() -> &'static str {
 }
 
 const DEFAULT_CONFIG_TOML: &str = r#"# ro configuration file.
-# Edit by hand, or run `ro config edit`.
-# See `ro config show --json` for the resolved configuration.
+# Edit by hand, or run `ro config set <key>=<value>`.
+# Every table below is read. There is no fourth source of truth: a setting
+# that is not here and not on a repo row does not exist.
+#
+# Precedence, highest first:
+#   1. a flag on the command line
+#   2. <repo>/.ro/config.local.toml     (gitignored; outranks the row)
+#   3. the `repos` row in the registry (credential_ref, author_ref, engine)
+#   4. this file
+# Per-repo settings that travel with the code belong in a repo row or that
+# local file, not here.
 
 [core]
 projects_dir = "~/projects"
 layout = "flat"            # flat | nested
-parallel = 8
-timeout_secs = 30
+parallel = 8               # repos handled at once in one run
+timeout_secs = 30          # per git command, and per engine
 
 # [identity] — the commit author, and the named profiles a repo picks
 # from. The row's `author_ref` names a profile here; no row ever carries
 # an address, so renaming one is a single edit rather than a migration.
 # A row with no `author_ref` gets `default`; if exactly one profile is
 # defined, `default` is unnecessary.
+#
+# The author is applied per invocation, so nothing is written to
+# .git/config and two repos can commit as two different people in one run.
 #
 #   [identity.work]
 #   name  = "Your Name"
@@ -163,29 +175,6 @@ timeout_secs = 30
 [github]
 host = "github.com"
 auth = "auto"              # env | gh | config-token | auto
-[git]
-update_strategy = "ff-only" # ff-only | rebase | merge
-autostash = false
-terminal_prompt = false
-
-[jobs]
-enabled = true
-max_attempts = 3
-retry_backoff = "exponential" # fixed | exponential
-default_timeout_secs = 1800
-
-[mcp]
-enabled = true
-stdio = true
-sse = false
-sse_port = 7300
-
-# [review] was removed. Its two settings moved:
-#   review.provider      -> no longer needed; see [agent].engine
-#   review.quality_gates -> [checkpoint].quality_gates  (default changed
-#                           from "auto" to "off", see below)
-# A config still carrying [review] parses cleanly and the table is ignored,
-# which is why `ro` prints a deprecation note naming the new keys.
 
 # [agent] — which engine commits, and how it is invoked.
 # Exactly three built-ins, no plugin registry: claude | codex | git.
@@ -205,43 +194,24 @@ sse_port = 7300
 engine = "claude"   # claude | codex | git — the default; git is the raw backend, not a fallback
 # command = 'codex exec "{prompt}"'   # optional: a different binary entirely
 # prompt  = "..."                     # optional: a different instruction
-#
-# [providers.claude] and [providers.codex] are the old form. They are still
-# read, with a deprecation warning, and stop being read in a future release.
 
-# [checkpoint] — what runs before a WIP commit is written.
-# This is the last thing between a WIP commit and a leaked credential.
-#
-# secret_scan: off | warn | block. "block" is the default. A pasted
-#   ghp_... is stopped here, with the matched text redacted.
-#
-# quality_gates: off | on. **Off by default.** It runs
-#   `cargo test --workspace` over the WHOLE tree, so one pre-existing
-#   failure in an untouched crate blocks a one-file commit — and across
-#   a twenty-repo fleet that check dominates the cost of the run. A gate
-#   that fires on things you did not touch teaches you to override it,
-#   and the override disables the gates that matter.
-[checkpoint]
-secret_scan = "block"
-quality_gates = "off"
-
-[safety]
-secret_scan = "block"      # off | warn | block
-require_plan_for_ai_apply = true
-max_auto_apply_risk = "low" # low | medium | high
+# Tables that were removed, and where each setting went. A config still
+# carrying one of these loads cleanly and the table is ignored, which is why
+# `ro` prints a migration note naming the new key rather than failing:
+#   [review]      -> [agent] engine; the preflight is no longer configurable
+#   [providers]   -> [agent] engine
+#   [engines]     -> [agent] engine
+#   [jobs]        -> gone; `ro sync` records a run instead of a job
+#   [mcp]         -> gone; there is no MCP sidecar
+#   [safety]      -> gone; the preflight always blocks, and is not a setting
+#   [git]         -> gone; the per-command flags are the only git settings
+#   [checkpoint]  -> gone; the preflight always blocks, and is not a setting
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn expand_tilde_with_home() {
-        let expanded = expand_tilde("~/projects");
-        assert!(expanded.to_string_lossy().ends_with("projects"));
-        assert!(!expanded.to_string_lossy().starts_with("~"));
-    }
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn expand_tilde_backslash() {
@@ -277,25 +247,37 @@ mod tests {
         assert_eq!(paths.run_log_dir("abc"), Path::new("/state/logs/abc"));
     }
 
+    /// The default file must contain **only** tables something reads.
+    ///
+    /// A shipped table that nothing reads is worse than an absent one: the
+    /// user opens their own config on day one and finds a setting that looks
+    /// real, types a sensible value into it, and watches nothing change.
     #[test]
-    fn default_config_parses_as_toml() {
-        let raw = default_config_toml();
-        let parsed: toml::Value = toml::from_str(raw).expect("default config parses");
-        assert!(parsed.get("core").is_some());
-        assert!(parsed.get("github").is_some());
-        assert!(parsed.get("git").is_some());
-        assert!(parsed.get("jobs").is_some());
-        assert!(parsed.get("mcp").is_some());
-        assert!(parsed.get("checkpoint").is_some());
-        assert!(parsed.get("agent").is_some());
-        assert!(parsed.get("auth").is_some());
-        assert!(parsed.get("safety").is_some());
-        // The default template must NOT ship the deprecated table. If it did,
-        // every new user would open their own config and be told they were
-        // using something deprecated on day zero.
+    fn the_default_config_ships_only_tables_that_are_read() {
+        let parsed: toml::Value =
+            toml::from_str(default_config_toml()).expect("default config parses");
+        let t = parsed.as_table().expect("a table at the root");
+
+        for live in ["core", "auth", "github", "agent"] {
+            assert!(t.contains_key(live), "[{live}] is read and must be shipped");
+        }
+        for gone in [
+            "git", "jobs", "mcp", "safety", "checkpoint", "review", "providers", "engines",
+        ] {
+            assert!(
+                !t.contains_key(gone),
+                "[{gone}] is read by nothing and must not be in the default config"
+            );
+        }
+    }
+
+    /// And the file the user ends up with must not trip the migration note
+    /// that `load_config` prints for a config carrying a cut table.
+    #[test]
+    fn a_fresh_install_does_not_get_told_it_is_outdated() {
         assert!(
-            parsed.get("providers").is_none(),
-            "the default config must not ship the deprecated [providers] table"
+            crate::loader::deprecated_tables(default_config_toml()).is_empty(),
+            "ro init would warn a brand-new user about a table it just wrote"
         );
     }
 }

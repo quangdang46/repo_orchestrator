@@ -21,18 +21,63 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
     let config: AppConfig =
         toml::from_str(&raw).with_context(|| format!("parsing config from {}", path.display()))?;
     validate(&config).with_context(|| format!("validating config at {}", path.display()))?;
-    // Loud, not silent. A deprecated key that is merely tolerated is a
-    // deprecated key nobody migrates off, and the whole point of reading the
-    // old table is that the reading stops eventually.
-    if let Some(note) = config.review_deprecation_note() {
-        tracing::warn!("{note}");
-        eprintln!("warning: {note}");
-    }
-    if let Some(note) = config.engine_deprecation_note() {
+    // Loud, not silent. A deprecated table that is merely tolerated is one
+    // nobody migrates off, and the point of reading the old form is that the
+    // reading stops eventually.
+    //
+    // This checks the **raw** file rather than typed fields, for two reasons.
+    // The tables it names no longer exist in `AppConfig` — that is the cut —
+    // and `AppConfig` deliberately has no `deny_unknown_fields`, so a config
+    // carrying one loads cleanly and does nothing. Detecting the table in the
+    // raw document is the only way to tell the user their setting stopped
+    // being read, and it covers every table that was cut, not just the two
+    // that had a hand-written note.
+    for note in deprecated_tables(&raw) {
         tracing::warn!("{note}");
         eprintln!("warning: {note}");
     }
     Ok(config)
+}
+
+/// Tables ro no longer reads, and where each key went.
+///
+/// Each entry is the table as it appeared in a shipped config, and the
+/// replacement the user should migrate to. Detection is by table name in the
+/// raw document, so it works for a table `AppConfig` has never heard of — which
+/// is the only way it can fire at all, since an unmodelled table is ignored
+/// rather than rejected.
+pub(crate) const CUT_TABLES: &[(&str, &str)] = &[
+    ("review", "its settings moved to [agent] and the preflight defaults"),
+    ("providers", "use [agent] engine"),
+    ("engines", "use [agent] engine"),
+    ("jobs", "the job runner is gone; `ro sync` records a run instead"),
+    ("mcp", "the MCP sidecar is gone"),
+    ("safety", "the preflight is not configurable; it always blocks"),
+    ("git", "the per-command flags are the only git settings"),
+    ("checkpoint", "the preflight is not configurable; it always blocks"),
+];
+
+pub fn deprecated_tables(raw: &str) -> Vec<String> {
+    let doc: toml::Value = match raw.parse() {
+        Ok(v) => v,
+        // Unparseable is not this function's problem: `load_config` has
+        // already reported it with a real message by now.
+        Err(_) => return Vec::new(),
+    };
+    let Some(root) = doc.as_table() else {
+        return Vec::new();
+    };
+    CUT_TABLES
+        .iter()
+        .filter(|(name, _)| root.contains_key(*name))
+        .map(|(name, to)| {
+            format!(
+                "[{name}] is no longer read — {to}. The file still loads, so the \
+                 settings in it are not the ones in effect; run `ro config set` to \
+                 write the current form."
+            )
+        })
+        .collect()
 }
 
 /// Load config from the canonical XDG path
@@ -306,6 +351,52 @@ mod tests {
         let path = dir.path().join("ro/config.toml");
         write_default(&path).unwrap();
         let cfg = load_config(&path).unwrap();
-        assert_eq!(cfg.jobs.max_attempts, 3);
+        // The default file must load into defaults that survive a second
+        // load, and must not be tripping the cut-table warning.
+        let again = load_config(&path).unwrap();
+        assert_eq!(cfg.core.parallel, again.core.parallel);
+        assert!(deprecated_tables(&std::fs::read_to_string(&path).unwrap()).is_empty(),
+            "the shipped default config must not look like a config to migrate");
+    }
+
+    /// A config carrying a table ro no longer reads must SAY SO.
+    ///
+    /// `AppConfig` has no `deny_unknown_fields` on purpose, so a stale
+    /// table loads cleanly and does nothing. That is the worst failure a
+    /// config cut can have: the user changes a setting, watches nothing
+    /// happen, and has no way to tell whether ro is broken or the key is
+    /// wrong.
+    #[test]
+    fn a_cut_table_in_a_users_config_warns_instead_of_going_quiet() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[core]
+parallel = 4
+
+[jobs]
+enabled = true
+
+[providers.claude]
+bin = \"claude\"
+",
+        )
+        .unwrap();
+        let notes = deprecated_tables(&std::fs::read_to_string(&path).unwrap());
+        assert!(notes.len() >= 2, "both stale tables must be reported, got {notes:?}");
+        let joined = notes.join(" ");
+        assert!(joined.contains("[jobs]") && joined.contains("[providers]"));
+        assert!(joined.contains("ro config set"), "and the note must say what to do");
+        // And the file still loads — a warning, not a refusal.
+        assert!(load_config(&path).is_ok());
+    }
+
+    #[test]
+    fn a_current_config_warns_about_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ro/config.toml");
+        write_default(&path).unwrap();
+        assert!(deprecated_tables(&std::fs::read_to_string(&path).unwrap()).is_empty());
     }
 }

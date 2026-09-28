@@ -30,56 +30,15 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
         );
     }
 
-    if !["ff-only", "rebase", "merge"].contains(&cfg.git.update_strategy.as_str()) {
-        bail!(
-            "git.update_strategy: '{}' is not valid (expected: ff-only | rebase | merge)",
-            cfg.git.update_strategy
-        );
-    }
-
-    if !["fixed", "exponential"].contains(&cfg.jobs.retry_backoff.as_str()) {
-        bail!(
-            "jobs.retry_backoff: '{}' is not valid (expected: fixed | exponential)",
-            cfg.jobs.retry_backoff
-        );
-    }
-    if cfg.jobs.max_attempts == 0 {
-        bail!("jobs.max_attempts: must be >= 1");
-    }
-
-    // `[checkpoint]` is the only place these two settings live now.
-    // `review.quality_gates` used to be validated here and read by nobody:
-    // a key that is checked and then ignored is worse than one that is
-    // absent, because a user who sets it reasonably concludes it is
-    // doing something.
-
-    if !["off", "warn", "block"].contains(&cfg.checkpoint.secret_scan.as_str()) {
-        bail!(
-            "checkpoint.secret_scan: '{}' is not valid (expected: off | warn | block)",
-            cfg.checkpoint.secret_scan
-        );
-    }
-    if !["off", "on"].contains(&cfg.checkpoint.quality_gates.as_str()) {
-        bail!(
-            "checkpoint.quality_gates: '{}' is not valid (expected: off | on)",
-            cfg.checkpoint.quality_gates
-        );
-    }
-
-    if !["off", "warn", "block"].contains(&cfg.safety.secret_scan.as_str()) {
-        bail!(
-            "safety.secret_scan: '{}' is not valid (expected: off | warn | block). \
-             The checkpoint preflight reads `checkpoint.secret_scan`; this key is \
-             read by nothing.",
-            cfg.safety.secret_scan
-        );
-    }
-    if !["low", "medium", "high"].contains(&cfg.safety.max_auto_apply_risk.as_str()) {
-        bail!(
-            "safety.max_auto_apply_risk: '{}' is not valid (expected: low | medium | high)",
-            cfg.safety.max_auto_apply_risk
-        );
-    }
+    // Everything else this used to validate is gone with its table:
+    // `git.update_strategy`, `jobs.*`, `checkpoint.*` and `safety.*`.
+    //
+    // Validating a key that nothing reads is worse than not having the key.
+    // A user who sets `safety.secret_scan` to a reasonable value concludes
+    // it is doing something, and it is not — which is the exact failure a
+    // config key is supposed to rule out. A table ro does not read now
+    // produces a migration note in the loader instead (see
+    // `loader::deprecated_tables`), which is loud and actionable.
 
     Ok(())
 }
@@ -117,10 +76,19 @@ mod tests {
         validate(&cfg).expect_err("zero parallel must fail");
     }
 
+    /// The preflight's secret scan is not configurable, so there is
+    /// nothing to validate. This test exists to say so: the alternative is
+    /// someone re-adding a `[safety]` section because a test once
+    /// mentioned one.
     #[test]
-    fn invalid_secret_scan_rejected() {
-        let mut cfg = AppConfig::default();
-        cfg.safety.secret_scan = "loud".into();
-        validate(&cfg).expect_err("invalid secret_scan must fail");
+    fn there_is_no_configurable_secret_scan_to_reject() {
+        // The default file must not carry a table that is never read.
+        let raw = crate::paths::default_config_toml();
+        for gone in ["[safety]", "[checkpoint]", "[jobs]", "[git]", "[mcp]"] {
+            assert!(
+                !raw.lines().any(|l| l.trim() == gone),
+                "{gone} is written into the default config but read by nothing"
+            );
+        }
     }
 }
