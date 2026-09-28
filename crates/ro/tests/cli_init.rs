@@ -195,6 +195,56 @@ fn an_unknown_repo_is_a_usage_error() {
         .code(64);
 }
 
+/// A registered repo **nested inside** the one being deleted is refused.
+///
+/// The `--delete` path guards against two rows pointing at the same
+/// directory, but only by exact string equality of `local_path`. A repo
+/// registered *inside* another one has a different `local_path`, so the
+/// check did not fire — and `remove_dir_all` destroyed the nested repo's
+/// working copy too, leaving its registry row dangling at a path that no
+/// longer exists. The flag's own help says a directory that belongs to
+/// another registered repo is "refused outright".
+#[test]
+fn remove_delete_refuses_a_nested_registered_repo() {
+    let t = Test::initialised();
+
+    let parent = local_repo();
+    // A real checkout *inside* the parent's directory, not a sibling.
+    let child_path = parent.path().join("child");
+    std::fs::create_dir_all(&child_path).unwrap();
+    ro_testkit::worktree::run(&child_path, &["init", "-q", "-b", "main"]);
+    ro_testkit::worktree::run(&child_path, &["config", "user.email", "t@example.invalid"]);
+    ro_testkit::worktree::run(&child_path, &["config", "user.name", "T"]);
+    ro_testkit::worktree::run(&child_path, &["commit", "-q", "--allow-empty", "-m", "init"]);
+
+    t.cmd().arg("add").arg(parent.path()).assert().success();
+    t.cmd().arg("add").arg(&child_path).assert().success();
+
+    // Find the label for the parent row (owner is derived from the parent
+    // directory name, so match on the recorded `local_path`).
+    let rows = listed(&t);
+    let parent_label = rows
+        .iter()
+        .find(|r| r["local_path"].as_str() == Some(parent.path().to_str().unwrap()))
+        .map(|r| format!("{}/{}", r["owner"].as_str().unwrap(), r["name"].as_str().unwrap()))
+        .expect("the parent row must be registered");
+
+    t.cmd()
+        .args(["remove", &parent_label, "--delete", "--non-interactive"])
+        .assert()
+        .code(64)
+        .stderr(predicate::str::contains("refused"));
+
+    assert!(
+        child_path.join(".git").exists(),
+        "the nested repo's working copy must survive"
+    );
+    assert!(
+        parent.path().join(".git").exists(),
+        "the parent's working copy must survive"
+    );
+}
+
 #[test]
 fn status_distinguishes_clean_from_dirty() {
     let t = Test::initialised();

@@ -192,8 +192,30 @@ pub fn should_block(mode: SecretScanMode, findings: &[SecretFinding]) -> bool {
     matches!(mode, SecretScanMode::Block) && !findings.is_empty()
 }
 
+/// Decide whether a file is binary enough that scanning its text is
+/// pointless.
+///
+/// A **density** test, not a presence test. The old version returned true if
+/// *any* of the first 8000 bytes was zero, so a single `0x00` at offset 0
+/// switched the scan off for the whole file — and a real-looking text file
+/// carrying a `ghp_`-shaped token committed and pushed as a clean run. That
+/// is exactly the class this scan exists to catch, so it was a clean bypass
+/// of the safety net.
+///
+/// A stray NUL inside a text file is rare; a binary file is *mostly* NULs and
+/// other non-text bytes. Requiring a meaningful proportion keeps genuinely
+/// binary blobs skipped (the `scan_file_skips_binary` fixture is 2 NULs in 6
+/// bytes) while a text file with one odd byte is still scanned. A NUL inside
+/// a credential is not something a real secret has, so matching the
+/// surrounding shape still works over the lossy-UTF8 text.
 fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(8000).any(|&b| b == 0)
+    let head = &bytes[..bytes.len().min(8000)];
+    if head.is_empty() {
+        return false;
+    }
+    let nul = head.iter().filter(|&&b| b == 0).count();
+    // More than 5% NUL bytes is a binary file; a stray byte in text is not.
+    nul * 20 > head.len()
 }
 
 #[cfg(test)]
@@ -282,6 +304,28 @@ mod tests {
         std::fs::write(&p, [0u8, 1, 2, 0, 4, 5]).unwrap();
         let f = scan_file(&p).unwrap();
         assert!(f.is_empty());
+    }
+
+    /// A NUL byte anywhere in the first 8000 bytes must not switch the scan
+    /// off for the whole file. `looks_binary` used to return true on a
+    /// single zero byte, so one `0x00` at offset 0 let a real-looking text
+    /// file carrying a `ghp_`-shaped token commit and push as a clean run.
+    #[test]
+    fn a_nul_byte_does_not_disable_the_scan() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("notes.bin");
+        let mut bytes: Vec<u8> = vec![0u8];
+        bytes.extend_from_slice(b"AAAAAAAAAAAAAAAAAAAA\n");
+        // A full-length ghp_ token (36+ chars after the prefix) so the
+        // github_token rule — the most specific one — is what must fire.
+        bytes.extend_from_slice(b"token = \"ghp_ZZZsecretZZZ1234567890ABCDEFGHIJKLMNOP\"\n");
+        std::fs::write(&p, &bytes).unwrap();
+
+        let f = scan_file(&p).unwrap();
+        assert!(
+            f.iter().any(|x| x.rule == "github_token"),
+            "a NUL byte must not disable the scan; findings were: {f:?}"
+        );
     }
 
     #[test]

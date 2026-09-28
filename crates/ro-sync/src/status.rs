@@ -1,7 +1,8 @@
 //! Status display engine.
 //!
 //! Show repo status for all or single repo.
-//! Output in text/JSON/NDJSON/TOON.
+//! Output in text, JSON and NDJSON — the three variants of
+//! `ro --format`, applied in `crates/ro` against this row.
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -43,7 +44,28 @@ pub struct RepoStatus {
     /// the one condition that makes every other field on the row — the
     /// ahead/behind comparison in particular — not mean what it appears to
     /// mean.
+    ///
+    /// It is `true` for an unmerged index with **no** operation in
+    /// progress too, which is the state a conflicting `git pull
+    /// --autostash` leaves behind: the pull fast-forwards, the pop of
+    /// the stashed work conflicts, git exits 0, and none of the four
+    /// operation markers is written. A tree full of conflict markers
+    /// that this field calls `false` is the one answer `ro status` must
+    /// never give.
     pub in_conflict: bool,
+    /// What the conflict is, when there is one.
+    ///
+    /// `None` when [`Self::in_conflict`] is `false`, so a consumer can
+    /// branch on the boolean and read this only when it matters. The
+    /// value is the `ConflictOp` git reported — `merge`, `rebase`,
+    /// `cherry-pick`, `revert`, or `stash pop` for the unmerged-index
+    /// case above, where no operation marker names the cause.
+    ///
+    /// It is a `String` rather than the enum so this row stays a plain
+    /// data record: it is serialised to JSON and NDJSON as-is, and a
+    /// consumer reading `ro status --format ndjson` gets the same word
+    /// the text renderer prints.
+    pub conflict_kind: Option<String>,
     pub last_synced_at: Option<i64>,
 }
 
@@ -163,7 +185,17 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
     let is_protected = effective
         .as_deref()
         .is_some_and(ro_git::primitives::is_protected_branch);
-    let in_conflict = ro_git::conflict::detect(&path).ok().flatten().is_some();
+
+    // The conflict read is kept apart from the `?`-using block above on
+    // purpose. A repo whose index is unmerged is a repo to *report*, not
+    // a reason to fail the row: `ro status` exists to answer "is
+    // anything wrong with my repos right now", and this is the answer
+    // for one of them. The error is swallowed only after the state has
+    // been read, and only because a repo that cannot be read at all is
+    // already covered by the `not cloned` branch above.
+    let conflict = ro_git::conflict::detect(&path).ok().flatten();
+    let in_conflict = conflict.is_some();
+    let conflict_kind = conflict.as_ref().map(|c| c.op.to_string());
 
     Ok(RepoStatus {
         repo_id: repo_id.to_string(),
@@ -180,6 +212,7 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
         // and it is the branch it is on that the next `ro ship` will use.
         is_protected,
         in_conflict,
+        conflict_kind,
         last_synced_at,
     })
 }
@@ -454,5 +487,296 @@ mod tests {
         let (_, conn) = setup();
         let err = status_repo(&conn, "nonexistent-id").unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    // ── The unmerged index ──
+
+    /// A repo whose tree is full of conflict markers is a repo in
+    /// conflict, however it got there.
+    ///
+    /// `git pull --autostash` is the way in: the pull fast-forwards, the
+    /// pop of the stashed work conflicts, **git exits 0**, and it writes
+    /// none of `MERGE_HEAD`, `REBASE_HEAD`, `CHERRY_PICK_HEAD` or
+    /// `REVERT_HEAD`. `ro status` used to answer `in_conflict = false`
+    /// for exactly that tree, and said nothing about the markers — the
+    /// user learns their repo is fine hours before something tries to
+    /// build on it.
+    #[test]
+    fn a_conflicting_autostash_pop_reports_in_conflict() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        leave_conflicting_autostash_pop(&local_path);
+
+        // The precondition, asserted: this is a tree with no operation
+        // marker in it at all. The old check looked for those four files
+        // and nothing else, so this is the whole reason it said "fine".
+        for marker in ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+            assert!(
+                !local_path.join(".git").join(marker).exists(),
+                "{marker} must be absent, or this is not the case under test"
+            );
+        }
+        assert_eq!(
+            porcelain(&local_path),
+            "UU shared.txt",
+            "the index is unmerged, and it is the only evidence there is"
+        );
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert!(
+            status.in_conflict,
+            "a tree with conflict markers in it is not a healthy repo"
+        );
+        assert_eq!(
+            status.conflict_kind.as_deref(),
+            Some("stash pop"),
+            "the row must say *why*, so a user is not sent hunting for a \
+             merge that is not running"
+        );
+    }
+
+    /// The negative control. Without it the test above passes on a
+    /// `detect` that answers `true` unconditionally, which is the same
+    /// shape of defect one layer down.
+    #[test]
+    fn a_clean_repo_reports_no_conflict() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        init_repo(&local_path);
+        commit(&local_path, "a.txt", "hello");
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert!(!status.in_conflict, "a clean repo is not in conflict");
+        assert_eq!(status.conflict_kind, None);
+    }
+
+    /// A dirty repo is not a conflicted repo. The two are different
+    /// facts and a user acting on one of them does the wrong thing to
+    /// the other — `git add .` fixes a dirty tree, and does nothing for
+    /// a conflict.
+    #[test]
+    fn a_dirty_repo_reports_no_conflict() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        init_repo(&local_path);
+        commit(&local_path, "a.txt", "hello");
+        std::fs::write(local_path.join("a.txt"), "changed").unwrap();
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert!(status.is_dirty);
+        assert!(!status.in_conflict, "dirty is not conflict");
+        assert_eq!(status.conflict_kind, None);
+    }
+
+    /// The signal is about the index, so it is not specific to the one
+    /// command that produces it most often. A conflicting `git merge
+    /// --squash` writes no `MERGE_HEAD` and lands the same way.
+    #[test]
+    fn unmerged_entries_from_another_source_are_also_reported() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        init_repo(&local_path);
+        commit(&local_path, "f.txt", "line1\nbase\nline3\n");
+        run_git(&local_path, &["checkout", "-q", "-b", "feat"]);
+        commit(&local_path, "f.txt", "line1\ntheirs\nline3\n");
+        run_git(&local_path, &["checkout", "-q", "main"]);
+        commit(&local_path, "f.txt", "line1\nours\nline3\n");
+        let out = git_out(&local_path, &["merge", "--squash", "feat"]);
+        assert!(
+            !out.success,
+            "the squash merge must have conflicted, or there is nothing to report"
+        );
+        assert_eq!(porcelain(&local_path), "UU f.txt");
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert!(status.in_conflict, "the source of the conflict is irrelevant");
+    }
+
+    /// A repo that is not a git repository at all has no index to
+    /// unmerge, and must not be reported as conflicted just because a
+    /// `detect` on it failed.
+    #[test]
+    fn a_directory_that_is_not_a_repo_reports_no_conflict() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        std::fs::create_dir_all(&local_path).unwrap();
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert!(!status.in_conflict);
+        assert_eq!(status.conflict_kind, None);
+    }
+
+    /// One bad row must not take out the others.
+    ///
+    /// A conflicted repo is the newest way to make `ro status` abort, and
+    /// an abort over a fleet teaches the user the same thing a green
+    /// board does: that this command cannot be trusted.
+    #[test]
+    fn a_conflicted_repo_does_not_hide_the_rest_of_the_fleet() {
+        let (tmp, conn) = setup();
+        let conflicted = crate::manage::add(&conn, "alice/conflicted", &projects_dir(&tmp)).unwrap();
+        let clean = crate::manage::add(&conn, "bob/clean", &projects_dir(&tmp)).unwrap();
+        let missing = crate::manage::add(&conn, "carol/missing", &projects_dir(&tmp)).unwrap();
+
+        leave_conflicting_autostash_pop(&projects_dir(&tmp).join("alice").join("conflicted"));
+
+        let clean_path = projects_dir(&tmp).join("bob").join("clean");
+        init_repo(&clean_path);
+        commit(&clean_path, "a.txt", "hello");
+
+        // Tracked but never cloned — the row is real, the worktree is not.
+        std::fs::create_dir_all(projects_dir(&tmp).join("carol").join("missing")).unwrap();
+
+        let statuses = status_all(&conn).unwrap();
+        assert_eq!(statuses.len(), 3, "every row must be reported");
+
+        let by_id = |id: &str| {
+            statuses
+                .iter()
+                .find(|s| s.repo_id == id)
+                .unwrap_or_else(|| panic!("no row for {id}"))
+                .clone()
+        };
+
+        let conflicted_status = by_id(&conflicted.id);
+        assert!(conflicted_status.in_conflict);
+
+        let clean_status = by_id(&clean.id);
+        assert!(
+            !clean_status.in_conflict,
+            "one conflicted repo must not colour the others"
+        );
+        assert_eq!(clean_status.is_in_sync(), Some(true));
+
+        let missing_status = by_id(&missing.id);
+        assert_eq!(
+            missing_status.unmeasurable_reason.as_deref(),
+            Some("not cloned")
+        );
+        assert!(!missing_status.in_conflict);
+    }
+
+    /// The signal has to survive every machine format.
+    ///
+    /// `ro status --format json` and `--format ndjson` both serialise
+    /// this struct whole, so a field that is not on it is a field no
+    /// script ever sees — and a status that only appears in one format
+    /// is a status most scripts never see.
+    #[test]
+    fn the_conflict_signal_reaches_the_machine_formats() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        leave_conflicting_autostash_pop(&local_path);
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+
+        // What both `json` and `ndjson` emit for this row.
+        let row: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(row["in_conflict"], serde_json::Value::Bool(true));
+        assert_eq!(row["conflict_kind"], "stash pop");
+    }
+
+    // ── fixtures ──
+
+    /// A bare repo whose `HEAD` points at `main`.
+    ///
+    /// The `symbolic-ref` is load-bearing, not decoration: a fresh
+    /// `git init --bare` leaves `HEAD` at `refs/heads/master`, so a
+    /// clone of it checks out an empty `master`, the first commit lands
+    /// on a branch the remote has no ref for, and the push fails with
+    /// "src refspec main does not match any" — a fixture that never
+    /// reaches the state it exists to describe.
+    fn bare_remote(p: &Path) {
+        std::fs::create_dir_all(p).unwrap();
+        run_git(p, &["init", "--bare", "-q", "."]);
+        run_git(p, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    }
+
+    /// A repo whose index is unmerged and which has **no** operation
+    /// marker: the state a conflicting `git pull --autostash` leaves.
+    ///
+    /// Real git against a real bare remote, because the thing asserted
+    /// is exactly what git leaves on disk. A fixture that staged an
+    /// unmerged entry by hand would only prove that the reader reads
+    /// what the writer wrote — and `git update-index --index-info` is
+    /// the one way to build this state without the pull that produces
+    /// it, which is why it is not used here.
+    fn leave_conflicting_autostash_pop(local_path: &Path) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        bare_remote(&remote);
+
+        init_repo(local_path);
+        commit(local_path, "shared.txt", "line1\nline2\nline3\n");
+        run_git(
+            local_path,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
+        run_git(local_path, &["push", "-q", "origin", "main"]);
+
+        // A second checkout rewrites the same line and pushes it.
+        let other = tmp.path().join("other");
+        run_git(tmp.path(), &["clone", "-q", &remote.display().to_string(), "other"]);
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test"]);
+        commit(&other, "shared.txt", "line1\nREMOTE-VERSION\nline3\n");
+        run_git(&other, &["push", "-q", "origin", "main"]);
+
+        // The local checkout rewrites the same line and does not commit,
+        // so the pull has to stash it and the pop is what conflicts.
+        std::fs::write(
+            local_path.join("shared.txt"),
+            "line1\nLOCAL-VERSION\nline3\n",
+        )
+        .unwrap();
+        // Without tracking, `git pull` refuses to guess a branch and the
+        // fixture never reaches the state under test.
+        run_git(
+            local_path,
+            &["branch", "--set-upstream-to=origin/main", "main"],
+        );
+        let out = git_out(local_path, &["pull", "--autostash"]);
+        assert!(
+            out.success,
+            "git calls a conflicting autostash pop a success — that is the \
+             entire reason the exit code cannot be the signal. stderr: {}",
+            out.stderr
+        );
+    }
+
+    /// `git status --porcelain`, the index's own answer.
+    fn porcelain(dir: &Path) -> String {
+        git_out(dir, &["status", "--porcelain"]).stdout.trim().to_string()
+    }
+
+    /// A git call whose *output* is wanted, and whose failure is not
+    /// fatal — several steps below are expected to fail, and the ones
+    /// that are not have their exit code asserted by name.
+    struct GitOut {
+        success: bool,
+        stdout: String,
+        stderr: String,
+    }
+
+    fn git_out(dir: &Path, args: &[&str]) -> GitOut {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap_or_else(|e| panic!("git {args:?} in {} could not run: {e}", dir.display()));
+        GitOut {
+            success: out.status.success(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
     }
 }

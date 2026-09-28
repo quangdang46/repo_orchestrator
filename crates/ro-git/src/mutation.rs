@@ -61,6 +61,15 @@ pub struct PullOpts {
     pub branch: Option<String>,
     /// Pull strategy. Defaults to `--ff-only` (safest).
     pub strategy: PullStrategy,
+    /// Stash uncommitted work, pull, then pop it back.
+    ///
+    /// This is the flag that makes a dirty worktree syncable, and it is
+    /// **not** a success signal on its own. `git pull --autostash` exits 0
+    /// even when the pop conflicts, so a caller that reads the exit code
+    /// reports a green sync over a tree holding conflict markers and a
+    /// stash the user was never told about. See [`pull`], which reads the
+    /// tree instead of the code.
+    pub autostash: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +87,16 @@ pub struct PullOutcome {
     pub result: GitCommandResult,
     pub conflict: bool,
     pub already_up_to_date: bool,
+    /// Set when a nominally-successful `--autostash` pull left the work
+    /// stashed rather than back in the tree.
+    ///
+    /// `None` for every pull that did not ask for an autostash, and for
+    /// every autostash that popped cleanly. `Some(message)` means the
+    /// command exited 0 while the user's uncommitted work is still sitting
+    /// in a stash, and `message` is the recovery the user needs — naming
+    /// `git stash list`, because that is where the work now lives and
+    /// nothing else mentions it.
+    pub autostash_hold: Option<String>,
 }
 
 /// Options for `clone`.
@@ -103,12 +122,32 @@ pub struct PushOpts {
     pub force_with_lease: bool,
     pub set_upstream: bool,
     pub tags: bool,
-    /// Which host the `extraheader` is scoped to. Defaults to github.com.
+    /// Which host the `extraheader` is scoped to. `None` means **no
+    /// credential mechanism**, and that is load-bearing rather than a
+    /// default to fill in.
     ///
-    /// Scoped rather than global on purpose: a credential for one host must not
-    /// be offered to another, and a global `http.extraheader` would offer it to
-    /// every host this git talks to for the life of the invocation.
+    /// The caller sets `None` for a non-HTTP(S) remote — the header is an
+    /// HTTP mechanism and SSH authenticates with keys. It used to be
+    /// replaced here with the literal `"github.com"`, so a token from *any*
+    /// row with a `credential_ref` and an SSH remote was aimed at github.com
+    /// and handed to a child git process for a transport that must not have
+    /// it. The key was malformed too (`http.github.com/…`, no scheme), so
+    /// git silently ignored it — the token never reached the wire, which is
+    /// exactly why nothing noticed for as long as it did.
+    ///
+    /// Scoped rather than global on purpose: a credential for one host must
+    /// not be offered to another, and a global `http.extraheader` would offer
+    /// it to every host this git talks to for the life of the invocation.
     pub host: Option<String>,
+    /// Which binary to spawn. `None` means `git`.
+    ///
+    /// The same seam as [`RunOpts::program`], and present for the same
+    /// reason: a test of "does the credential reach the child" has to be
+    /// able to put a reporting shim where the real `git` would be. Without
+    /// it the only way to test this is to read the code, and a test that
+    /// spawns the real git and asserts on its output passes vacuously.
+    #[serde(skip)]
+    pub program: Option<String>,
 }
 
 /// Per-invocation settings for a git command.
@@ -402,12 +441,36 @@ pub fn fetch(repo: &Path, opts: &FetchOpts) -> Result<GitCommandResult> {
 }
 
 /// Pull from a remote.
+///
+/// **The exit code is not the outcome.** With `--autostash`, git exits 0
+/// even when the pop conflicts, so `result.ok()` alone would report a
+/// successful sync over a tree full of conflict markers and a stash the
+/// user was never told about. When `opts.autostash` is set this therefore
+/// reads the tree afterwards and reports what actually happened:
+///
+///   * a clean pop — no unmerged entries, and no stash *this pull* created —
+///     is a success
+///   * a conflicting pop — unmerged entries, or a stash this pull created
+///     and did not pop — is reported as a conflict, and the stash is named
+///     in the message
+///
+/// "This pull's" is load-bearing and is decided by comparing the stash list
+/// from before the pull with the one after. A stash the user made earlier —
+/// or made by hand, whatever it is called — is theirs, and blaming it on
+/// this pull wedges the repo: every later sync reports a conflict the user
+/// cannot clear from inside the tool.
+///
+/// Without `--autostash` the exit code is the whole story, because git
+/// refuses the merge outright and nothing is stashed.
 pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
     let mut args: Vec<String> = vec!["pull".to_string()];
     match opts.strategy {
         PullStrategy::FastForwardOnly => args.push("--ff-only".to_string()),
         PullStrategy::Merge => args.push("--no-rebase".to_string()),
         PullStrategy::Rebase => args.push("--rebase".to_string()),
+    }
+    if opts.autostash {
+        args.push("--autostash".to_string());
     }
     if let Some(remote) = &opts.remote {
         args.push(remote.clone());
@@ -431,14 +494,196 @@ pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
         args.push(branch.clone());
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Taken **before** git runs, because the only sound answer to "is that
+    // stash this pull's?" is "did it exist before the pull". Matching on the
+    // stash's message does not work: the user's own stash may say
+    // `autostash`, and a stash left by an *earlier* pull still says it too.
+    // Skipped entirely when no autostash was asked for — that path is judged
+    // by the exit code alone, and it must not pay for a tree read.
+    let stashes_before = if opts.autostash {
+        stash_snapshot(repo)
+    } else {
+        None
+    };
     let result = run_in(Some(repo), &argv, &RunOpts::none())?;
     let conflict = result.stderr.contains("conflict") || result.stdout.contains("CONFLICT");
     let already_up_to_date = result.stdout.contains("Already up to date");
+
+    // Only the autostash path needs the tree read. A pull without it either
+    // succeeded or git refused before stashing anything, so the exit code
+    // and the stream already say the whole truth.
+    if opts.autostash && result.ok() {
+        let unmerged = unmerged_paths(repo);
+        let stash = autostash_state(repo, stashes_before.as_deref());
+        let stash_held = !matches!(stash, AutostashState::Popped);
+        if !unmerged.is_empty() || stash_held {
+            // The pull landed and the pop did not. Both facts are stated,
+            // because the recovery depends on the second: the work is in
+            // the stash, and the tree holds conflict markers.
+            let mut detail = String::from(
+                "the pull succeeded but the autostash did not pop — your uncommitted work is \
+                 still stashed, not lost",
+            );
+            if !unmerged.is_empty() {
+                detail.push_str(&format!(
+                    ". The remote rewrote the same lines, so the pop conflicted; the worktree now \
+                     holds conflict markers in: {}",
+                    unmerged.join(", ")
+                ));
+            }
+            match stash {
+                AutostashState::Held => detail.push_str(
+                    ". Run `git stash list` to see it (it is listed as `autostash`), resolve the \
+                     conflicts, then `git stash pop` to bring your work back",
+                ),
+                // Not a claim that the work is stashed — a claim that we
+                // could not find out. Saying so beats naming a stash the
+                // user may not have.
+                AutostashState::Unreadable => detail.push_str(
+                    ". `git stash list` could not be read, so whether the pop applied is unknown; \
+                     check it by hand before trusting this tree",
+                ),
+                AutostashState::Popped => {}
+            }
+            return Ok(PullOutcome {
+                result,
+                conflict: true,
+                already_up_to_date: false,
+                autostash_hold: Some(detail),
+            });
+        }
+    }
+
     Ok(PullOutcome {
         result,
         conflict,
         already_up_to_date,
+        autostash_hold: None,
     })
+}
+
+/// Paths git reports as unmerged (`UU`, `AA`, `DD`, `AU`, `UA`, `DU`, `UD`).
+///
+/// This is the tree's own answer to "did the pop apply cleanly", and it is
+/// read rather than inferred from the exit code because `git pull
+/// --autostash` returns 0 either way. A `UU` entry is a file holding
+/// conflict markers; an `AU`/`UA` is a file one side added and the other
+/// changed. Both are a pop that did not finish.
+fn unmerged_paths(repo: &Path) -> Vec<String> {
+    let out = match std::process::Command::new("git")
+        .args(["status", "--porcelain", "-z", "-uall"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+    {
+        Ok(o) => o,
+        // A worktree that cannot be read is not evidence of a clean pop.
+        // An empty answer here would report success on a tree we never
+        // looked at, which is the exact lie this function exists to stop.
+        Err(_) => return vec!["<unreadable worktree>".to_string()],
+    };
+    if !out.status.success() {
+        return vec!["<git status failed>".to_string()];
+    }
+    crate::primitives::parse_porcelain(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .filter(|e| {
+            let c = e.code.as_str();
+            c == "UU" || c == "AA" || c == "DD" || c == "AU" || c == "UA" || c == "DU" || c == "UD"
+        })
+        .map(|e| e.path)
+        .collect()
+}
+
+/// The stashes a repository currently holds, as the id of each stash commit.
+///
+/// **By id, never by `stash@{n}`.** An entry's index is its position in the
+/// `refs/stash` reflog, which renumbers itself every time anything is pushed
+/// or dropped: drop `stash@{0}` from a two-stash list and the survivor becomes
+/// `stash@{0}`. Comparing two snapshots by index would therefore call an
+/// untouched stash "new" the moment a later one is dropped above it, and the
+/// pull would report a hold against work the user left alone. The commit id
+/// is the thing that survives a renumber, so it is the identity.
+///
+/// `None` means **unknown**, not empty. `git stash list` exits non-zero
+/// outside a repository, so an unreadable list is a thing that actually
+/// happens to a tracked repo whose checkout was replaced, and a caller that
+/// read it as "no stashes" would be reporting a clean pop on the strength of
+/// a command that never ran.
+fn stash_snapshot(repo: &Path) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .args(["stash", "list", "--format=%H"])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// What this pull's `--autostash` actually did, as far as the repo can be
+/// asked.
+enum AutostashState {
+    /// This pull created a stash and did not pop it. The user's uncommitted
+    /// work is in there right now.
+    Held,
+    /// No stash appeared that was not there before, so the pop applied — or
+    /// there was nothing to stash in the first place.
+    Popped,
+    /// The stash list could not be read. Deliberately not folded into
+    /// `Popped`: not knowing where the work is is not the same as knowing it
+    /// came back, and the one thing this code path must never do is call a
+    /// tree clean it did not look at.
+    Unreadable,
+}
+
+/// Whether *this* pull is still holding its autostash.
+///
+/// The discriminator is **age, not wording**. A stash belongs to this pull
+/// only if it was not there when the pull started, so the answer is the
+/// difference between a snapshot taken before `git pull` and one taken after.
+/// Nothing about the message is consulted, and that is the point: a stash the
+/// user wrote with `git stash push -m "autostash of ..."` is as ordinary as
+/// any other, and matching on the word the flag uses is how a user's own
+/// stash gets reported as a leak.
+///
+/// `before` is the snapshot taken before git ran, or `None` when the pull
+/// was not asked to autostash at all.
+fn autostash_state(repo: &Path, before: Option<&[String]>) -> AutostashState {
+    let Some(after) = stash_snapshot(repo) else {
+        return AutostashState::Unreadable;
+    };
+    let Some(before) = before else {
+        // The pre-pull state is unknown, so nothing in the list can be shown
+        // to be older than this pull. Reporting `Popped` here would be the
+        // lie this function exists to prevent: an entry that was already
+        // there, made by the user, is enough to invent a conflict on a pull
+        // that stashed nothing.
+        return if after.is_empty() {
+            // An empty list is still evidence: there is nothing stashed, so
+            // there is no work in a stash no matter what we could not read
+            // before.
+            AutostashState::Popped
+        } else {
+            AutostashState::Unreadable
+        };
+    };
+    if after.iter().any(|id| !before.contains(id)) {
+        AutostashState::Held
+    } else {
+        AutostashState::Popped
+    }
 }
 
 /// Clone a repository to `dest`.
@@ -615,14 +860,18 @@ pub fn push_with_credential(
         args.push(branch.clone());
     }
 
-    let env = match token {
-        Some(t) => extraheader_env(opts.host.as_deref().unwrap_or("github.com"), t),
-        None => Vec::new(),
+    // `None` means "this remote has no credential mechanism", and the
+    // answer is **no header at all** — not a header aimed at a host the
+    // caller never named. See `PushOpts::host` for what the old
+    // `unwrap_or("github.com")` did.
+    let env = match (token, opts.host.as_deref()) {
+        (Some(t), Some(host)) => extraheader_env(host, t),
+        _ => Vec::new(),
     };
-    let run_opts = if env.is_empty() {
-        RunOpts::none()
-    } else {
-        RunOpts::with_env(&env)
+    let run_opts = RunOpts {
+        env: &env,
+        timeout: None,
+        program: opts.program.as_deref(),
     };
 
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1147,6 +1396,92 @@ echo PROBE_ARGS=%*
         );
     }
 
+    /// A non-HTTP(S) remote gets **no** header, even when a credential was
+    /// resolved.
+    ///
+    /// The caller passes `host: None` for an SSH remote and says so at the
+    /// call site — "the header is an HTTP mechanism and SSH authenticates
+    /// with keys". `push_with_credential` then replaced that `None` with the
+    /// literal `"github.com"` and fabricated a header, so a token from *any*
+    /// row with a `credential_ref` and a non-HTTP remote was aimed at
+    /// github.com. The key was also malformed (`http.github.com/…`, no
+    /// scheme), so git silently ignored it — the token never reached the
+    /// wire, but it *was* handed to a child git process for a transport that
+    /// must not have it.
+    #[test]
+    fn a_non_http_remote_gets_no_header_even_with_a_credential() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let shim_str = shim.to_str().expect("a UTF-8 shim path").to_string();
+
+        let token = SecretString::new("ghp_ssh_remote_marker");
+        let pushed = push_with_credential(
+            &repo,
+            &PushOpts {
+                host: None,
+                program: Some(shim_str),
+                ..Default::default()
+            },
+            Some(&token),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            pushed.stdout.contains("PROBE_ARGS="),
+            "the shim must be the binary that ran, stdout: {:?}",
+            pushed.stdout
+        );
+        assert!(
+            !pushed.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "an SSH remote must not receive an extraheader, stdout: {:?}",
+            pushed.stdout
+        );
+        assert!(
+            !pushed.stdout.contains("AUTHORIZATION"),
+            "no authorization header may be fabricated for a non-HTTP remote, stdout: {:?}",
+            pushed.stdout
+        );
+    }
+
+    /// The other half of the same rule, so the fix cannot be "never send a
+    /// header": an HTTP remote still gets one, scoped to the host the caller
+    /// named.
+    #[test]
+    fn an_http_remote_still_gets_its_scoped_header() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let shim_str = shim.to_str().expect("a UTF-8 shim path").to_string();
+
+        let token = SecretString::new("ghp_http_marker");
+        let pushed = push_with_credential(
+            &repo,
+            &PushOpts {
+                host: Some("http://127.0.0.1:8080".into()),
+                program: Some(shim_str),
+                ..Default::default()
+            },
+            Some(&token),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            pushed.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "an HTTP remote must still receive a header, stdout: {:?}",
+            pushed.stdout
+        );
+        assert!(
+            pushed
+                .stdout
+                .contains("GIT_CONFIG_KEY_0=http.http://127.0.0.1:8080/.extraheader"),
+            "the header must be scoped to the host actually requested, stdout: {:?}",
+            pushed.stdout
+        );
+    }
+
     /// The hardening block reaches a wrapper binary too, so a caller that
     /// swaps in a shim still gets `GIT_TERMINAL_PROMPT=0` and friends.
     #[test]
@@ -1389,10 +1724,29 @@ echo PROBE_ARGS=%*
         (tmp, path)
     }
 
-    fn run_git(dir: &Path, args: &[&str]) {
+    /// `pub(crate)` so `pull_arg_tests` can share it. The autostash tests
+    /// build a remote and two clones, which is exactly this helper's job —
+    /// and the one thing they must not do is hand-roll `Command::new("git")`
+    /// and ignore the status, because a silently-failed setup step makes the
+    /// test exercise a different scenario than the one it names. That is how
+    /// the first version of these two passed or failed for reasons that had
+    /// nothing to do with autostash.
+    pub(crate) fn run_git(dir: &Path, args: &[&str]) {
         // The real API, not the deprecated `run` shim. CI compiles tests
         // with `-D warnings`, so a shim kept "so callers do not churn" turns
         // into a build error for exactly the callers it was meant to spare.
+        let _ = run_git_out(dir, args);
+    }
+
+    /// `run_git` that hands back the result, for a test that needs to assert
+    /// on what a command printed.
+    ///
+    /// Split rather than given a flag, because the two callers have different
+    /// needs: a setup step wants "did it work" and a query wants the bytes.
+    /// A single helper that asserted on success would make the query
+    /// impossible, and one that returned unchecked would let a failed
+    /// `push` pass as a setup.
+    pub(crate) fn run_git_out(dir: &Path, args: &[&str]) -> GitCommandResult {
         let r = run_in(Some(dir), args, &RunOpts::none()).unwrap();
         assert!(
             r.ok(),
@@ -1400,6 +1754,7 @@ echo PROBE_ARGS=%*
             r.stdout,
             r.stderr
         );
+        r
     }
 
     #[test]
@@ -1489,7 +1844,8 @@ echo PROBE_ARGS=%*
 mod pull_arg_tests {
     use super::*;
 
-    use super::tests::temp_repo;
+    use super::tests::{run_git, run_git_out, temp_repo};
+    use tempfile::TempDir;
     #[test]
     fn a_branch_without_a_remote_still_pulls_from_origin() {
         let (_tmp, repo) = temp_repo();
@@ -1497,6 +1853,7 @@ mod pull_arg_tests {
             remote: None,
             branch: Some("feat/x".into()),
             strategy: PullStrategy::FastForwardOnly,
+            ..Default::default()
         };
         let out = pull(&repo, &opts).unwrap();
         let argv = out.result.args.join(" ");
@@ -1517,12 +1874,518 @@ mod pull_arg_tests {
             remote: Some("upstream".into()),
             branch: Some("main".into()),
             strategy: PullStrategy::Rebase,
+            ..Default::default()
         };
         let out = pull(&repo, &opts).unwrap();
         assert!(
             out.result.stderr.contains("'upstream'") || !out.result.stderr.contains("'main' does not appear"),
             "an explicit remote must be used as given: {}",
             out.result.stderr
+        );
+    }
+
+    /// `--autostash` has to reach git, not stop at ro's own dirty-skip.
+    ///
+    /// The run-level test in `ro-sync` asserts the outcome; this one asserts
+    /// the **wiring**, which is the part that was broken. It reads the
+    /// arguments git was handed rather than the exit code, because a pull
+    /// that never stashed anything exits 0 in exactly the same way.
+    ///
+    /// No network and no remote: the assertion is about the argv, and a repo
+    /// with no `origin` cannot pull from one either way.
+    #[test]
+    fn autostash_is_passed_to_git() {
+        let (_tmp, repo) = temp_repo();
+        let opts = PullOpts {
+            remote: None,
+            branch: Some("feat/x".into()),
+            strategy: PullStrategy::FastForwardOnly,
+            autostash: true,
+        };
+        let out = pull(&repo, &opts).unwrap();
+        let argv = out.result.args.join(" ");
+        assert!(
+            out.result.args.iter().any(|a| a == "--autostash"),
+            "--autostash never reached git, so git refused the merge instead of \
+             stashing: {argv}"
+        );
+        // And it is still a well-formed pull, not a flag bolted onto a broken
+        // argument list.
+        assert_eq!(out.result.args[0], "pull");
+        assert!(
+            out.result.args.iter().any(|a| a == "--ff-only"),
+            "the strategy flag must survive alongside --autostash: {argv}"
+        );
+    }
+
+    /// A pull that did not ask for an autostash must not be judged by the
+    /// tree either — the exit code is the whole story there.
+    ///
+    /// Without this, a caller that sets `autostash: true` once would have
+    /// every subsequent pull read the worktree, and a stale stash from
+    /// someone else's work would be reported as a leaked autostash.
+    #[test]
+    fn a_pull_without_autostash_is_not_judged_by_the_tree() {
+        let (_tmp, repo) = temp_repo();
+        let opts = PullOpts {
+            remote: None,
+            branch: Some("feat/x".into()),
+            strategy: PullStrategy::FastForwardOnly,
+            autostash: false,
+        };
+        let out = pull(&repo, &opts).unwrap();
+        assert!(
+            out.autostash_hold.is_none(),
+            "a pull that did not autostash must not report a hold: {:?}",
+            out.autostash_hold
+        );
+    }
+
+    /// The conflict the flag exists for, detected from the tree.
+    ///
+    /// `git pull --autostash` exits 0 even when the pop conflicts, so the
+    /// exit code cannot be the signal. This is the smallest real case: both
+    /// sides rewrite the same line of a tracked file, the pull fast-forwards,
+    /// the pop conflicts, and the tree is left holding conflict markers
+    /// with the work still in the stash.
+    #[test]
+    fn a_conflicting_autostash_pop_is_detected_from_the_tree_not_the_exit_code() {
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+
+        // A seed clone that publishes the base commit. `clone` already sets
+        // `origin`, so there is no `remote add` here — adding one fails, the
+        // failure is silent without `run_git`, and the push that follows
+        // then goes nowhere, leaving the remote empty and the whole fixture
+        // testing a different scenario than the one named.
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&seed, &["config", "user.email", "t@example.com"]);
+        run_git(&seed, &["config", "user.name", "T"]);
+        run_git(&seed, &["config", "commit.gpgSign", "false"]);
+        std::fs::write(seed.join("a.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-q", "-m", "base"]);
+        run_git(&seed, &["push", "-q", "origin", "main"]);
+
+        // The worktree, going dirty on the same line the remote will move.
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        run_git(&work, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&work, &["config", "user.email", "t@example.com"]);
+        run_git(&work, &["config", "user.name", "T"]);
+        std::fs::write(work.join("a.txt"), "LOCAL WORK\n").unwrap();
+
+        // The remote moves, rewriting that exact line.
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        run_git(&other, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&other, &["config", "user.email", "t@example.com"]);
+        run_git(&other, &["config", "user.name", "T"]);
+        std::fs::write(other.join("a.txt"), "REMOTE WON\n").unwrap();
+        run_git(&other, &["add", "."]);
+        run_git(&other, &["commit", "-q", "-m", "remote moved"]);
+        run_git(&other, &["push", "-q", "origin", "main"]);
+
+        let opts = PullOpts {
+            remote: Some("origin".into()),
+            branch: Some("main".into()),
+            strategy: PullStrategy::FastForwardOnly,
+            autostash: true,
+        };
+        let out = pull(&work, &opts).unwrap();
+
+        // The exit code lies, so this is the assertion that matters.
+        assert!(
+            out.result.ok(),
+            "git exits 0 even when the pop conflicts — that is why the tree \
+             has to be read: {}",
+            out.result.stderr
+        );
+        assert!(
+            out.autostash_hold.is_some(),
+            "a pop that conflicted must be reported as a hold, not a success: {:?}",
+            out.autostash_hold
+        );
+        let detail = out.autostash_hold.clone().expect("a hold is reported");
+        assert!(
+            detail.contains("git stash list"),
+            "the recovery must name `git stash list`: {detail}"
+        );
+
+        // Asserted on the tree, not on the message.
+        let status = run_git_out(&work, &["status", "--porcelain"]);
+        let porcelain = status.stdout.clone();
+        assert!(
+            porcelain.contains("UU"),
+            "the worktree must show the unmerged entry: {porcelain}"
+        );
+        let content = std::fs::read_to_string(work.join("a.txt")).unwrap();
+        assert!(
+            content.contains("<<<<<<<") && content.contains(">>>>>>>"),
+            "the worktree must hold conflict markers: {content}"
+        );
+        let stashes = run_git_out(&work, &["stash", "list"]);
+        assert!(
+            stashes.stdout.contains("autostash"),
+            "the failed pop must keep the stash: {}",
+            stashes.stdout
+        );
+    }
+
+    /// The other half, so the assertion above is not self-deceiving.
+    ///
+    /// A pop that applies cleanly leaves no unmerged entry and no stash, and
+    /// the local work is back on top of the remote's version. Without this,
+    /// the detection above could be reporting a hold on every autostash and
+    /// still pass.
+    #[test]
+    fn a_clean_autostash_pop_is_not_reported_as_a_hold() {
+        let tmp = TempDir::new().unwrap();
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&seed, &["config", "user.email", "t@example.com"]);
+        run_git(&seed, &["config", "user.name", "T"]);
+        run_git(&seed, &["config", "commit.gpgSign", "false"]);
+        std::fs::write(seed.join("a.txt"), "base\n").unwrap();
+        std::fs::write(seed.join("b.txt"), "base b\n").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-q", "-m", "base"]);
+        run_git(&seed, &["push", "-q", "origin", "main"]);
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        run_git(&work, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&work, &["config", "user.email", "t@example.com"]);
+        run_git(&work, &["config", "user.name", "T"]);
+        // Dirty a *different* file than the remote is about to move, so the
+        // pop has nothing to conflict with.
+        std::fs::write(work.join("b.txt"), "LOCAL WORK\n").unwrap();
+
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        run_git(&other, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&other, &["config", "user.email", "t@example.com"]);
+        run_git(&other, &["config", "user.name", "T"]);
+        std::fs::write(other.join("a.txt"), "REMOTE WON\n").unwrap();
+        run_git(&other, &["add", "."]);
+        run_git(&other, &["commit", "-q", "-m", "remote moved"]);
+        run_git(&other, &["push", "-q", "origin", "main"]);
+
+        let opts = PullOpts {
+            remote: Some("origin".into()),
+            branch: Some("main".into()),
+            strategy: PullStrategy::FastForwardOnly,
+            autostash: true,
+        };
+        let out = pull(&work, &opts).unwrap();
+
+        assert!(
+            out.autostash_hold.is_none(),
+            "a clean pop must not be reported as a hold: {:?}",
+            out.autostash_hold
+        );
+        // The local work is back, on top of the remote's version.
+        assert_eq!(
+            std::fs::read_to_string(work.join("b.txt")).unwrap(),
+            "LOCAL WORK\n",
+            "the local edit must survive the stash/pop"
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("a.txt")).unwrap(),
+            "REMOTE WON\n",
+            "the remote's version must have landed"
+        );
+        let stashes = run_git_out(&work, &["stash", "list"]);
+        assert!(
+            stashes.stdout.is_empty(),
+            "a clean pop must leave no stash behind: {}",
+            stashes.stdout
+        );
+    }
+
+    /// The fixture the two tests below share: a worktree whose uncommitted
+    /// edit sits on the exact line the remote is about to rewrite, so the
+    /// pop after the fast-forward cannot apply cleanly.
+    ///
+    /// Returned *before* any pull, because that is the moment the two tests
+    /// part ways — one pulls first, the other makes a stash first.
+    fn worktree_about_to_conflict(tmp: &TempDir) -> PathBuf {
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir_all(&remote).unwrap();
+        run_git(&remote, &["init", "--bare", "-q", "-b", "main"]);
+
+        let seed = tmp.path().join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        run_git(&seed, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&seed, &["config", "user.email", "t@example.com"]);
+        run_git(&seed, &["config", "user.name", "T"]);
+        std::fs::write(seed.join("a.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "."]);
+        run_git(&seed, &["commit", "-q", "-m", "base"]);
+        run_git(&seed, &["push", "-q", "origin", "main"]);
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        run_git(&work, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&work, &["config", "user.email", "t@example.com"]);
+        run_git(&work, &["config", "user.name", "T"]);
+        std::fs::write(work.join("a.txt"), "LOCAL WORK\n").unwrap();
+
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        run_git(&other, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        run_git(&other, &["config", "user.email", "t@example.com"]);
+        run_git(&other, &["config", "user.name", "T"]);
+        std::fs::write(other.join("a.txt"), "REMOTE WON\n").unwrap();
+        run_git(&other, &["add", "."]);
+        run_git(&other, &["commit", "-q", "-m", "remote moved"]);
+        run_git(&other, &["push", "-q", "origin", "main"]);
+
+        work
+    }
+
+    fn autostash_pull() -> PullOpts {
+        PullOpts {
+            remote: Some("origin".into()),
+            branch: Some("main".into()),
+            strategy: PullStrategy::FastForwardOnly,
+            autostash: true,
+        }
+    }
+
+    /// A stash left behind by an *earlier* pull must not condemn every later
+    /// pull. This is the wedge.
+    ///
+    /// The sequence is the one a user actually lives through:
+    ///
+    ///   1. `ro sync --autostash` conflicts, and the work stays in
+    ///      `stash@{0}` — correctly, because that stash is the only route
+    ///      back to it.
+    ///   2. The user resolves the conflict markers and commits the
+    ///      resolution. **The stash is still there**; it is their work, and
+    ///      nothing has any business deleting it.
+    ///   3. `ro sync --autostash` runs again. The tree is clean, the pull is
+    ///      "Already up to date", git stashes nothing and pops nothing.
+    ///
+    /// A detector that asks "does any line of `git stash list` contain the
+    /// word `autostash`" answers "yes" at step 3, on the strength of the
+    /// stash created at step 1 — so every sync from then on is a red
+    /// `autostash_conflict` over a perfectly healthy repo, and the only way
+    /// out is for the user to go and drop a stash by hand. The tool that was
+    /// supposed to surface the problem is now the problem.
+    ///
+    /// The final pull exists so this cannot be "fixed" by reporting a hold
+    /// unconditionally: after the user drops the stash, the repo must be
+    /// clean and stay clean.
+    #[test]
+    fn a_stash_from_an_earlier_pull_does_not_wedge_every_later_pull() {
+        let tmp = TempDir::new().unwrap();
+        let work = worktree_about_to_conflict(&tmp);
+
+        // 1. The conflict, reported once.
+        let first = pull(&work, &autostash_pull()).unwrap();
+        assert!(
+            first.autostash_hold.is_some(),
+            "the pop conflicts here, so this pull must report it: {:?}",
+            first.autostash_hold
+        );
+        let held = run_git_out(&work, &["stash", "list", "--format=%H"]);
+        assert_eq!(
+            held.stdout.lines().count(),
+            1,
+            "a failed pop keeps exactly one stash, and it is the user's only \
+             route back to their work: {:?}",
+            held.stdout
+        );
+
+        // 2. The user resolves the markers and commits. The stash stays.
+        run_git(&work, &["checkout", "--theirs", "a.txt"]);
+        run_git(&work, &["add", "a.txt"]);
+        run_git(&work, &["commit", "-q", "-m", "resolved: keep the local work"]);
+        let still_there = run_git_out(&work, &["stash", "list", "--format=%H"]);
+        assert_eq!(
+            still_there.stdout.lines().count(),
+            1,
+            "resolving the conflict must not silently drop the user's work: {:?}",
+            still_there.stdout
+        );
+
+        // 3. The next sync. This pull stashes nothing and pops nothing, so
+        //    the stash from step 1 is not its stash and must not be blamed
+        //    on it.
+        let second = pull(&work, &autostash_pull()).unwrap();
+        assert!(
+            second.result.ok(),
+            "the tree is clean and the pull is a no-op, so git succeeds: {}",
+            second.result.stderr
+        );
+        assert!(
+            second.autostash_hold.is_none(),
+            "a leftover autostash from an EARLIER pull must not be reported as \
+             this pull's — that wedges the repo forever, with no way out short \
+             of dropping the stash by hand. This pull stashed nothing and \
+             popped nothing; got {:?}",
+            second.autostash_hold
+        );
+        assert!(!second.conflict, "and nothing is in conflict: {second:?}");
+
+        // The user drops the stash, and the repo is clean from then on.
+        run_git(&work, &["stash", "drop"]);
+        let third = pull(&work, &autostash_pull()).unwrap();
+        assert!(
+            third.autostash_hold.is_none(),
+            "a repo with no stashes at all must never report a hold: {:?}",
+            third.autostash_hold
+        );
+    }
+
+    /// A stash the *user* made is not this pull's stash, whatever the user
+    /// called it.
+    ///
+    /// `git stash push -m "autostash: before the rewrite"` is an ordinary
+    /// thing for a person to write — the word is in the flag, after all. A
+    /// detector that substring-matches the stash list cannot tell that stash
+    /// from one git created, so it invents a conflict on a pull that
+    /// fast-forwarded perfectly and stashed nothing.
+    ///
+    /// This is the second half of the same defect as the wedge above, and it
+    /// is the reason the discriminator cannot be a message match: the only
+    /// thing that distinguishes the two stashes is *when they appeared*.
+    #[test]
+    fn a_stash_the_user_made_is_not_reported_as_this_pulls() {
+        let tmp = TempDir::new().unwrap();
+        let work = worktree_about_to_conflict(&tmp);
+
+        // The user's own stash, made by hand, before the pull.
+        run_git(
+            &work,
+            &["stash", "push", "-m", "autostash of the report rewrite"],
+        );
+        let before = run_git_out(&work, &["stash", "list", "--format=%H"]);
+        assert_eq!(
+            before.stdout.lines().count(),
+            1,
+            "the fixture must have exactly the user's stash: {:?}",
+            before.stdout
+        );
+
+        let out = pull(&work, &autostash_pull()).unwrap();
+
+        assert!(
+            out.result.ok(),
+            "the tree is clean, so this is an ordinary fast-forward: {}",
+            out.result.stderr
+        );
+        // The remote's work landed, and the user's stash is untouched: this
+        // is a clean sync.
+        assert_eq!(
+            std::fs::read_to_string(work.join("a.txt")).unwrap(),
+            "REMOTE WON\n",
+            "the fast-forward must have landed"
+        );
+        assert!(
+            out.autostash_hold.is_none(),
+            "a stash the user made is not this pull's stash, and its message \
+             saying 'autostash' changes nothing: {:?}",
+            out.autostash_hold
+        );
+        let after = run_git_out(&work, &["stash", "list", "--format=%H"]);
+        assert_eq!(
+            after.stdout, before.stdout,
+            "the user's stash must be left exactly as it was"
+        );
+    }
+
+    /// A before-snapshot that could not be read is not a before-snapshot
+    /// with nothing in it.
+    ///
+    /// "We could not read the list before the pull" and "the list was empty
+    /// before the pull" lead to opposite verdicts, and the difference is the
+    /// user's work: with the first, an entry present afterwards might be
+    /// theirs, so this pull cannot be said to have popped cleanly. Calling
+    /// that clean is the whole lie this function exists to stop.
+    ///
+    /// The empty-list case is included because it is the one place the
+    /// unknown is genuinely good news: nothing is stashed now, so nothing
+    /// could have been left behind, whatever we could not read before.
+    #[test]
+    fn a_before_snapshot_that_cannot_be_read_is_not_treated_as_empty() {
+        let tmp = TempDir::new().unwrap();
+        let work = worktree_about_to_conflict(&tmp);
+        run_git(&work, &["stash", "push", "-m", "the user's own work"]);
+
+        assert!(
+            matches!(autostash_state(&work, None), AutostashState::Unreadable),
+            "with no before-snapshot and an entry in the list, nothing can be \
+             shown to be older than this pull, so the pop cannot be called clean"
+        );
+        assert!(
+            matches!(autostash_state(&work, None), AutostashState::Unreadable),
+            "and it is not a hold either: the message has to say which"
+        );
+
+        // With nothing stashed at all, the unknown stops mattering: there is
+        // no work in a stash, so there is nothing to have failed to pop.
+        run_git(&work, &["stash", "drop"]);
+        assert!(
+            matches!(autostash_state(&work, None), AutostashState::Popped),
+            "an empty list after the pull is evidence, not an absence of it"
+        );
+    }
+
+    /// "Cannot read the stash list" and "there are no stashes" are different
+    /// answers, and only the second one is good news.
+    ///
+    /// `git stash list` exits 128 outside a repository, so the unreadable
+    /// case is reachable in ordinary use — a tracked repo whose checkout was
+    /// replaced, a `.git` removed out from under ro — rather than only in a
+    /// corrupt repo. A caller that folded the two together would be claiming
+    /// a clean pop on the strength of a command that never ran, which is the
+    /// exact failure this whole code path exists to prevent, one level down.
+    #[test]
+    fn an_unreadable_stash_list_is_not_an_empty_one() {
+        let tmp = TempDir::new().unwrap();
+        let not_a_repo = tmp.path().join("plain-directory");
+        std::fs::create_dir_all(&not_a_repo).unwrap();
+
+        // Pin the premise: this really is the unreadable case, not an
+        // assumption about which git version does what.
+        let raw = std::process::Command::new("git")
+            .args(["stash", "list", "--format=%H"])
+            .current_dir(&not_a_repo)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            !raw.status.success(),
+            "the fixture must be a directory git cannot answer for: {}",
+            String::from_utf8_lossy(&raw.stderr)
+        );
+
+        assert!(
+            stash_snapshot(&not_a_repo).is_none(),
+            "an unreadable stash list must be reported as unknown, not as an \
+             empty one — an empty one says 'nothing is stashed', which is a \
+             claim about the user's work that was never checked"
+        );
+        // And the empty case is a real `Some(vec![])`, so the two are
+        // genuinely distinguishable at the call site.
+        let (_tmp, repo) = temp_repo();
+        run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
+        assert_eq!(
+            stash_snapshot(&repo),
+            Some(Vec::new()),
+            "a real repository with no stashes is 'known to be empty', which \
+             is not the same answer as 'could not be read'"
         );
     }
 }

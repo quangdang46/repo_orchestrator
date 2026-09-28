@@ -6,13 +6,22 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 /// Default denylist glob patterns.
 ///
 /// These paths are never staged, committed, or touched by AI agents.
+///
+/// The four credential entries carry a `**/` prefix so they match at **any**
+/// depth below the repo root, not just as the exact repo-relative path. They
+/// used to be depth-less (`.env`, `id_rsa`, …), which meant `cfgdir/.env` and
+/// `a/b/c/.env` were staged, committed and pushed while the sibling
+/// `**/target/**` patterns correctly blocked at any depth — an omission that
+/// reads as deliberate because the three patterns beside them were not
+/// omitted. FEATURES.md promises these are "never committed" without
+/// qualifying depth, so the code now matches the promise.
 pub const DEFAULT_DENYLIST: &[&str] = &[
-    ".env",
-    ".env.*",
+    "**/.env",
+    "**/.env.*",
     "*.pem",
     "*.key",
-    "id_rsa",
-    "id_ed25519",
+    "**/id_rsa",
+    "**/id_ed25519",
     "**/.git/**",
     "**/target/**",
     "**/node_modules/**",
@@ -93,6 +102,27 @@ mod tests {
         assert!(d.is_denied("tls.key"));
         assert!(d.is_denied("id_rsa"));
         assert!(d.is_denied("id_ed25519"));
+    }
+
+    /// A `.env` at any depth below the repo root is denied, not only the
+    /// one sitting at the root. The four depth-less entries used to match
+    /// only the exact repo-relative path, so `cfgdir/.env` and `a/b/c/.env`
+    /// were committed and pushed while the sibling `*.pem` / `**/target/**`
+    /// patterns blocked at any depth — which made the omission look
+    /// deliberate when it was not.
+    #[test]
+    fn denies_env_and_keys_at_any_depth() {
+        let d = Denylist::new_default().unwrap();
+        for p in [
+            "sub/.env",
+            "sub/.env.local",
+            "a/b/c/.env",
+            "a/b/c/.env.production",
+            "sub/id_rsa",
+            "sub/id_ed25519",
+        ] {
+            assert!(d.is_denied(p), "{p} must be denied at any depth");
+        }
     }
 
     #[test]
