@@ -350,8 +350,18 @@ impl Engine for AgentEngine {
         }
 
         let mut commits = Vec::new();
+        // The engine set the author on the *child's* environment. ro commits
+        // some of this work itself, and a per-invocation `-c` has to be
+        // re-asserted here: the agent may have run `git config user.email
+        // something-else` in between, and that write persists in
+        // `.git/config` for every commit after it.
+        let author = ctx
+            .identity
+            .as_ref()
+            .map(|i| (i.name.as_str(), i.email.as_str()));
         for subject in subjects {
-            let oid = match ro_git::primitives::commit_all(ctx.repo_root, &subject) {
+            let oid =
+                match ro_git::primitives::commit_all_as(ctx.repo_root, &subject, author) {
                 Ok(oid) => oid,
                 Err(e) => {
                     return EngineOutcome::Failed {

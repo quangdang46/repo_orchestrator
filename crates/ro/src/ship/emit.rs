@@ -135,25 +135,9 @@ pub fn plan_for(
     }
 
     let identity = match author_ref.as_deref() {
-        Some(name) => {
-            let p = profiles.resolve(name).ok_or_else(|| {
-                let known = profiles.names();
-                anyhow::anyhow!(
-                    "repo {}/{}: author_ref = {name:?} is not a profile in [identity.*]\n  {}",
-                    repo.owner,
-                    repo.name,
-                    if known.is_empty() {
-                        "no profiles are defined".to_string()
-                    } else {
-                        format!("known profiles: {}", known.join(", "))
-                    }
-                )
-            })?;
-            Some(ro_core::CommitIdentity {
-                name: p.name,
-                email: p.email,
-            })
-        }
+        Some(name) => Some(profiles.resolve(name).map_err(|why| {
+            anyhow::anyhow!("repo {}/{}: author_ref = {name:?}\n  {why}", repo.owner, repo.name)
+        })?),
         None => global_identity.cloned(),
     };
 

@@ -513,69 +513,6 @@ fn resolve_paths(cli: &Cli) -> Result<ConfigPaths> {
     }
 }
 
-/// What `ro add` did about the per-repo config file.
-///
-/// Three outcomes, not two. "Nothing was passed" and "a file is already
-/// there" both mean *no write happened*, but they are different facts and
-/// collapsing them made the command report `already existed` for a file it
-/// had just decided not to create.
-enum Seeded {
-    Written,
-    /// The file was there. Never overwritten — it may have been edited.
-    AlreadyThere,
-    /// No `--author`/`--credential`/`--engine` was passed, so there is
-    /// nothing to seed. An empty file is noise.
-    NothingToSeed,
-}
-
-/// Write `.ro/config.local.toml` from the settings `ro add` was given.
-///
-/// Only the keys that were **actually passed** are written. A file that
-/// mirrors every column of the row would be a second copy of the registry
-/// that drifts on the first `ro config set`, and the whole reason this file
-/// exists is that it is the layer for the cases the registry cannot cover —
-/// a deliberate short list of overrides, not a mirror.
-fn seed_local_config(
-    repo_root: &std::path::Path,
-    opts: &ro_sync::manage::AddOptions,
-) -> anyhow::Result<Seeded> {
-    let path = ro_config::local::RepoLocalConfig::path_in(repo_root);
-    if path.exists() {
-        return Ok(Seeded::AlreadyThere);
-    }
-
-    let cfg = ro_config::local::RepoLocalConfig {
-        author: opts.author_ref.clone(),
-        // Validated even though it is stored as the raw string, so a pasted
-        // `ghp_…` fails at `ro add` instead of sitting in a gitignored
-        // file that looks configured. `ghp_…` never becomes a
-        // `CredentialRef`, which is the whole point of parsing here.
-        credential: match &opts.credential_ref {
-            Some(s) => {
-                s.parse::<ro_core::CredentialRef>().map_err(|_| {
-                    anyhow::anyhow!("credential {s:?} is not a reference — use env:VAR or keychain:ENTRY")
-                })?;
-                Some(s.clone())
-            }
-            None => None,
-        },
-        engine: opts.engine.clone(),
-        engine_args: None,
-    };
-    if cfg.is_empty() {
-        return Ok(Seeded::NothingToSeed);
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    let body = toml::to_string_pretty(&cfg)?;
-    std::fs::write(&path, format!("# ro per-repo settings.\n# Gitignored, and outranks the registry row.\n{body}"))
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(Seeded::Written)
-}
-
 fn main() {
     if let Err(err) = run() {
         // A fatal is its own code. Exiting 1 here reported a config file
@@ -836,30 +773,27 @@ fn run() -> Result<()> {
             eprintln!("Added: {}/{} (id={})", repo.owner, repo.name, repo.id);
             eprintln!("  path: {}", repo.local_path);
 
-            // Seed `.ro/config.local.toml` and make sure `.ro/` is ignored,
-            // but only when there is a working copy on disk to seed. A
-            // `--clone-to` that has not been fetched yet has nothing to
-            // write into, and the row already carries the settings, so
-            // this is a convenience rather than a step that must happen.
+            // `ro add` records the row and nothing else. An earlier
+            // revision also wrote `.ro/config.local.toml` from the flags,
+            // which was wrong twice over: it made the file a second copy of
+            // columns the registry already holds — the drift this tool is
+            // built to avoid — and it left a `.gitignore` behind, so the
+            // repo read as dirty the moment it was enrolled. The first
+            // thing anyone does after adding a repo is run `ro status`.
+            //
+            // The file is still read, and still outranks the row. It is for
+            // the cases the registry cannot cover: a repo that is not in
+            // the registry at all, and settings that must travel with the
+            // code to another machine. Both want a file someone wrote on
+            // purpose, not one ro manufactured from a row that already
+            // says the same thing.
             let local_path = std::path::PathBuf::from(&repo.local_path);
-            if local_path.join(".git").exists() {
-                match seed_local_config(&local_path, &opts) {
-                    Ok(Seeded::Written) => {
-                        eprintln!("  wrote {}", ro_config::local::LOCAL_REL);
-                        ignore_local_config(&local_path);
-                    }
-                    Ok(Seeded::AlreadyThere) => {
-                        eprintln!("  {} left as-is", ro_config::local::LOCAL_REL);
-                        // The file is there but the repo may never have had
-                        // the ignore line, and that is a real state worth
-                        // fixing. Unlike the "wrote it ourselves" case, this
-                        // one is about a repo the user may have set up by
-                        // hand.
-                        ignore_local_config(&local_path);
-                    }
-                    Ok(Seeded::NothingToSeed) => {}
-                    Err(e) => eprintln!("  warning: could not seed per-repo config: {e:#}"),
-                }
+            if ro_config::local::RepoLocalConfig::path_in(&local_path).exists() {
+                // A file is already here. Say so, and make sure it is
+                // ignored — this is the one case where editing the repo's
+                // `.gitignore` is right, because the file is the user's.
+                eprintln!("  {} already present", ro_config::local::LOCAL_REL);
+                ignore_local_config(&local_path);
             }
         }
 
@@ -997,10 +931,12 @@ fn run() -> Result<()> {
             // there is nothing wrong with asking for everything when there
             // is nothing.
             let selected: Vec<String> = if repos.is_empty() {
-                // `--all` and a filter go through the **same resolver** the
-                // fleet verbs use, so "which repos does that name mean" has
-                // one answer in this tool rather than one per verb.
-                if all || filter.is_some() {
+                // No name and no pattern: the whole registry. `--all` is the
+                // same thing said out loud, for scripts, and a filter narrows
+                // it. The fleet verbs already default this way; `sync` did
+                // not, so the same argument list meant two different sets of
+                // repos depending on which verb it was.
+                if all || filter.is_some() || tag.is_some() || include_archived {
                     let targets = ro_sync::targets::resolve_targets(
                         &conn,
                         None,

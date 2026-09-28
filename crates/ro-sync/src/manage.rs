@@ -237,9 +237,9 @@ pub fn classify_add_input(input: &str) -> Result<AddSource> {
     //    user is standing right in front of it.
     let path = std::path::Path::new(value);
     if path.join(".git").exists() {
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("resolving local path: {}", path.display()))?;
+        let canonical = strip_verbatim(path.canonicalize().with_context(|| {
+            format!("resolving local path: {}", path.display())
+        })?);
         let name = canonical
             .file_name()
             .and_then(|n| n.to_str())
@@ -638,6 +638,32 @@ pub fn set_repo_config(conn: &Connection, repo: &str, config_key: &str, value: &
 
 /// Find a repo by `owner/name`, alias, or raw id.
 /// Owner/name lookups are case-insensitive (GitHub convention).
+/// Windows `canonicalize` returns the verbatim (`\\?\`) form, which is what
+/// the Win32 API wants and what a person does not.
+///
+/// Every path this tool stores or prints went through `canonicalize`, so
+/// `ro list` showed `\\?\C:\Users\...` and a repo added today looked like a
+/// different repo from one added before the change — the prefix was part of
+/// the stored string. Stripping it at the one place the path is produced
+/// fixes both, and the form git and the user both use is the one that gets
+/// stored.
+///
+/// `\\?\UNC\server\share` becomes `\\server\share`; the UNC form keeps its
+/// double leading backslash, which is what it is.
+fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    p
+}
+
 pub fn find_repo(conn: &Connection, key: &str) -> Result<TrackedRepo> {
     // Try owner/name
     let parts: Vec<&str> = key.splitn(2, '/').collect();
@@ -1071,8 +1097,11 @@ mod tests {
         match classify_add_input(checkout.to_str().unwrap()).unwrap() {
             AddSource::Local { path, owner, name } => {
                 // Canonicalised, so the stored path compares equal to whatever
-                // the orphan walker produces later.
-                assert_eq!(path, checkout.canonicalize().unwrap());
+                // the orphan walker produces later — and with the Win32
+                // verbatim prefix stripped, because the walker produces the
+                // plain form. Storing the prefixed one made a repo added
+                // today a different string from the same repo added earlier.
+                assert_eq!(path, strip_verbatim(checkout.canonicalize().unwrap()));
                 assert_eq!(owner, "acme");
                 assert_eq!(name, "api");
             }
@@ -1347,5 +1376,47 @@ mod tests {
         let added = add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
         let found = find_repo(&conn, &added.id).unwrap();
         assert_eq!(found.name, "proj1");
+    }
+}
+
+#[cfg(test)]
+mod verbatim_tests {
+    use super::strip_verbatim;
+    use std::path::PathBuf;
+
+    /// The prefix is a Win32 implementation detail, and it was ending up in
+    /// the stored `local_path` and in every line `ro list` printed. A repo
+    /// added before the fix and one added after it were different strings for
+    /// the same directory.
+    #[test]
+    #[cfg(windows)]
+    fn the_verbatim_prefix_is_stripped_and_unc_keeps_its_slashes() {
+        assert_eq!(
+            strip_verbatim(PathBuf::from("\\\\?\\C:\\work\\api")),
+            PathBuf::from("C:\\work\\api")
+        );
+        assert_eq!(
+            strip_verbatim(PathBuf::from("\\\\?\\UNC\\server\\share\\api")),
+            PathBuf::from("\\\\server\\share\\api")
+        );
+    }
+
+    /// A path that is already in normal form is returned untouched, so this
+    /// cannot mangle a repo whose path genuinely starts with those
+    /// characters.
+    #[test]
+    #[cfg(windows)]
+    fn an_ordinary_path_is_unchanged() {
+        for p in ["C:\\work\\api", "\\\\server\\share\\api", "D:\\a b\\c"] {
+            assert_eq!(strip_verbatim(PathBuf::from(p)), PathBuf::from(p));
+        }
+    }
+
+    /// And on Unix it is the identity, because there is nothing to strip.
+    #[test]
+    #[cfg(not(windows))]
+    fn unix_paths_are_untouched() {
+        let p = std::path::PathBuf::from("/home/dev/api");
+        assert_eq!(strip_verbatim(p.clone()), p);
     }
 }

@@ -110,6 +110,15 @@ pub fn run_verb(
         pattern.map(str::to_string)
     };
 
+    // No argument at all means the whole registry. That is the daily
+    // invocation — it is the command that replaces `cd repo-a && ro ship`
+    // in a loop, and a tool that makes you add a flag to say "everything"
+    // does not replace the loop, it renames it.
+    //
+    // `--all` says the same thing out loud, for scripts. A name, a pattern
+    // and a filter are all narrower, so any of them turns this off.
+    let all = all || (named.is_empty() && pattern.is_none() && filter.is_none());
+
     let targets = match ro_sync::targets::resolve_targets(
         &conn,
         selection.as_deref(),
@@ -148,11 +157,16 @@ pub fn run_verb(
     // carried an `[agent]` table nobody read, so `ro config set` of an
     // author was a no-op and every commit fell through to git's own
     // config — the per-repo author feature was advertised and inert.
-    let global_identity: Option<ro_core::CommitIdentity> =
-        config.identity.fallback().map(|p| ro_core::CommitIdentity {
-            name: p.name,
-            email: p.email,
-        });
+    let global_identity: Option<ro_core::CommitIdentity> = match config.identity.fallback() {
+        Ok(v) => v,
+        Err(why) => {
+            // A `default` naming a profile that does not exist, or one that
+            // is half-written, would otherwise be papered over — and then
+            // every repo in the fleet commits under some other identity.
+            eprintln!("error: [identity] default: {why}");
+            std::process::exit(crate::exit::EX_USAGE as i32);
+        }
+    };
     let mut plans = Vec::with_capacity(targets.len());
     for t in &targets {
         match ro_sync::manage::find_repo(&conn, &t.repo_id) {

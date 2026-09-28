@@ -110,7 +110,16 @@ impl Engine for GitEngine {
         }
         // NB: staging failed is a dirty-tree problem the caller can clear.
 
-        let oid = match ro_git::primitives::commit_all(root, &message) {
+        // The author has to be applied here too, not only on the agent
+        // engines' child environment. `git` is the engine that is always
+        // available — no external binary to install — so it is the one a new
+        // user actually runs first, and it was the one quietly committing as
+        // whatever `.git/config` happened to say.
+        let author = ctx
+            .identity
+            .as_ref()
+            .map(|i| (i.name.as_str(), i.email.as_str()));
+        let oid = match ro_git::primitives::commit_all_as(root, &message, author) {
             Ok(oid) => oid,
             Err(e) => {
                 let text = format!("{e:#}");

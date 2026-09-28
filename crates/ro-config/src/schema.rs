@@ -262,8 +262,8 @@ pub struct IdentityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitIdentityConfig {
-    pub name: String,
-    pub email: String,
+    pub name: Option<String>,
+    pub email: Option<String>,
 }
 
 impl IdentityConfig {
@@ -274,17 +274,73 @@ impl IdentityConfig {
     /// did before — produces a commit attributed to `work@localhost` and
     /// calls it success, which is worse than refusing: the commit is real,
     /// the author is wrong, and nothing reports it.
-    pub fn resolve(&self, name: &str) -> Option<CommitIdentityConfig> {
-        self.profiles.get(name).cloned()
+    ///
+    /// Both halves of that hold for a profile that *exists but is
+    /// incomplete*, which is why both fields are `Option` and the check
+    /// lives here rather than in serde. With required fields, a profile
+    /// could not be built a key at a time: `ro config set
+    /// identity.work.name=…` produced a `[identity.work]` table with one
+    /// key, the whole file then failed to parse with `missing field
+    /// email`, and the tool that exists so a config can be written without
+    /// an editor could not write one. An incomplete profile is now a
+    /// well-formed config that names what it is missing.
+    pub fn resolve(&self, name: &str) -> Result<ro_core::CommitIdentity, String> {
+        let p = self.profiles.get(name).ok_or_else(|| {
+            // The name that failed goes in the message too. A caller can
+            // add context, but a bare `known profiles: work, personal`
+            // leaves the reader to work out which of the several things
+            // named on the command line was the wrong one.
+            let known = self.names();
+            if known.is_empty() {
+                format!("no [identity.*] profile named {name:?} is defined")
+            } else {
+                format!("no [identity.*] profile named {name:?}; known: {}", known.join(", "))
+            }
+        })?;
+
+        let mut missing: Vec<&str> = Vec::new();
+        if p.name.as_deref().unwrap_or_default().trim().is_empty() {
+            missing.push("name");
+        }
+        if p.email.as_deref().unwrap_or_default().trim().is_empty() {
+            missing.push("email");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "[identity.{name}] is missing {}",
+                missing.join(" and ")
+            ));
+        }
+
+        Ok(ro_core::CommitIdentity {
+            name: p.name.clone().unwrap_or_default(),
+            email: p.email.clone().unwrap_or_default(),
+        })
     }
 
     /// The profile a repo with no explicit `author_ref` gets.
-    pub fn fallback(&self) -> Option<CommitIdentityConfig> {
+    ///
+    /// Returns `Err` rather than silently falling back: a `default` that
+    /// names a missing or half-written profile is a configuration mistake,
+    /// and committing every repo under some other identity is what happens
+    /// if that is papered over.
+    pub fn fallback(&self) -> Result<Option<ro_core::CommitIdentity>, String> {
         if let Some(d) = &self.default {
-            return self.resolve(d);
+            // Say the *default* is the problem. `resolve`'s own message
+            // names a profile that is missing, but here the thing the user
+            // wrote is `default = "..."`, and blaming the profile they did
+            // not name sends them to edit the wrong line.
+            return self
+                .resolve(d)
+                .map(Some)
+                .map_err(|why| format!("`default` names {d:?}, and {why}"));
         }
         // One profile needs no `default` key. More than one is ambiguous.
-        (self.profiles.len() == 1).then(|| self.profiles.values().next().cloned()).flatten()
+        if self.profiles.len() == 1 {
+            let only = self.profiles.keys().next().expect("len is 1");
+            return self.resolve(only).map(Some);
+        }
+        Ok(None)
     }
 
     /// Every profile name, for error messages that have to say what *is*

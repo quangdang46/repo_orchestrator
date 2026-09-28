@@ -304,6 +304,31 @@ mod tests {
         );
     }
 
+    /// `ro commit`, `ro push`, `ro ship` and `ro sync` all treat a bare
+    /// invocation as the whole registry. That is the daily command — it is
+    /// what replaces the `cd repo-a && ro ship` loop — and a tool that
+    /// makes you add a flag to say "everything" renames the loop instead of
+    /// removing it.
+    ///
+    /// It did not: the fleet verbs selected nothing and told you to pass
+    /// `--all`, and `sync` disagreed with them. So the same argument list
+    /// — none — meant two different sets of repos depending on the verb.
+    #[test]
+    fn a_bare_invocation_is_stated_by_the_caller_as_the_whole_registry() {
+        let (_t, conn) = conn_with_two_tagged();
+        // `all: true` is what the CLI now passes when nothing narrowed it.
+        let got = resolve_targets(
+            &conn,
+            None,
+            None,
+            true,
+            std::path::Path::new("/projects"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2, "a bare invocation reaches every managed repo");
+    }
+
     #[test]
     fn no_selector_and_not_all_selects_nothing() {
         let (_tmp, conn) = setup();

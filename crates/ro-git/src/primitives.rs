@@ -179,11 +179,42 @@ pub fn stage_paths(repo: &Path, paths: &[std::path::PathBuf]) -> Result<()> {
 /// Commit whatever is staged, with a subject. No file list — that is
 /// `mutation::commit`'s job.
 pub fn commit_all(repo: &Path, message: &str) -> Result<String> {
-    let out = run_in(
-        Some(repo),
-        &["commit", "--no-gpg-sign", "-m", message],
-        &RunOpts::none(),
-    )?;
+    commit_all_as(repo, message, None)
+}
+
+/// Commit the whole worktree, optionally under an explicit author.
+///
+/// The author is applied with per-invocation `-c`, so nothing is written to
+/// `.git/config` or to the user's global config, and it applies only to this
+/// one commit. That is what makes two repos able to commit as two different
+/// people in one run, and it is the same guarantee for the `git` engine that
+/// `GIT_CONFIG_*` on the child environment gives the agent engines.
+///
+/// The parameters are a plain `(name, email)` rather than a profile type, so
+/// this crate keeps no dependency on the config layer: `ro-git` runs git
+/// commands, and what an "identity profile" means is not its business.
+pub fn commit_all_as(
+    repo: &Path,
+    message: &str,
+    author: Option<(&str, &str)>,
+) -> Result<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if let Some((name, email)) = author {
+        // `-c` is a git-wide option and has to precede the subcommand.
+        argv.push("-c".to_string());
+        argv.push(format!("user.name={name}"));
+        argv.push("-c".to_string());
+        argv.push(format!("user.email={email}"));
+    }
+    argv.extend([
+        "commit".to_string(),
+        "--no-gpg-sign".to_string(),
+        "-m".to_string(),
+        message.to_string(),
+    ]);
+
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let out = run_in(Some(repo), &argv, &RunOpts::none())?;
     if !out.ok() {
         bail!("git commit failed: {}", out.stderr.trim());
     }
@@ -913,6 +944,145 @@ mod tests {
         assert!(
             err.to_string().contains("is not a git repository"),
             "the error should name the real problem, got: {err}"
+        );
+    }
+}
+
+/// Per-repo identity, proven at the git layer.
+/// Per-repo identity, proven at the git layer.
+///
+/// `ro` exists to let a fleet commit as more than one person. That only
+/// works if the author is applied per invocation: writing it into
+/// `.git/config` would make it a property of the checkout rather than of the
+/// run, and the second repo committed would inherit the first one's
+/// identity. This is the layer the whole feature rests on — both engines
+/// call through here, and an agent that ran `git config user.email …`
+/// mid-task is overridden by the same mechanism.
+#[cfg(test)]
+mod author_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// A repo whose own config names a *different* person, so a passing test
+    /// cannot be passing because the config happened to agree.
+    fn repo_with_a_contrary_config() -> (TempDir, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("repo");
+        std::fs::create_dir_all(&p).unwrap();
+        for args in [
+            ["init", "-q", "."],
+            ["config", "user.email", "configured@e.st"],
+            ["config", "user.name", "Configured"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?} failed");
+        }
+        (tmp, p)
+    }
+
+    /// `commit_all` does not stage — the caller does, exactly as
+    /// `GitEngine` does. These are the same three steps.
+    fn commit_file(repo: &Path, file: &str, message: &str, author: Option<(&str, &str)>) {
+        std::fs::write(repo.join(file), "x\n").expect("the file is writable");
+        stage_all(repo).expect("staging succeeds");
+        commit_all_as(repo, message, author).expect("the commit lands");
+    }
+
+    fn author_of(repo: &Path) -> (String, String) {
+        let out = run_in(
+            Some(repo),
+            &["log", "-1", "--format=%an%n%ae"],
+            &RunOpts::none(),
+        )
+        .unwrap();
+        let mut lines = out.stdout.lines();
+        (
+            lines.next().unwrap_or_default().to_string(),
+            lines.next().unwrap_or_default().to_string(),
+        )
+    }
+
+    #[test]
+    fn an_explicit_author_wins_over_the_configured_one() {
+        let (_tmp, p) = repo_with_a_contrary_config();
+        commit_file(
+            &p,
+            "a.txt",
+            "with an author",
+            Some(("Dev Work", "dev@corp.com")),
+        );
+        assert_eq!(author_of(&p), ("Dev Work".into(), "dev@corp.com".into()));
+    }
+
+    /// And it is per-invocation: the next commit, with no author, is back to
+    /// git's own config. That is the difference between "ro set the identity
+    /// for this run" and "ro changed your repo's identity".
+    #[test]
+    fn the_override_does_not_outlive_the_invocation() {
+        let (_tmp, p) = repo_with_a_contrary_config();
+        commit_file(&p, "a.txt", "first", Some(("Dev Work", "dev@corp.com")));
+        commit_file(&p, "b.txt", "second", None);
+
+        assert_eq!(
+            author_of(&p),
+            ("Configured".into(), "configured@e.st".into()),
+            "a plain commit must fall back to git's own config"
+        );
+    }
+
+    /// Two repos, two identities — the feature in one test. If this ever
+    /// collapses to a single author, the reason the tool exists is gone.
+    #[test]
+    fn two_repos_commit_as_two_people() {
+        let tmp = TempDir::new().unwrap();
+        let mut seen = Vec::new();
+        for (dir, who, mail) in [
+            ("work", "Dev Work", "dev@corp.com"),
+            ("personal", "Dev Me", "me@personal.dev"),
+        ] {
+            let p = tmp.path().join(dir);
+            std::fs::create_dir_all(&p).unwrap();
+            std::process::Command::new("git")
+                .args(["init", "-q", "."])
+                .current_dir(&p)
+                .output()
+                .unwrap();
+            commit_file(&p, "f.txt", "same message for both", Some((who, mail)));
+            seen.push(author_of(&p));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ("Dev Work".to_string(), "dev@corp.com".to_string()),
+                ("Dev Me".to_string(), "me@personal.dev".to_string()),
+            ],
+            "one run must be able to commit as two people"
+        );
+    }
+
+    /// Nothing is written to the repo's config. `.git/config` is the one file
+    /// a per-repo identity must never touch, because a commit made outside ro
+    /// — or by another tool — would then inherit it.
+    #[test]
+    fn the_repo_config_is_untouched() {
+        let (_tmp, p) = repo_with_a_contrary_config();
+        let before = std::fs::read_to_string(p.join(".git/config")).unwrap();
+        commit_file(
+            &p,
+            "a.txt",
+            "with an author",
+            Some(("Dev Work", "dev@corp.com")),
+        );
+        let after = std::fs::read_to_string(p.join(".git/config")).unwrap();
+        assert_eq!(
+            before, after,
+            "per-invocation `-c` must not write anything to .git/config"
         );
     }
 }
