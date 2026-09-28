@@ -34,10 +34,21 @@ impl HowFar {
 
     /// Does this run rebase onto the remote's base first?
     ///
-    /// `commit` and `push` do not: only a full ship fetches, and there is
-    /// nothing to rebase onto a base we have not fetched.
+    /// Everything that touches the remote, and `commit` does not. A push
+    /// onto a branch the remote has moved past is rejected as
+    /// non-fast-forward, and the only two ways out are a rebase — which
+    /// rewrites the branch and needs `--force-with-lease` — or failing and
+    /// handing the user a problem they have to know the answer to. Rebasing
+    /// first makes the common case an ordinary forward push, which is the
+    /// whole reason the step exists.
+    ///
+    /// `ro push` skipping it was not a design decision, it was an omission:
+    /// `ro ship` rebased, `ro push` did not, and both are on the same
+    /// pipeline with the same arguments. `ro commit` stays out because it
+    /// writes nothing to the remote, and rewriting local history for a
+    /// request that was only "commit this" is its own surprise.
     pub fn rebases(&self) -> bool {
-        matches!(self, HowFar::Ship)
+        matches!(self, HowFar::Ship | HowFar::Push)
     }
 }
 
@@ -1366,4 +1377,44 @@ fn base_for(repo: &Path) -> String {
         .ok()
         .flatten()
         .unwrap_or_else(|| "main".to_string())
+}
+
+/// Every verb that touches the remote rebases first.
+///
+/// This is a one-line table, and it was wrong in the worst way a table can
+/// be wrong: `ro ship` rebased, `ro push` did not, and both are the same
+/// pipeline with the same flags. A user who ran `ro push` instead of
+/// `ro ship` got a push onto a branch the remote had already moved past —
+/// accepted by the remote as a fast-forward of the *branch*, with the base
+/// divergence silently still there, and rejected outright the moment the
+/// base was actually required.
+#[cfg(test)]
+mod verb_shape_tests {
+    use super::HowFar;
+
+    #[test]
+    fn every_verb_that_touches_the_remote_rebases_first() {
+        assert!(HowFar::Ship.rebases(), "ship pushes, so it rebases");
+        assert!(HowFar::Push.rebases(), "push pushes, so it rebases");
+        assert!(
+            !HowFar::Commit.rebases(),
+            "commit writes nothing to the remote, and rewriting local \
+             history for a request that was only 'commit this' is its own \
+             surprise"
+        );
+    }
+
+    /// The three predicates describe one shape, and a change to one has to
+    /// agree with the others. `push` implies `rebases`; if it ever does not,
+    /// the reason is written down rather than discovered by a user.
+    #[test]
+    fn pushing_implies_rebasing() {
+        for far in [HowFar::Ship, HowFar::Push] {
+            assert!(
+                far.pushes() && far.rebases(),
+                "{far:?} pushes but does not rebase"
+            );
+        }
+        assert!(!HowFar::Commit.pushes(), "commit never touches the remote");
+    }
 }

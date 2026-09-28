@@ -37,10 +37,24 @@ use crate::{Availability, CommitRecord, Engine, EngineContext, EngineKind, Engin
 
 /// The built-in instruction. A constant, and asserted on literally.
 pub const BUILTIN_PROMPT: &str = "\
-Read the full diff of this repository. Group the changes into a small \
-number of logically connected commits, in dependency order, and write \
-each one with a specific subject line describing what that commit actually \
-does.
+Read the full diff of this repository and group the changes into a small \
+number of logically connected commits, in dependency order.
+
+Leave every change in the working tree. Do NOT run `git commit` — the \
+caller stages and commits each group itself, with the author identity it \
+resolved. A commit you make yourself is one the caller cannot attribute, \
+cannot split, and will not push.
+
+When you are done, output the plan and nothing else after it, as a JSON \
+array inside a fenced block:
+
+```ro-commits
+[{\"subject\": \"one line, imperative, describing what the commit does\",
+  \"files\": [\"path/one\", \"path/two\"]}]
+```
+
+Every changed path must appear in exactly one group. Paths are relative \
+to the repository root. A file that is not in any group is not committed.
 
 Do not edit any source file. Do not reformat. Do not add obviously \
 ephemeral files (build output, lockfiles from an unrelated package, \
@@ -77,8 +91,17 @@ impl AgentEngine {
             bin: "claude".to_string(),
             // `-p` is non-interactive: a prompt on stdin would hang a
             // fleet run forever, and the timeout would have to kill it.
+            //
+            // `--verbose` is not optional. `claude` refuses
+            // `--output-format stream-json` together with `--print`
+            // unless `--verbose` is also present, so the first real
+            // `ro commit` with the default engine failed with
+            // "When using --print, --output-format=stream-json requires
+            // --verbose" — the flagship path, on the very first use, and
+            // only on a machine where `claude` was actually installed.
             default_args: vec![
                 "-p".to_string(),
+                "--verbose".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
             ],
@@ -112,8 +135,10 @@ impl AgentEngine {
             bin: bin.into(),
             default_args: default_args.unwrap_or_else(|| match kind {
                 EngineKind::Codex => vec!["exec".to_string()],
+                // Same pair as `claude()` above, for the same reason.
                 _ => vec![
                     "-p".to_string(),
+                    "--verbose".to_string(),
                     "--output-format".to_string(),
                     "stream-json".to_string(),
                 ],
@@ -339,6 +364,40 @@ impl Engine for AgentEngine {
         // the agent never touches the push.
         let before = ro_git::read::head_oid(ctx.repo_root).unwrap_or(None);
         if !ro_git::read::is_dirty(ctx.repo_root).unwrap_or(false) {
+            // A clean tree has two causes, and they are not the same news:
+            // the agent changed nothing, or the agent **committed it
+            // itself**. Only the ref tells them apart, and `before` is the
+            // only record of what it was.
+            //
+            // The second case is not hypothetical. The prompt says to group
+            // the changes into commits, and an agent that reads that as an
+            // instruction rather than a description runs `git commit`. It
+            // did exactly that on a scratch repo: two commits landed, and
+            // ro reported "nothing to commit" — a false report about work
+            // that had already happened. On `ro ship` that also means no
+            // push, so the work sits local with nothing saying it is
+            // stranded.
+            let after = ro_git::read::head_oid(ctx.repo_root).unwrap_or(None);
+            if before != after {
+                let commits: Vec<CommitRecord> = ro_git::read::commits_between(
+                    ctx.repo_root,
+                    before.as_deref(),
+                    after.as_deref(),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|oid| {
+                    Some(CommitRecord {
+                        message: ro_git::read::commit_subject(ctx.repo_root, &oid)?,
+                        oid,
+                        files: Vec::new(),
+                    })
+                })
+                .collect();
+                if !commits.is_empty() {
+                    return EngineOutcome::Committed { commits };
+                }
+            }
             return EngineOutcome::NothingToCommit;
         }
 
@@ -359,9 +418,27 @@ impl Engine for AgentEngine {
             .identity
             .as_ref()
             .map(|i| (i.name.as_str(), i.email.as_str()));
-        for subject in subjects {
-            let oid =
-                match ro_git::primitives::commit_all_as(ctx.repo_root, &subject, author) {
+        for group in subjects {
+            // Each group is staged on its own, so the split the agent
+            // reasoned about is the split that lands. Committing the whole
+            // index N times — which is what this did before — takes every
+            // file in the first commit and leaves the rest with an empty
+            // index, so the second commit failed with nothing left to
+            // commit and the run reported a failure after the work was
+            // already half done.
+            let paths: Vec<std::path::PathBuf> =
+                group.files.iter().map(std::path::PathBuf::from).collect();
+            if let Err(e) = ro_git::primitives::stage_paths(ctx.repo_root, &paths) {
+                return EngineOutcome::Failed {
+                    error: format!("staging {:?} failed: {e:#}", group.subject),
+                    class: FailureClass::DirtyWorktree,
+                };
+            }
+            let oid = match ro_git::primitives::commit_all_as(
+                ctx.repo_root,
+                &group.subject,
+                author,
+            ) {
                 Ok(oid) => oid,
                 Err(e) => {
                     return EngineOutcome::Failed {
@@ -371,52 +448,115 @@ impl Engine for AgentEngine {
                 }
             };
             commits.push(CommitRecord {
-                message: subject,
+                message: group.subject,
                 oid,
-                files: Vec::new(),
+                files: group.files,
             });
         }
 
-        let _ = before;
+
         EngineOutcome::Committed { commits }
     }
 }
 
-/// Extract the commit subjects the agent proposed.
+/// One proposed commit: a subject, and the files that belong in it.
 ///
-/// Deliberately forgiving about format and strict about nothing: a subject
-/// an agent could not express should not become a commit ro made up.
-fn parse_commits(stdout: &str, format: StreamFormat) -> Vec<String> {
-    match format {
-        StreamFormat::ClaudeStreamJson => stdout
-            .lines()
-            .filter_map(|line| {
-                let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-                let text = v.get("message")?.get("content")?;
-                let blocks = text.as_array()?;
+/// The file list is the whole point. A subject on its own cannot be turned
+/// into more than one commit — `git commit` takes whatever is in the index,
+/// so committing N times without staging between them produces one commit
+/// and N−1 empty ones.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommitGroup {
+    subject: String,
+    files: Vec<String>,
+}
+
+/// Extract the commit groups the agent proposed.
+///
+/// Deliberately forgiving about format and strict about nothing: a group an
+/// agent could not express should not become a commit ro made up. A
+/// response with no parsable plan is `NothingToCommit` rather than a single
+/// commit built from whatever prose happened to be last.
+fn parse_commits(stdout: &str, format: StreamFormat) -> Vec<CommitGroup> {
+    let text = match format {
+        StreamFormat::ClaudeStreamJson => {
+            let mut all = String::new();
+            for line in stdout.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+                    continue;
+                };
+                let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
+                    continue;
+                };
+                let Some(blocks) = content.as_array() else { continue };
                 // Every text block, not the last one. Claude streams a
-                // *sequence* of assistant turns, and each is a proposed
-                // commit — taking only the last silently discarded every
-                // commit but one, which is the "it committed something"
-                // outcome that hides how little was actually written.
-                let last = blocks.last()?;
-                let s = last.get("text")?.as_str()?;
-                let s = s.trim();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
+                // *sequence* of assistant turns, and the plan lands in
+                // whichever turn produced it.
+                for b in blocks {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        all.push_str(t);
+                        all.push('\n');
+                    }
                 }
-            })
-            .collect(),
-        StreamFormat::CodexText => stdout
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(|l| l.trim_start_matches("# ").trim().to_string())
-            .filter(|l| !l.is_empty())
-            .collect(),
+            }
+            all
+        }
+        StreamFormat::CodexText => stdout.to_string(),
+    };
+
+    parse_plan(&text)
+}
+
+/// Pull the `ro-commits` block out of an agent's prose and parse it.
+///
+/// Scans **every** fenced block rather than the first, because an agent
+/// that explains itself before answering puts other blocks first. A block
+/// that does not parse is skipped, not fatal: the worst case for a
+/// malformed one is that the run reports nothing to commit, which is
+/// recoverable, whereas refusing to read the rest of the output is not.
+fn parse_plan(text: &str) -> Vec<CommitGroup> {
+    let mut rest = text;
+    while let Some(start) = rest.find("```") {
+        let after = &rest[start + 3..];
+        let (lang, body) = match after.find('\n') {
+            Some(i) => (&after[..i], &after[i + 1..]),
+            None => break,
+        };
+        let end_at = match body.find("```") {
+            Some(i) => i,
+            None => break,
+        };
+        let block = &body[..end_at];
+        if lang.trim() == "ro-commits" {
+            if let Ok(serde_json::Value::Array(items)) =
+                serde_json::from_str::<serde_json::Value>(block.trim())
+            {
+                let groups: Vec<CommitGroup> = items
+                    .iter()
+                    .filter_map(|it| {
+                        let subject = it.get("subject")?.as_str()?.trim().to_string();
+                        if subject.is_empty() {
+                            return None;
+                        }
+                        let files: Vec<String> = it
+                            .get("files")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(|f| f.as_str())
+                            .map(|f| f.trim().trim_matches('"').to_string())
+                            .filter(|f| !f.is_empty())
+                            .collect();
+                        Some(CommitGroup { subject, files })
+                    })
+                    .collect();
+                if !groups.is_empty() {
+                    return groups;
+                }
+            }
+        }
+        rest = body.get(end_at + 3..).unwrap_or("");
     }
+    Vec::new()
 }
 
 /// One shared taxonomy, applied to an agent's words.
@@ -644,32 +784,69 @@ mod tests {
         );
     }
 
+    /// The plan is a list of (subject, files) groups, and the file list is
+    /// load-bearing: a subject on its own cannot become more than one
+    /// commit, because `git commit` takes whatever is in the index.
     #[test]
-    fn codex_text_parses_subjects() {
-        let out = "add the engine trait\n\nadd git engine\n";
-        let subjects = parse_commits(out, StreamFormat::CodexText);
-        assert_eq!(subjects, vec!["add the engine trait", "add git engine"]);
+    fn a_plan_becomes_one_group_per_entry() {
+        let out = "reasoning\n\n```ro-commits\n[{\"subject\":\"add the engine trait\",\"files\":[\"src/lib.rs\"]},\n {\"subject\":\"add git engine\",\"files\":[\"src/git.rs\",\"src/read.rs\"]}]\n```\n";
+        let groups = parse_commits(out, StreamFormat::CodexText);
+        assert_eq!(
+            groups,
+            vec![
+                CommitGroup {
+                    subject: "add the engine trait".into(),
+                    files: vec!["src/lib.rs".into()],
+                },
+                CommitGroup {
+                    subject: "add git engine".into(),
+                    files: vec!["src/git.rs".into(), "src/read.rs".into()],
+                },
+            ],
+            "the split the agent reasoned about has to survive into the plan"
+        );
     }
 
-    /// Every assistant turn is a proposed commit. Taking only the last
-    /// would silently drop the rest — a "it committed something" outcome
-    /// that hides how little was actually written.
+    /// Every assistant turn is scanned. Taking only the last would drop the
+    /// plan entirely whenever the agent explained itself after answering —
+    /// the "nothing to commit" outcome that hides work that was done.
     #[test]
-    fn claude_stream_json_parses_every_text_block() {
+    fn claude_stream_json_is_scanned_across_every_text_block() {
         let out = concat!(
-            r#"{"message":{"content":[{"type":"text","text":"first"}]}}"#,
+            r#"{"message":{"content":[{"type":"text","text":"thinking out loud"}]}}"#,
             "\n",
-            r#"{"message":{"content":[{"type":"text","text":"  the real subject  "}]}}"#,
+            r#"{"message":{"content":[{"type":"text","text":"here you go\n\n```ro-commits\n[{\"subject\":\"the real subject\",\"files\":[\"a.txt\"]}]\n```"}]}}"#,
             "\n",
             r#"{"type":"result","subtype":"success"}"#,
             "\n",
         );
-        let subjects = parse_commits(out, StreamFormat::ClaudeStreamJson);
+        let groups = parse_commits(out, StreamFormat::ClaudeStreamJson);
         assert_eq!(
-            subjects,
-            vec!["first", "the real subject"],
-            "each assistant turn is one proposed commit"
+            groups,
+            vec![CommitGroup {
+                subject: "the real subject".into(),
+                files: vec!["a.txt".into()],
+            }],
+            "the plan may land in any turn, not only the last"
         );
+    }
+
+    /// The plan is looked for in every fenced block, not just the first. An
+    /// agent that shows its work puts a shell block before the answer.
+    #[test]
+    fn the_plan_is_found_past_an_earlier_fenced_block() {
+        let out = "here\n\n```bash\ngit status\n```\n\nthen:\n\n```ro-commits\n[{\"subject\":\"real\",\"files\":[\"a\"]}]\n```\n";
+        let groups = parse_commits(out, StreamFormat::CodexText);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].subject, "real");
+    }
+
+    /// Prose with no plan block is not a commit. ro does not invent a subject
+    /// from whatever the agent happened to say last.
+    #[test]
+    fn prose_with_no_plan_block_is_nothing_to_commit() {
+        let out = "I looked at the diff and it seems fine.\n";
+        assert!(parse_commits(out, StreamFormat::CodexText).is_empty());
     }
 
     #[test]

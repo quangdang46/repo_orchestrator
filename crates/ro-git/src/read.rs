@@ -344,3 +344,123 @@ mod tests {
         assert_eq!(status(&path).unwrap(), RepoStatus::Missing);
     }
 }
+
+/// The commits in `after` but not in `before`, oldest first.
+///
+/// `None` for either end means "empty" — a repo with no commits has no
+/// history to walk, and a run whose `before` is unknown cannot say what
+/// changed.
+pub fn commits_between(repo_path: &Path, before: Option<&str>, after: Option<&str>) -> Result<Vec<String>> {
+    let after = match after {
+        Some(a) => a,
+        None => return Ok(Vec::new()),
+    };
+    let range = match before {
+        Some(b) => format!("{b}..{after}"),
+        None => after.to_string(),
+    };
+    let out = run_read(repo_path, &["rev-list", "--reverse", &range])?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// The subject line of one commit.
+///
+/// Empty when the commit cannot be read. A commit record with no message is
+/// worse than no record: it renders as a blank line in a summary table and
+/// reports an OID the reader cannot look up.
+pub fn commit_subject(repo_path: &Path, oid: &str) -> Option<String> {
+    let out = run_read(repo_path, &["log", "-1", "--format=%s", oid]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let subject = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if subject.is_empty() {
+        None
+    } else {
+        Some(subject)
+    }
+}
+
+/// Run a read-only git command. Never prompts, never writes.
+fn run_read(repo_path: &Path, args: &[&str]) -> Result<std::process::Output> {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn repo_with_three() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("r");
+        std::fs::create_dir_all(&p).unwrap();
+        for args in [
+            vec!["init", "-q", "."],
+            vec!["config", "user.email", "d@e.st"],
+            vec!["config", "user.name", "D"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&p)
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?}");
+        }
+        for (file, msg) in [("a", "first"), ("b", "second"), ("c", "third")] {
+            std::fs::write(p.join(file), "x\n").unwrap();
+            run_read(&p, &["add", "-A"]).unwrap();
+            run_read(&p, &["commit", "-q", "-m", msg]).unwrap();
+        }
+        (tmp, p)
+    }
+
+    /// The reason these exist: ro has to be able to say "the agent committed
+    /// this itself" rather than "nothing to commit", because a clean tree and
+    /// an unmoved HEAD are different facts and only one of them means no work
+    /// happened.
+    #[test]
+    fn commits_between_walks_only_the_new_ones_oldest_first() {
+        let (_t, p) = repo_with_three();
+        let head = head_oid(&p).unwrap().unwrap();
+        let first = commits_between(&p, None, Some(&head)).unwrap();
+        assert_eq!(first.len(), 3, "everything, from no known start");
+
+        let tip = commits_between(&p, Some(&first[1]), Some(&head)).unwrap();
+        assert_eq!(
+            tip,
+            vec![first[2].clone()],
+            "only what landed after the recorded head, in commit order"
+        );
+    }
+
+    #[test]
+    fn commits_between_an_unmoved_head_is_empty() {
+        let (_t, p) = repo_with_three();
+        let head = head_oid(&p).unwrap().unwrap();
+        assert!(commits_between(&p, Some(&head), Some(&head)).unwrap().is_empty());
+        assert!(commits_between(&p, Some(&head), None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_subject_is_read_back_verbatim() {
+        let (_t, p) = repo_with_three();
+        let head = head_oid(&p).unwrap().unwrap();
+        assert_eq!(commit_subject(&p, &head).as_deref(), Some("third"));
+        assert_eq!(commit_subject(&p, "0000000000000000000000000000000000000000"), None);
+    }
+}
