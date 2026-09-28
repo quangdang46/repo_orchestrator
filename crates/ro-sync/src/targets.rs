@@ -81,17 +81,30 @@ pub fn resolve_targets(
         // narrower request does something wider. `--all` means "no
         // narrower request given", not "ignore any that was".
         let matches = if !tokens.is_empty() {
-            // A token selects a repo three ways, because three things are
-            // things a user types: the glob, the name they gave it, and the
-            // `owner/name` the registry knows it by. The help text promises
-            // "by name or alias" and only the last of the three worked, so
-            // `ro ship alpha` selected nothing and said so in a tone that
-            // reads like success.
+            // A token selects a repo four ways, because four things are
+            // things a user types: the glob, the name they gave it, the
+            // `owner/name` the registry knows it by, and the bare `name` on
+            // its own. The help text promises "by name or alias" and only
+            // the alias and the full label worked, so `ro ship alpha`
+            // selected nothing and said so in a tone that reads like
+            // success.
+            //
+            // The bare name matches on `name` and **not** on the label,
+            // because `*` does not cross a `/` in globset — so `alpha`
+            // was never a pattern that matched `owner/alpha` either.
+            //
+            // Two owners can both have a repo called `alpha`, and this
+            // matches both. That is the same behaviour as `--pattern 'a*'`,
+            // which is already how a glob is allowed to select more than
+            // one repo, and the alternative — refusing an ambiguous name —
+            // would break the common single-owner fleet this is written
+            // for.
             tokens.iter().any(|(tok, m)| {
                 m.as_ref().is_some_and(|g| g.is_match(&label))
                     || repo.alias.as_deref() == Some(tok.as_str())
                     || label == *tok
                     || repo.id == *tok
+                    || repo.name == *tok
             })
         } else if let Some(f) = filter {
             matches_filter(conn, &repo.id, &label, f)?

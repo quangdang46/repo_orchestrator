@@ -150,10 +150,138 @@ pub fn plan_for(
         local_path,
         clone_url: repo.clone_url.clone(),
         base_branch,
-        author_ref: repo.author_ref.clone(),
-        credential_ref: repo.credential_ref.clone(),
+        // The **merged** values, not the row's. Writing `repo.credential_ref`
+        // here is what made the per-repo file a no-op for the credential: the
+        // merge above wrote into a local variable, the identity was resolved
+        // from it (so `author` worked), and then the plan was built from the
+        // unmerged row. The operator believed the local file pinned the
+        // credential; the row's other token was what actually left the
+        // machine, and nothing said otherwise. The comment above this
+        // function claims "the per-repo file outranks the row" — this is
+        // where that claim is either true or a lie.
+        author_ref: author_ref.clone(),
+        credential_ref,
         onto: None,
         identity,
         engine,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ro_config::schema::IdentityConfig;
+
+    /// A tracked row with a `credential_ref` that cannot be resolved, and a
+    /// `.ro/config.local.toml` naming a different one.
+    ///
+    /// The local file is documented to outrank the row — the shipped
+    /// config.toml's own precedence list says so, and `ro-config` documents
+    /// the key. `plan_for` merged the file's value into a local variable and
+    /// then wrote the **unmerged row value** into the `RepoPlan`, so the
+    /// operator believed the local file pinned the credential while the row's
+    /// other token was what actually left the machine. That fails in the
+    /// dangerous direction: the wrong token is used and nothing says so.
+    #[test]
+    fn the_local_files_credential_outranks_the_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join(".ro")).unwrap();
+        std::fs::write(
+            repo_dir.join(".ro/config.local.toml"),
+            "credential = \"env:RO_FROM_LOCAL_FILE\"\n",
+        )
+        .unwrap();
+
+        let repo = ro_sync::manage::TrackedRepo {
+            id: "id-1".into(),
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "api".into(),
+            branch: None,
+            alias: None,
+            clone_url: "https://example.com/x.git".into(),
+            local_path: repo_dir.to_string_lossy().into_owned(),
+            visibility: "private".into(),
+            archived: false,
+            disabled: false,
+            credential_ref: Some("env:RO_FROM_THE_ROW".into()),
+            author_ref: None,
+            engine: None,
+            engine_args: None,
+        };
+
+        let plan = plan_for(
+            &repo,
+            &ro_engine::EngineSlots::default(),
+            "git",
+            None,
+            &IdentityConfig::default(),
+            None,
+        )
+        .expect("the plan builds");
+
+        assert_eq!(
+            plan.credential_ref.as_deref(),
+            Some("env:RO_FROM_LOCAL_FILE"),
+            "the local file's credential must outrank the row's"
+        );
+    }
+
+    /// The same rule for `author_ref`, which already worked — pinned so the
+    /// credential fix cannot quietly break it.
+    #[test]
+    fn the_local_files_author_outranks_the_row() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(repo_dir.join(".ro")).unwrap();
+        std::fs::write(
+            repo_dir.join(".ro/config.local.toml"),
+            "author = \"work\"\n",
+        )
+        .unwrap();
+
+        let repo = ro_sync::manage::TrackedRepo {
+            id: "id-1".into(),
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "api".into(),
+            branch: None,
+            alias: None,
+            clone_url: "https://example.com/x.git".into(),
+            local_path: repo_dir.to_string_lossy().into_owned(),
+            visibility: "private".into(),
+            archived: false,
+            disabled: false,
+            credential_ref: None,
+            author_ref: Some("personal".into()),
+            engine: None,
+            engine_args: None,
+        };
+
+        let mut profiles = IdentityConfig::default();
+        profiles.profiles.insert(
+            "work".into(),
+            ro_config::schema::CommitIdentityConfig {
+                name: Some("Work Person".into()),
+                email: Some("work@example.invalid".into()),
+            },
+        );
+
+        let plan = plan_for(
+            &repo,
+            &ro_engine::EngineSlots::default(),
+            "git",
+            None,
+            &profiles,
+            None,
+        )
+        .expect("the plan builds");
+
+        assert_eq!(
+            plan.identity.as_ref().map(|i| i.email.as_str()),
+            Some("work@example.invalid"),
+            "the local file's author must outrank the row's"
+        );
+    }
 }

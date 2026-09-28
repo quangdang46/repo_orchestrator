@@ -123,10 +123,21 @@ impl Summary {
     /// distinct from `NothingToCommit`, which needs nobody. A conflict
     /// stops the pipeline because continuing would pick a side, and
     /// picking a side is the one thing this tool must never do on its own.
+    ///
+    /// `HandedOver` belongs here as much as `SkippedConflict` does: both are
+    /// a conflict that stopped the pipeline and left the work unlanded, and
+    /// the two differ only in *when* the pipeline stopped — during this run,
+    /// or on a previous one. Counting only the first left a fleet of repos
+    /// waiting on a human reading "0 committed, 0 pushed, 0 failed".
     pub fn skipped_needing_action(&self) -> usize {
         self.rows
             .iter()
-            .filter(|r| matches!(r.outcome, RepoOutcome::SkippedConflict { .. }))
+            .filter(|r| {
+                matches!(
+                    r.outcome,
+                    RepoOutcome::SkippedConflict { .. } | RepoOutcome::HandedOver { .. }
+                )
+            })
             .count()
     }
 
@@ -348,6 +359,51 @@ mod skip_reporting_tests {
         // And it is counted separately from failures, which stays the
         // deliberate answer above.
         assert_eq!(s.skipped_needing_action(), 2);
+        assert_eq!(s.failures(), 0);
+        assert_eq!(s.counts(), (3, 0), "the exit code is a separate question");
+    }
+
+    /// A `HandedOver` row is counted as **nothing at all**.
+    ///
+    /// The enum's own doc comment says "Not a success either — the work did
+    /// not land — so the summary says so", and it does not: `HandedOver` is
+    /// excluded from `committed()`, `pushed()`, `failures()` *and*
+    /// `skipped_needing_action()`. So a fleet of three repos each waiting on
+    /// a human conflict resolution printed "0 committed, 0 pushed, 0 failed"
+    /// and exited 0 — the reader takes away that nothing happened, while
+    /// every repo's work is stranded.
+    ///
+    /// `SkippedConflict` was fixed in the same shape; this is the other half.
+    #[test]
+    fn a_handed_over_fleet_is_counted_as_needing_a_human() {
+        let s = Summary::new(vec![
+            row(
+                "acme/a",
+                RepoOutcome::HandedOver {
+                    detail: "conflict: 1 file(s) need you".into(),
+                },
+            ),
+            row(
+                "acme/b",
+                RepoOutcome::HandedOver {
+                    detail: "conflict: 1 file(s) need you".into(),
+                },
+            ),
+            row("acme/c", RepoOutcome::NothingToCommit),
+        ]);
+
+        let text = s.render();
+        assert!(
+            text.contains("2 skipped (need a human)"),
+            "a handed-over repo must be counted as needing a human, got:\n{text}"
+        );
+        assert_eq!(
+            s.skipped_needing_action(),
+            2,
+            "HandedOver belongs in the same count as SkippedConflict"
+        );
+        // Still not a failure: nothing is broken, and the exit code stays
+        // clean for the same reason SkippedConflict's does.
         assert_eq!(s.failures(), 0);
         assert_eq!(s.counts(), (3, 0), "the exit code is a separate question");
     }

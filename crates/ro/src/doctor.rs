@@ -218,7 +218,7 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
     // 403 discovered at the push step — after four other repos have already
     // been pushed — into a warning before any of them were touched.
     if let Ok(conn) = ro_state::open_db(&paths.state_dir.join("state.db")) {
-        checks.extend(check_repo_write_access(&conn));
+        checks.extend(check_repo_write_access(&conn, None));
     }
 
     // Previously `let _ = applied_fix_count; // reserved for future scoring` —
@@ -265,6 +265,79 @@ fn check_git() -> CheckResult {
     }
 }
 
+/// The credential one row will actually be pushed with, and a name for it.
+///
+/// A row may carry its own `credential_ref` — `env:VAR` or `keychain:NAME` —
+/// and the push path in `ship` honours it. The write check has to probe with
+/// the *same* credential, or it answers a question nobody asked: a row with a
+/// perfectly good per-repo token, probed with the machine's ambient token,
+/// reports `write: NO` forever. That is a permanent false alarm, and it is
+/// worse than no check because it is believed.
+///
+/// The name travels with the token for the same reason. "my token has no
+/// access" and "this repo points at a credential I do not have" look
+/// identical in a `write: NO` row and are fixed by opposite actions, so the
+/// message has to say which credential it asked.
+struct RowCredential {
+    token: ro_github::AuthToken,
+    /// How to refer to this credential in a message. The literal
+    /// `credential_ref` for a row that names one, and a description of the
+    /// ambient fallback for a row that does not.
+    label: String,
+}
+
+/// The token used for a row that names no credential: whatever the machine's
+/// environment offers.
+const AMBIENT_LABEL: &str = "the machine's own token (GH_TOKEN/GITHUB_TOKEN)";
+
+/// Resolve the credential for one row, or explain why it cannot be resolved.
+///
+/// A malformed reference and an unset variable are both failures, and both are
+/// reported *without* falling back to the ambient token — the same
+/// no-silent-fallback rule the push path follows. A repo whose row says
+/// `env:WORK_TOKEN` and whose `WORK_TOKEN` is unset must not be probed as
+/// somebody else, or the check reports a verdict for a push that will never
+/// happen that way.
+fn resolve_row_credential(
+    repo: &ro_sync::manage::TrackedRepo,
+    ambient: Option<&ro_github::AuthToken>,
+) -> Result<RowCredential, String> {
+    let Some(reference) = repo
+        .credential_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    else {
+        // No reference configured is not an error: a repo whose SSH key is
+        // already correct needs no configuration, and the push path treats
+        // `None` the same way.
+        return match ambient {
+            Some(token) => Ok(RowCredential {
+                token: ro_github::AuthToken::new(token.as_str().to_string()),
+                label: AMBIENT_LABEL.to_string(),
+            }),
+            None => Err(format!(
+                "this row names no credential ({AMBIENT_LABEL}) and neither is available"
+            )),
+        };
+    };
+
+    // Parsed first, so a malformed reference is a clear error rather than a
+    // fall-through to the machine's own credential. The `CredentialRef` error
+    // already explains the two accepted forms, so this only attributes it to
+    // the row rather than restating "invalid reference".
+    let parsed: ro_core::CredentialRef = reference
+        .parse()
+        .map_err(|e| format!("this row's credential reference is invalid — {e}"))?;
+    let resolved = ro_core::credential_resolve::resolve(&parsed)
+        .map_err(|e| format!("credential reference {reference:?}: {e}"))?;
+
+    Ok(RowCredential {
+        token: ro_github::AuthToken::new(resolved.expose().to_string()),
+        label: reference.to_string(),
+    })
+}
+
 /// Probe write access for every tracked repo.
 ///
 /// One [`CheckResult`] per repo rather than a single rolled-up verdict,
@@ -276,18 +349,18 @@ fn check_git() -> CheckResult {
 /// "resolved but forbidden" both make a push fail and need different fixes, so
 /// neither is allowed to disappear.
 ///
-/// No token means no probes at all — there is nothing to probe *with*, and
-/// reporting twenty `Unresolvable` rows would bury the single fact that
-/// matters.
-fn check_repo_write_access(conn: &ro_state::Connection) -> Vec<CheckResult> {
-    let Ok(token) = ro_github::auth::discover_token("env") else {
-        return vec![CheckResult::warn(
-            "github_auth",
-            Severity::Optional,
-            "skipping the per-repository write check: no token in the environment",
-            None,
-        )];
-    };
+/// The ambient token is only a *fallback*. A row that names its own
+/// credential is probed with that, and a row whose reference cannot be
+/// resolved is a failure naming the reference — never quietly re-probed with
+/// the machine's token. The "no token at all" collapse to a single warning is
+/// kept for the genuinely-empty case (no ambient token and no row naming one),
+/// so a run with nothing to probe with reports one fact rather than twenty
+/// `Unresolvable` rows; rows that *do* carry a credential are still probed.
+fn check_repo_write_access(
+    conn: &ro_state::Connection,
+    base_uri: Option<&str>,
+) -> Vec<CheckResult> {
+    let ambient = ro_github::auth::discover_token("env").ok();
 
     let repos = match ro_sync::manage::list(conn, None) {
         Ok(r) => r,
@@ -308,45 +381,119 @@ fn check_repo_write_access(conn: &ro_state::Connection) -> Vec<CheckResult> {
         )];
     }
 
-    repos
-        .iter()
-        .map(|repo| {
-            // `owner/name`, not `Display`, which appends " as <alias>" — a
-            // string that belongs in a listing, not in a sentence about a URL.
-            let slug = format!("{}/{}", repo.owner, repo.name);
-            let access =
-                ro_github::permissions::probe_write_access(&token, &repo.owner, &repo.name, None);
-            let name = format!("repo:{slug}");
-            match &access {
-                ro_github::permissions::WriteAccess::Granted { .. } => {
-                    CheckResult::ok(&name, Severity::Optional, access.render())
-                }
-                ro_github::permissions::WriteAccess::Forbidden { login, .. } => CheckResult::fail(
-                    &name,
-                    Severity::Required,
-                    format!("{} — a push to this repo will be refused", access.render()),
-                    format!(
-                        "the credential is {login}; ask a repository admin for write access, \
-                             or point this repo at another account with \
-                             `ro config set repos.{}.credential_ref env:OTHER_VAR`",
-                        slug
-                    ),
-                ),
-                ro_github::permissions::WriteAccess::Unresolvable { reason } => {
-                    // A distinct verdict from Forbidden on purpose. "The token
-                    // did not work" and "the token worked and was still
-                    // refused" look the same from the outside and are fixed by
-                    // opposite actions.
-                    CheckResult::fail(
+    // Nothing to probe with, and no row that could supply its own credential.
+    // One warning, not twenty `Unresolvable` rows: the single fact that matters
+    // is that there is no credential, and a fleet of identical failures buries
+    // it. Rows that name a credential are still probed below — a per-repo
+    // credential is exactly the case where the machine's own token is absent.
+    if ambient.is_none() && repos.iter().all(|r| r.credential_ref.is_none()) {
+        return vec![CheckResult::warn(
+            "github_auth",
+            Severity::Optional,
+            "skipping the per-repository write check: no token in the environment",
+            None,
+        )];
+    }
+
+    let mut results = Vec::new();
+    let mut skipped_without_credential = 0usize;
+
+    for repo in &repos {
+        // `owner/name`, not `Display`, which appends " as <alias>" — a
+        // string that belongs in a listing, not in a sentence about a URL.
+        let slug = format!("{}/{}", repo.owner, repo.name);
+        let name = format!("repo:{slug}");
+
+        // The credential this row will actually be pushed with. A row that
+        // names one is probed with it; a row that does not falls back to
+        // the machine's own. A reference that cannot be resolved is a
+        // failure, not a fall-back.
+        let credential = match resolve_row_credential(repo, ambient.as_ref()) {
+            Ok(c) => c,
+            Err(why) => {
+                // A row that names a credential which cannot be resolved is a
+                // real failure: the push will fail the same way, and the fix
+                // is to set the variable or repair the reference.
+                if repo.credential_ref.is_some() {
+                    results.push(CheckResult::fail(
                         &name,
                         Severity::Required,
-                        format!("{} — could not determine write access", access.render()),
-                        format!("{reason}; this is a credential problem, not a permission one"),
-                    )
+                        format!("{why} — could not determine write access"),
+                        format!(
+                            "{why}; this is a credential problem, not a permission one. \
+                             Fix the reference, or set the variable, before pushing {slug}."
+                        ),
+                    ));
+                } else {
+                    // No reference and no ambient token: this row has nothing
+                    // to probe with. Counted and reported once below, so a
+                    // fleet of them does not become a wall of identical
+                    // failures.
+                    skipped_without_credential += 1;
                 }
+                continue;
             }
-        })
-        .collect()
+        };
+
+        let access = ro_github::permissions::probe_write_access(
+            &credential.token,
+            &repo.owner,
+            &repo.name,
+            base_uri,
+        );
+        results.push(match &access {
+            ro_github::permissions::WriteAccess::Granted { .. } => CheckResult::ok(
+                &name,
+                Severity::Optional,
+                format!("{} — credential: {}", access.render(), credential.label),
+            ),
+            ro_github::permissions::WriteAccess::Forbidden { login, .. } => CheckResult::fail(
+                &name,
+                Severity::Required,
+                format!(
+                    "{} — a push to this repo will be refused — credential: {}",
+                    access.render(),
+                    credential.label
+                ),
+                format!(
+                    "the credential is {login}; ask a repository admin for write access, \
+                         or point this repo at another account with \
+                         `ro config set repos.{}.credential_ref env:OTHER_VAR`",
+                    slug
+                ),
+            ),
+            ro_github::permissions::WriteAccess::Unresolvable { reason } => {
+                // A distinct verdict from Forbidden on purpose. "The token
+                // did not work" and "the token worked and was still
+                // refused" look the same from the outside and are fixed by
+                // opposite actions.
+                CheckResult::fail(
+                    &name,
+                    Severity::Required,
+                    format!(
+                        "{} — could not determine write access — credential: {}",
+                        access.render(),
+                        credential.label
+                    ),
+                    format!("{reason}; this is a credential problem, not a permission one"),
+                )
+            }
+        });
+    }
+
+    if skipped_without_credential > 0 {
+        results.push(CheckResult::warn(
+            "github_auth",
+            Severity::Optional,
+            format!(
+                "skipped the write check for {skipped_without_credential} repo(s) with no \
+                 credential_ref and no token in the environment"
+            ),
+            None,
+        ));
+    }
+
+    results
 }
 
 /// Report whether a GitHub token is available, and where it came from.
@@ -679,7 +826,11 @@ mod tests {
     use super::*;
 
     use ro_config::ConfigPaths;
+    use ro_state::rusqlite::params;
     use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     fn paths_in(tmp: &TempDir) -> ConfigPaths {
@@ -1011,5 +1162,408 @@ layout = \"flat\"
         let parsed: DoctorReport = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.run_id, "abc");
         assert_eq!(parsed.checks[0].name, "git");
+    }
+
+    // ── Per-repo credential resolution ─────────────────────────────────────────
+    //
+    // A row may carry its own `credential_ref` — `env:VAR` or `keychain:NAME`
+    // — and the push path honours it. The write check must probe with THAT
+    // credential, not the ambient one. A permanent false alarm is the failure
+    // mode being guarded against: a row whose token is fine for everything
+    // except this one repo, probed with the machine's token, reports NO forever.
+
+    /// A loopback GitHub that answers the two GETs the probe makes and records
+    /// every `Authorization` header it sees.
+    struct FakeGitHub {
+        base_uri: String,
+        auths: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeGitHub {
+        fn start(login: &'static str, grant_push: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+            let addr = listener.local_addr().expect("a bound address");
+            let auths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&auths);
+            let login = login.to_string();
+
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    let recorded = Arc::clone(&recorded);
+                    let login = login.clone();
+                    std::thread::spawn(move || {
+                        let _ = serve(stream, recorded, &login, grant_push);
+                    });
+                }
+            });
+
+            Self {
+                base_uri: format!("http://{addr}"),
+                auths,
+            }
+        }
+
+        fn requested_tokens(&self) -> Vec<String> {
+            self.auths.lock().expect("the log is not poisoned").clone()
+        }
+    }
+
+    /// Serve one HTTP request. Records the bearer token it carried, then answers
+    /// the two routes the probe reads: `/user` and `/repos/{owner}/{name}`.
+    fn serve(
+        mut stream: TcpStream,
+        auths: Arc<Mutex<Vec<String>>>,
+        login: &str,
+        grant_push: bool,
+    ) -> std::io::Result<()> {
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
+
+        let mut authorization = String::new();
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header)? == 0 {
+                break;
+            }
+            if header.trim().is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("authorization") {
+                    authorization = value.trim().to_string();
+                }
+            }
+        }
+        auths
+            .lock()
+            .expect("the log is not poisoned")
+            .push(authorization.clone());
+
+        let (status, body) = if path == "/user" {
+            ("200 OK", format!(r#"{{"login":"{login}"}}"#))
+        } else {
+            let push = if grant_push { "true" } else { "false" };
+            (
+                "200 OK",
+                format!(r#"{{"permissions":{{"push":{push},"maintain":false,"admin":false,"triage":false,"pull":true}}}}"#),
+            )
+        };
+
+        let reason = if status.starts_with("200") {
+            "OK"
+        } else {
+            "Error"
+        };
+        stream.write_all(
+            format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                len = body.len()
+            )
+            .as_bytes(),
+        )?;
+        stream.flush()
+    }
+
+    /// Insert a tracked repo row directly into the registry.
+    ///
+    /// Adopts a real local checkout rather than cloning, so the fixture never
+    /// touches the network. The checkout is laid out as `<owner>/<name>` so the
+    /// derived row matches the `acme/api` the assertions below look for.
+    fn track_repo(conn: &ro_state::Connection, spec: &str) {
+        let (owner, name) = spec.split_once('/').expect("spec is owner/name");
+        let projects = tempfile::tempdir().expect("a projects dir");
+        let checkout = projects.path().join(owner).join(name);
+        fs::create_dir_all(&checkout).expect("the checkout directory is creatable");
+
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&checkout)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        fs::write(checkout.join("README.md"), "# fixture\n").expect("a file to commit");
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "initial"]);
+
+        let repo = ro_sync::manage::add_from_input(
+            conn,
+            &checkout.to_string_lossy(),
+            projects.path(),
+            &ro_sync::manage::AddOptions::default(),
+        )
+        .expect("the repo is tracked");
+        assert_eq!(repo.owner, owner);
+        assert_eq!(repo.name, name);
+    }
+
+    fn rows_for<'a>(
+        checks: &'a [CheckResult],
+        slug: &str,
+    ) -> Vec<&'a CheckResult> {
+        checks
+            .iter()
+            .filter(|c| c.name == format!("repo:{slug}"))
+            .collect()
+    }
+
+    /// A row whose `credential_ref` names a SET variable is probed with THAT
+    /// token, not the ambient one.
+    ///
+    /// The fake GitHub records the bearer token of every request. The named
+    /// variable's value must appear and the ambient token must not — proving the
+    /// probe used the credential the row points at.
+    #[test]
+    fn a_row_with_a_set_credential_ref_is_probed_with_that_credential() {
+        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
+            std::env::set_var("GH_TOKEN_WORK", "ghp_worktoken1234567890123456789012345");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let conn = ro_state::open_db(&paths.state_db()).expect("the db opens");
+        track_repo(&conn, "acme/api");
+        ro_sync::manage::set_repo_config(
+            &conn,
+            "acme/api",
+            "credential_ref",
+            "env:GH_TOKEN_WORK",
+        )
+        .expect("the row is updated");
+
+        let fake = FakeGitHub::start("quangdang46", true);
+        let checks = check_repo_write_access(&conn, Some(&fake.base_uri));
+
+        let tokens = fake.requested_tokens();
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.contains("ghp_worktoken1234567890123456789012345")),
+            "the row's own credential must be the one probed; saw: {tokens:?}"
+        );
+        assert!(
+            !tokens
+                .iter()
+                .any(|t| t.contains("ghp_ambienttoken123456789012345678901234")),
+            "the ambient token must NOT be used for a row with its own credential_ref; saw: {tokens:?}"
+        );
+
+        let rows = rows_for(&checks, "acme/api");
+        assert_eq!(rows.len(), 1, "one row per repo");
+        assert_eq!(rows[0].status, Status::Ok);
+        assert!(
+            rows[0].message.contains("write: yes"),
+            "got: {}",
+            rows[0].message
+        );
+
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GH_TOKEN_WORK");
+        }
+    }
+
+    /// A row whose `credential_ref` names an UNSET variable is a FAIL naming the
+    /// variable — never a silent fall-back to the ambient token.
+    #[test]
+    fn a_row_with_an_unset_credential_ref_fails_and_names_the_variable() {
+        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
+            std::env::remove_var("GH_TOKEN_MISSING");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let conn = ro_state::open_db(&paths.state_db()).expect("the db opens");
+        track_repo(&conn, "acme/api");
+        ro_sync::manage::set_repo_config(
+            &conn,
+            "acme/api",
+            "credential_ref",
+            "env:GH_TOKEN_MISSING",
+        )
+        .expect("the row is updated");
+
+        let fake = FakeGitHub::start("quangdang46", true);
+        let checks = check_repo_write_access(&conn, Some(&fake.base_uri));
+
+        let rows = rows_for(&checks, "acme/api");
+        assert_eq!(rows.len(), 1, "one row per repo");
+        assert_eq!(
+            rows[0].status,
+            Status::Fail,
+            "an unresolvable credential is a failure, not a fall-back"
+        );
+        assert!(
+            rows[0].message.contains("GH_TOKEN_MISSING"),
+            "the message must name the variable; got: {}",
+            rows[0].message
+        );
+        assert!(
+            rows[0].message.contains("env:GH_TOKEN_MISSING"),
+            "the message must name the reference; got: {}",
+            rows[0].message
+        );
+
+        // The ambient token must not have been used as a stand-in.
+        assert!(
+            !fake
+                .requested_tokens()
+                .iter()
+                .any(|t| t.contains("ghp_ambienttoken123456789012345678901234")),
+            "an unset variable must not fall back to the ambient token; saw: {:?}",
+            fake.requested_tokens()
+        );
+
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+        }
+    }
+
+    /// A malformed `credential_ref` is a clear failure, not a fall-back.
+    #[test]
+    fn a_malformed_credential_ref_is_a_clear_failure() {
+        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let conn = ro_state::open_db(&paths.state_db()).expect("the db opens");
+        track_repo(&conn, "acme/api");
+        // A pasted token is the classic mistake. `set_repo_config` validates the
+        // reference, so write the malformed value straight to the column to
+        // model a row that predates the validation or was edited by hand.
+        conn.execute(
+            "UPDATE repos SET credential_ref = ?1 WHERE owner = 'acme' AND name = 'api'",
+            params!["ghp_pastedtoken1234567890123456789012345678"],
+        )
+        .expect("the row is updated");
+
+        let fake = FakeGitHub::start("quangdang46", true);
+        let checks = check_repo_write_access(&conn, Some(&fake.base_uri));
+
+        let rows = rows_for(&checks, "acme/api");
+        assert_eq!(rows.len(), 1, "one row per repo");
+        assert_eq!(
+            rows[0].status,
+            Status::Fail,
+            "a malformed reference must not fall back to the ambient token"
+        );
+        assert!(
+            rows[0].message.contains("credential"),
+            "the message must say what is wrong; got: {}",
+            rows[0].message
+        );
+
+        assert!(
+            !fake
+                .requested_tokens()
+                .iter()
+                .any(|t| t.contains("ghp_ambienttoken123456789012345678901234")),
+            "a malformed reference must not fall back to the ambient token; saw: {:?}",
+            fake.requested_tokens()
+        );
+
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+        }
+    }
+
+    /// A row with no `credential_ref` still uses the ambient token — no
+    /// regression on the common case.
+    #[test]
+    fn a_row_without_a_credential_ref_uses_the_ambient_token() {
+        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let conn = ro_state::open_db(&paths.state_db()).expect("the db opens");
+        track_repo(&conn, "acme/api");
+
+        let fake = FakeGitHub::start("quangdang46", true);
+        let checks = check_repo_write_access(&conn, Some(&fake.base_uri));
+
+        let tokens = fake.requested_tokens();
+        assert!(
+            tokens
+                .iter()
+                .any(|t| t.contains("ghp_ambienttoken123456789012345678901234")),
+            "a row with no credential_ref must be probed with the ambient token; saw: {tokens:?}"
+        );
+
+        let rows = rows_for(&checks, "acme/api");
+        assert_eq!(rows.len(), 1, "one row per repo");
+        assert_eq!(rows[0].status, Status::Ok);
+
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+        }
+    }
+
+    /// The check must say WHICH credential it probed with, so a user can tell
+    /// "my token has no access" from "this repo points at a credential I do not
+    /// have".
+    #[test]
+    fn the_message_names_the_credential_it_probed_with() {
+        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
+            std::env::set_var("GH_TOKEN_WORK", "ghp_worktoken1234567890123456789012345");
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let conn = ro_state::open_db(&paths.state_db()).expect("the db opens");
+        track_repo(&conn, "acme/api");
+        ro_sync::manage::set_repo_config(
+            &conn,
+            "acme/api",
+            "credential_ref",
+            "env:GH_TOKEN_WORK",
+        )
+        .expect("the row is updated");
+
+        let fake = FakeGitHub::start("quangdang46", true);
+        let checks = check_repo_write_access(&conn, Some(&fake.base_uri));
+
+        let rows = rows_for(&checks, "acme/api");
+        assert_eq!(rows.len(), 1, "one row per repo");
+        assert!(
+            rows[0].message.contains("GH_TOKEN_WORK"),
+            "the message must name the credential it probed with; got: {}",
+            rows[0].message
+        );
+
+        unsafe {
+            std::env::remove_var("GH_TOKEN");
+            std::env::remove_var("GH_TOKEN_WORK");
+        }
     }
 }

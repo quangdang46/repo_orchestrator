@@ -1382,7 +1382,6 @@ mod tests {
 #[cfg(test)]
 mod verbatim_tests {
     use super::strip_verbatim;
-    use std::path::PathBuf;
 
     /// The prefix is a Win32 implementation detail, and it was ending up in
     /// the stored `local_path` and in every line `ro list` printed. A repo

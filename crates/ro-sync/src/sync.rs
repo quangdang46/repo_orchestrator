@@ -80,6 +80,74 @@ pub struct SyncResult {
     pub post_oid: Option<String>,
 }
 
+/// The statuses `sync_repo` can put in [`SyncResult::status`], and what each
+/// one means for the run.
+///
+/// Written down because the run-level verdict is a decision about *this*
+/// list, and a decision that is not written down is a decision that gets
+/// re-made wrong. Every status the module emits is here:
+///
+/// | status                | meaning                                    | fails the run |
+/// |-----------------------|--------------------------------------------|---------------|
+/// | `success`             | the repo is where the remote says it is    | no            |
+/// | `dry_run`             | nothing was asked of the repo              | no            |
+/// | `skipped`             | deliberately not touched, with a reason     | no            |
+/// | `error`               | git refused, or ro could not run it        | **yes**       |
+/// | `autostash_conflict`  | the pull landed, the pop did not           | **yes**       |
+/// | `conflict`            | the pull itself stopped on a conflict      | **yes**       |
+///
+/// The three that fail are the three where the repo is **not** in the state
+/// the user asked for and the user has to do something about it. The three
+/// that do not are the three where the repo is exactly as it should be, or
+/// was never touched.
+///
+/// `autostash_conflict` and `conflict` are the two rows that were missing,
+/// and they are missing for the same reason: the aggregation counted
+/// `status == "error"` and nothing else, so a run whose only bad repo was one
+/// of these exited 0 and wrote `exit_code = 0` into `runs`. A script driving
+/// ro saw success. That is the lie the whole `--autostash` work exists to
+/// prevent, reintroduced one layer up.
+///
+/// `conflict` is a failure **for the run** and nothing more. `ro ship`
+/// continues from a conflicted repo, but it does so by reading the
+/// on-disk state — the merge/rebase markers and unmerged index entries, via
+/// `ro_git::conflict::detect` — not by matching this string, so failing the
+/// run does not stop a ship that is entitled to continue. The two answers
+/// are about different questions: "did this run do what was asked?" and
+/// "can the pipeline go on?".
+///
+/// The skips are deliberately **not** failures, and this is the part that
+/// must not be "fixed" by making them so. `skipped_dirty` without
+/// `--autostash` is the tool refusing to throw work away, which is the
+/// correct answer; `skipped_unpushed` is a branch that has never been
+/// pushed, which is the normal state of a new branch; `skipped_clone` under
+/// `--pull-only` is the flag being honoured. A fleet of twenty healthy repos
+/// where three are dirty must exit 0, or the exit code stops meaning
+/// anything and scripts start ignoring it.
+pub(crate) const STATUS_SUCCESS: &str = "success";
+pub(crate) const STATUS_DRY_RUN: &str = "dry_run";
+pub(crate) const STATUS_SKIPPED: &str = "skipped";
+pub(crate) const STATUS_ERROR: &str = "error";
+pub(crate) const STATUS_AUTOSTASH_CONFLICT: &str = "autostash_conflict";
+pub(crate) const STATUS_CONFLICT: &str = "conflict";
+
+/// Whether one repo's outcome makes the whole run fail.
+///
+/// Kept as a function rather than an inline comparison so the rule has one
+/// home and one set of tests, and so a status added later cannot be
+/// forgotten here — an unknown status is treated as a failure, because a
+/// status nothing has classified is not a status anyone has vouched for.
+pub(crate) fn status_fails_run(status: &str) -> bool {
+    match status {
+        STATUS_SUCCESS | STATUS_DRY_RUN | STATUS_SKIPPED => false,
+        STATUS_ERROR | STATUS_AUTOSTASH_CONFLICT | STATUS_CONFLICT => true,
+        other => {
+            tracing::warn!(status = %other, "an unclassified sync status is failing the run");
+            true
+        }
+    }
+}
+
 /// Sync a single repo.
 pub fn sync_repo(
     conn: &Connection,
@@ -101,14 +169,29 @@ pub fn sync_repo(
     // run before the pull rather than after: the pull refetches what is
     // still there, and anything the prune deleted was already gone upstream.
     if opts.prune && !opts.dry_run && local.join(".git").exists() {
-        // Best-effort and silent on failure. A prune that cannot run is not
-        // a reason to fail a sync — the pull is the work, and the prune is
-        // housekeeping the user asked for once, not on every run.
-        let _ = ro_git::mutation::run_in(
+        // The remote name is a **required** argument. `git remote prune`
+        // with no name is a usage error — exit 129, "usage: git remote
+        // prune [<options>] <name>" — and `run_in` returns `Ok` for a
+        // non-zero exit, so the old `let _ =` discarded a command that had
+        // never run. The flag existed in `--help` with a full paragraph
+        // describing exactly what it did, and changed nothing.
+        //
+        // `origin` is the name the pull below uses, so it is the name that
+        // is pruned: a repo whose remote is called something else has no
+        // remote-tracking refs under `origin` to prune, and pruning a
+        // different name would be pruning a remote this sync never read.
+        let pruned = ro_git::mutation::run_in(
             Some(local),
-            &["remote", "prune"],
+            &["remote", "prune", "origin"],
             &ro_git::mutation::RunOpts::none(),
         );
+        if let Err(e) = &pruned {
+            // A prune that cannot run is not a reason to fail a sync — the
+            // pull is the work, and the prune is housekeeping the user asked
+            // for once, not on every run. It is reported, though: silent
+            // is how this flag became a no-op nobody noticed.
+            tracing::warn!("git remote prune origin failed in {}: {e}", local.display());
+        }
     }
 
     if opts.dry_run {
@@ -270,6 +353,7 @@ pub fn sync_repo(
         let pull_opts = ro_git::mutation::PullOpts {
             branch: Some(branch.clone()),
             strategy: pull_strategy,
+            autostash: opts.autostash,
             ..Default::default()
         };
 
@@ -280,6 +364,14 @@ pub fn sync_repo(
         // while rushing is a tool that gets uninstalled after the first
         // accident. `--autostash` is the way to say "yes, I mean it", and
         // the skip names the count so the user can decide.
+        //
+        // The flag is now passed all the way down to git (it used to stop
+        // here, at bypassing this skip, so git refused the merge with
+        // "Your local changes ... would be overwritten" and the sync
+        // reported an error for a tree the user had explicitly asked to
+        // sync). Passing it is only half the fix: a pop that conflicts
+        // still exits 0, which the `autostash_hold` arm below refuses to
+        // report as success.
         let dirty_count = dirty_file_count(local)?;
         if dirty_count > 0 && !opts.autostash && !opts.dry_run {
             let duration = start.elapsed().as_millis() as u64;
@@ -312,6 +404,45 @@ pub fn sync_repo(
         let duration = start.elapsed().as_millis() as u64;
 
         match pull_result {
+            // A pull that exited 0 while the autostash stayed stashed.
+            //
+            // **This arm has to be first.** It used to sit below
+            // `Ok(outcome) if outcome.result.ok()`, which matches this case
+            // too — a conflicting pop exits 0 — so the arm was unreachable
+            // and every conflicting autostash was filed as a clean `updated`.
+            // The comment that stood here claimed the opposite ordering was
+            // the requirement, which is how it survived review.
+            //
+            // `git pull --autostash` returns success even when the pop
+            // conflicts, so without this arm a green sync row means "your
+            // uncommitted work is in `stash@{0}` and your tree has conflict
+            // markers". That is worse than the old honest skip: the work is
+            // recoverable, but only by someone who knows to look.
+            Ok(outcome) if outcome.autostash_hold.is_some() => {
+                let detail = outcome.autostash_hold.clone().unwrap_or_else(|| {
+                    "the autostash did not pop; your uncommitted work is in the stash".to_string()
+                });
+                record_result(
+                    conn,
+                    run_id,
+                    &repo.id,
+                    "pull",
+                    STATUS_AUTOSTASH_CONFLICT,
+                    duration,
+                    Some(&detail),
+                    &pre_oid,
+                    &post_oid,
+                )?;
+                Ok(SyncResult {
+                    repo_id: repo.id.clone(),
+                    action: "pull".into(),
+                    status: STATUS_AUTOSTASH_CONFLICT.into(),
+                    duration_ms: duration,
+                    error: Some(detail),
+                    pre_oid,
+                    post_oid,
+                })
+            }
             // `pull` returns `Ok` when the command *ran*, not when it
             // succeeded — a non-zero git exit is reported in the outcome's
             // result. Matching only on `Ok` therefore recorded a failed
@@ -356,7 +487,7 @@ pub fn sync_repo(
                     run_id,
                     &repo.id,
                     "pull",
-                    "conflict",
+                    STATUS_CONFLICT,
                     duration,
                     Some(&err_msg),
                     &pre_oid,
@@ -365,7 +496,7 @@ pub fn sync_repo(
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "pull".into(),
-                    status: "conflict".into(),
+                    status: STATUS_CONFLICT.into(),
                     duration_ms: duration,
                     error: Some(err_msg),
                     pre_oid,
@@ -509,12 +640,28 @@ pub fn sync_all(
         results.push(sync_repo(conn, repo, opts, &run_id)?);
     }
 
-    // Exit code reflects the worst outcome, so a run that recorded errors
-    // is not filed as a clean one. `sync_results.status` already carries
-    // the per-repo detail; this is the run-level verdict.
-    let failed = results.iter().filter(|r| r.status == "error").count();
-    let conflicted = results.iter().filter(|r| r.status == "conflict").count();
-    let exit_code = if failed > 0 { 1 } else { 0 };
+    // Exit code reflects the worst outcome, so a run that recorded a failure
+    // is not filed as a clean one. `sync_results.status` already carries the
+    // per-repo detail; this is the run-level verdict, and it is the same
+    // verdict a script gets from the process exit status.
+    //
+    // It used to count `status == "error"` and nothing else, which meant
+    // `autostash_conflict` — a real per-repo failure, with the user's work
+    // in a stash — left the run at exit 0. See `status_fails_run` for the
+    // rule and, more importantly, for why the skips stay out of it.
+    let failed = results
+        .iter()
+        .filter(|r| status_fails_run(&r.status))
+        .count();
+    // Counted separately from `failed` because the two need different work:
+    // a pull conflict is a stage `ro ship` knows how to continue from, and
+    // an autostash conflict is a stash the user has to resolve by hand. A
+    // single "conflicted" number would hide which.
+    let conflicted = results
+        .iter()
+        .filter(|r| r.status == STATUS_AUTOSTASH_CONFLICT || r.status == STATUS_CONFLICT)
+        .count();
+    let exit_code = run_exit_code(&results);
     ro_jobs::finalize_run(conn, &run_id, exit_code).context("finalising the sync run record")?;
 
     tracing::info!(
@@ -525,6 +672,19 @@ pub fn sync_all(
         "sync run complete"
     );
     Ok(results)
+}
+
+/// The process exit code for a finished sync run: 0 when every repo is in a
+/// state the user asked for or was deliberately not touched, 1 otherwise.
+///
+/// Public because the CLI has to print this same number, and a caller that
+/// had to re-derive the rule would be a second place for it to go stale.
+pub fn run_exit_code(results: &[SyncResult]) -> i32 {
+    if results.iter().any(|r| status_fails_run(&r.status)) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Write one row to `sync_results`.
@@ -696,6 +856,71 @@ mod tests {
         assert_eq!(open, 0, "a finished sync run must be finalised");
     }
 
+    /// `--prune` must actually prune.
+    ///
+    /// `git remote prune` with **no remote name is a usage error** — exit
+    /// 129, "usage: git remote prune [<options>] <name>" — and `run_in`
+    /// returns `Ok` for a non-zero exit, so the old `let _ =` discarded a
+    /// command that had never run. The flag was in `--help` with a full
+    /// paragraph describing what it did, and changed nothing.
+    #[test]
+    fn prune_removes_stale_remote_tracking_refs() {
+        let (tmp, conn) = setup();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "hello");
+
+        let local_path = tmp.path().join("local").join("proj1");
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+
+        // Sync once so the checkout exists and has a remote-tracking ref.
+        let results = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
+        assert_eq!(results[0].status, "success");
+
+        // A stale remote-tracking ref: a branch the remote no longer has.
+        // `update-ref` rather than a real push, so the fixture does not
+        // depend on the remote's ref layout.
+        let head = run_git(&local_path, &["rev-parse", "HEAD"]);
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        run_git(
+            &local_path,
+            &["update-ref", "refs/remotes/origin/gone", &head],
+        );
+        let before = run_git(&local_path, &["for-each-ref", "refs/remotes/origin/gone"]);
+        assert!(
+            before.status.success(),
+            "the stale ref must exist before the prune"
+        );
+
+        let opts = SyncOptions {
+            prune: true,
+            ..Default::default()
+        };
+        let results = sync_all(&conn, &opts, &[]).unwrap();
+        assert_eq!(results[0].status, "success");
+
+        let after = run_git(&local_path, &["for-each-ref", "refs/remotes/origin/gone"]);
+        assert!(
+            after.stdout.is_empty(),
+            "--prune must remove the stale remote-tracking ref; it is still there"
+        );
+    }
+
     /// `--autostash` is the flag that makes a dirty worktree syncable, and
     /// the case that needs it is the one where the remote moved **on the file
     /// the tree is dirty in**. Anything less is a false pass: if the remote
@@ -703,8 +928,8 @@ mod tests {
     /// straight past the dirty file, leaves it dirty, and reports success —
     /// so the test passes on a build that never stashed anything and never
     /// popped anything. `git stash list` is empty in that case too, because
-    /// no stash was ever created. Asserting on the pull's *success* alone
-    /// therefore proves nothing about `--autostash` at all.
+    /// no stash was ever created. Asserting on the pull's *exit status*
+    /// alone therefore proves nothing about `--autostash` at all.
     ///
     /// Here the remote rewrites the same line the tree has uncommitted, so a
     /// pull without `--autostash` is refused by git itself:
@@ -731,8 +956,15 @@ mod tests {
     ///    tree — is therefore a real requirement, not a nicety: a silent
     ///    success here is a user's uncommitted work that nothing mentions.
     ///
-    /// Leaving the local edit back on top of the
-    /// remote's version, with no stash left behind.
+    /// **What this test asserts was corrected, and why.** It used to require
+    /// `status == "success"` and an empty stash — which is exactly the lie
+    /// the two facts above describe. Its own scenario (both sides rewriting
+    /// the same file) makes the pop conflict, so those assertions could only
+    /// ever pass on a build that reported a false success. It now asserts
+    /// what actually happens, and the **stash existing at all** is what
+    /// proves the flag reached git: without `--autostash` on the command
+    /// line git refuses the merge before it stashes anything, and there is
+    /// nothing in the stash list to find.
     #[test]
     fn autostash_pulls_a_tree_that_is_dirty_in_a_file_the_remote_moved() {
         let (tmp, conn) = setup();
@@ -787,30 +1019,169 @@ mod tests {
         )
         .unwrap();
 
+        // The flag reached git, so git stashed and pulled rather than
+        // refusing the merge. The pop then conflicted — both sides rewrote
+        // the same file — and that must be reported, not filed as success.
         assert_eq!(
-            results[0].status, "success",
-            "--autostash must let a dirty tree pull; the flag only bypasses \
-             ro's own skip and never reaches git, so git refuses the merge \
-             over the local change. error: {:?}",
+            results[0].status, "autostash_conflict",
+            "--autostash must let a dirty tree pull, and a pop that conflicted \
+             must be reported as such rather than as a clean sync. error: {:?}",
+            results[0].error
+        );
+        assert!(
+            results[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("git stash list")),
+            "the failure must name `git stash list`, where the work now lives: {:?}",
             results[0].error
         );
 
-        // The pull actually landed.
+        // The pull actually landed: the remote's version is in the tree,
+        // underneath the conflict markers the pop left behind.
         let after = std::fs::read_to_string(local_path.join("a.txt")).unwrap();
         assert!(
-            after.contains("REMOTE MOVED AHEAD") || after.contains("LOCAL UNCOMMITTED WORK"),
-            "the file must not be left in a state neither side wrote, got: {after}"
+            after.contains("REMOTE MOVED AHEAD"),
+            "the remote's version must have landed, got: {after}"
+        );
+        assert!(
+            after.contains("LOCAL UNCOMMITTED WORK"),
+            "the local work must still be present, in the conflict: {after}"
         );
 
-        // And the stash did not leak. `--autostash` promises a pop, and a
-        // pop that did not happen leaves the user's work sitting in a stash
-        // they were never told about.
+        // And the stash holds the work. This is the assertion that proves
+        // the flag reached git at all: a build that never passed
+        // `--autostash` was refused before stashing anything, so there
+        // would be nothing here to find.
         let stashes = run_git(&local_path, &["stash", "list"]);
         assert!(
-            stashes.stdout.is_empty(),
-            "--autostash must pop what it stashed; a leftover entry means the \
-             work is only recoverable by hand: {}",
+            stashes.status.success()
+                && String::from_utf8_lossy(&stashes.stdout).contains("autostash"),
+            "--autostash must stash what it could not pop, so the work is \
+             recoverable: {}",
             String::from_utf8_lossy(&stashes.stdout)
+        );
+    }
+
+    /// The flag has to reach git, not merely bypass ro's own dirty-skip.
+    ///
+    /// The test above asserts the run succeeded, which is the outcome the
+    /// flag exists for — but it cannot distinguish "git was told to
+    /// autostash" from "the pull happened to be clean". This one can,
+    /// because it reads the tree git was actually handed.
+    ///
+    /// The remote and the worktree rewrite the **same line of the same
+    /// file**, so the pop cannot apply cleanly. A build that never passes
+    /// `--autostash` to git is refused before it stashes anything: the
+    /// status is an error, the stash list is empty, and the local edit is
+    /// still sitting uncommitted in the tree. A build that passes the flag
+    /// and then reads the exit code reports success over a tree of conflict
+    /// markers. Only a build that passes the flag **and** reads the tree
+    /// reports the third thing, which is the truth.
+    #[test]
+    fn autostash_conflict_is_reported_as_a_failure_naming_the_stash() {
+        let (tmp, conn) = setup();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let local_path = tmp.path().join("local").join("proj1");
+        std::fs::create_dir_all(&local_path).unwrap();
+        run_git(&local_path, &["clone", &remote.to_string_lossy(), "."]);
+        run_git(&local_path, &["config", "user.email", "test@example.com"]);
+        run_git(&local_path, &["config", "user.name", "Test"]);
+
+        // Both sides rewrite the same line, so the pop must conflict.
+        std::fs::write(local_path.join("a.txt"), "LOCAL UNCOMMITTED WORK").unwrap();
+        commit_to_remote(tmp.path(), &remote, "a.txt", "REMOTE MOVED AHEAD");
+
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+
+        let results = sync_all(
+            &conn,
+            &SyncOptions {
+                autostash: true,
+                ..SyncOptions::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+        // Not success. `git pull --autostash` exits 0 here, so a run that
+        // read the exit code would file this as a clean sync over a tree
+        // holding conflict markers.
+        assert_ne!(
+            results[0].status, "success",
+            "a conflicting autostash pop must not be recorded as a success, \
+             got {:?}",
+            results[0]
+        );
+        assert_eq!(
+            results[0].status, "autostash_conflict",
+            "the failure must be named for what it is, got {:?}",
+            results[0]
+        );
+
+        // The message names the recovery, because the work is only reachable
+        // through the stash and nothing else mentions it.
+        let error = results[0]
+            .error
+            .as_deref()
+            .expect("a failure must carry the reason");
+        assert!(
+            error.contains("git stash list"),
+            "the message must name `git stash list`, where the work now lives: {error}"
+        );
+        assert!(
+            error.contains("stash pop"),
+            "the message must say how to get the work back: {error}"
+        );
+
+        // And the stash really does still hold the work — asserted on git's
+        // own list, not on the message.
+        let stashes = run_git(&local_path, &["stash", "list"]);
+        assert!(
+            stashes.status.success()
+                && String::from_utf8_lossy(&stashes.stdout).contains("autostash"),
+            "the failed pop must keep the stash, so the work is recoverable: {}",
+            String::from_utf8_lossy(&stashes.stdout)
+        );
+
+        // The tree really does hold conflict markers, which is the state a
+        // green sync row would have hidden.
+        let after = std::fs::read_to_string(local_path.join("a.txt")).unwrap();
+        assert!(
+            after.contains("<<<<<<<") && after.contains(">>>>>>>"),
+            "the worktree must show the conflict, got: {after}"
+        );
+
+        // The audit trail agrees with the verdict, so `ro status` does not
+        // report a clean run either.
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_results WHERE repo_id = ?1 AND status = 'success'",
+                params![repo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "a conflicting pop must not leave a success row in the audit trail"
         );
     }
 
@@ -1297,5 +1668,432 @@ mod unpushed_branch_tests {
             )
             .unwrap();
         assert_eq!(failed, 0, "a never-pushed branch is not a sync failure");
+    }
+}
+
+/// The run-level verdict, and the audit trail it writes.
+///
+/// `sync_all` used to count `status == "error"` and nothing else, so a run
+/// whose only bad repo was an `autostash_conflict` exited 0 — and wrote
+/// `exit_code = 0` into `runs` alongside a `sync_results` row saying the
+/// user's work was in a stash. A script driving ro saw success. That is the
+/// lie the whole `--autostash` work exists to prevent, reintroduced one
+/// layer up.
+#[cfg(test)]
+mod run_exit_code_tests {
+    use super::*;
+
+    fn result(status: &str) -> SyncResult {
+        SyncResult {
+            repo_id: "r1".into(),
+            action: "pull".into(),
+            status: status.into(),
+            duration_ms: 1,
+            error: None,
+            pre_oid: None,
+            post_oid: None,
+        }
+    }
+
+    /// The bug, as a unit test: the conflict is a failure, and it is not the
+    /// string `error`.
+    #[test]
+    fn an_autostash_conflict_fails_the_run() {
+        assert_eq!(
+            run_exit_code(&[result(STATUS_AUTOSTASH_CONFLICT)]),
+            1,
+            "a run whose only bad repo is an autostash conflict must not exit 0"
+        );
+        assert_eq!(run_exit_code(&[result(STATUS_ERROR)]), 1, "an error fails the run");
+    }
+
+    /// The negative control. This is the assertion that stops the fix above
+    /// from being "solved" by making every non-success a failure: a fleet of
+    /// healthy repos where some are dirty, some unpushed, some merely
+    /// simulated, is a **good** run, and it must exit 0.
+    #[test]
+    fn a_fleet_of_healthy_skips_exits_zero() {
+        let results = vec![
+            result(STATUS_SUCCESS),
+            result(STATUS_SUCCESS),
+            result(STATUS_SKIPPED),          // skipped_dirty
+            result(STATUS_SKIPPED),          // skipped_unpushed
+            result(STATUS_DRY_RUN),          // --dry-run
+            result(STATUS_SUCCESS),
+        ];
+        assert_eq!(
+            run_exit_code(&results),
+            0,
+            "skips are not failures: a fleet of twenty healthy repos must not \
+             exit 1, or the exit code stops meaning anything"
+        );
+        assert!(
+            !results.iter().any(|r| status_fails_run(&r.status)),
+            "no skip may be classified as a failure"
+        );
+    }
+
+    /// An empty run is a success. `ro sync` on an empty registry is a
+    /// legitimate question with the answer "nothing to do", not a failure.
+    #[test]
+    fn an_empty_run_exits_zero() {
+        assert_eq!(run_exit_code(&[]), 0, "nothing went wrong because nothing ran");
+    }
+
+    /// The third failure status, and the reason it is not the string `error`.
+    ///
+    /// A pull that stops on a conflict is filed as `conflict`, not `error`,
+    /// because the two need different work: a conflict is a stage `ro ship`
+    /// knows how to continue from, and an error is not. That distinction is
+    /// worth having in the audit trail — and it is exactly why the run-level
+    /// aggregation, which counted only `status == "error"`, let a run whose
+    /// only bad repo was a conflicted pull exit 0.
+    ///
+    /// Asserted at the rule rather than through a real conflicted rebase,
+    /// because whether `git pull --rebase` stops on a same-line divergence is
+    /// a property of the git version and of how the histories diverged, not
+    /// of this code: on this machine (git 2.53) a genuinely diverged
+    /// same-line rebase reports "Successfully rebased" and drops the local
+    /// commit, so a fixture built on that premise would pass or fail for
+    /// reasons that have nothing to do with the exit code. The rule is the
+    /// thing under test, and it is the thing that was wrong.
+    #[test]
+    fn a_conflicted_pull_fails_the_run_even_though_it_is_not_the_string_error() {
+        assert!(
+            status_fails_run(STATUS_CONFLICT),
+            "a conflicted pull is a failure, and it is not the string `error`"
+        );
+        assert_eq!(
+            run_exit_code(&[result(STATUS_CONFLICT)]),
+            1,
+            "a run whose only bad repo is a conflicted pull must not exit 0"
+        );
+        // And it is still distinguishable from an autostash conflict, which
+        // is the whole reason it is not filed as `error`.
+        assert_ne!(
+            STATUS_CONFLICT, STATUS_AUTOSTASH_CONFLICT,
+            "the two conflicts must stay separate in a query"
+        );
+    }
+
+    /// A status nobody has classified fails the run, loudly, rather than
+    /// being waved through. A status nothing knows about is not a status
+    /// anyone has vouched for, and the safe default for an unvouched status
+    /// is to say so.
+    #[test]
+    fn an_unclassified_status_fails_the_run_rather_than_passing() {
+        assert_eq!(
+            run_exit_code(&[result("some_future_status")]),
+            1,
+            "an unknown status must not be treated as success by default"
+        );
+    }
+
+    /// The end-to-end version: the conflict reaches the `runs` row, not just
+    /// the return value.
+    ///
+    /// `finalize_run` is what writes `exit_code`, so a run recorded with 0
+    /// while its results hold a conflict is an audit-trail lie — `ro status`
+    /// reads `runs`, and it would report a clean run over a repo whose work
+    /// is in a stash.
+    #[test]
+    fn a_conflicting_run_records_a_non_zero_exit_code_in_the_runs_table() {
+        let (tmp, conn) = super::tests::setup();
+        let remote = super::tests::init_bare_remote(tmp.path());
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let local_path = tmp.path().join("local").join("proj1");
+        std::fs::create_dir_all(&local_path).unwrap();
+        super::tests::run_git(&local_path, &["clone", &remote.to_string_lossy(), "."]);
+        super::tests::run_git(&local_path, &["config", "user.email", "test@example.com"]);
+        super::tests::run_git(&local_path, &["config", "user.name", "Test"]);
+
+        // Both sides rewrite the same line, so the pop must conflict.
+        std::fs::write(local_path.join("a.txt"), "LOCAL UNCOMMITTED WORK").unwrap();
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "REMOTE MOVED AHEAD");
+
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+
+        let results = sync_all(
+            &conn,
+            &SyncOptions {
+                autostash: true,
+                ..SyncOptions::default()
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            results[0].status, "autostash_conflict",
+            "the fixture must actually conflict, or this proves nothing: {:?}",
+            results[0]
+        );
+
+        // The run row is the audit trail, and it must agree with the verdict.
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT exit_code FROM runs WHERE command = 'sync' ORDER BY started_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 1,
+            "a run whose results hold an autostash conflict must not be \
+             recorded with exit_code 0 — that is the lie, in the table"
+        );
+
+        // And the per-repo row says what happened, so the two are readable
+        // together.
+        let row_status: String = conn
+            .query_row(
+                "SELECT status FROM sync_results WHERE repo_id = ?1 ORDER BY rowid DESC LIMIT 1",
+                params![repo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            row_status, "autostash_conflict",
+            "the per-repo row must name the conflict: {row_status}"
+        );
+    }
+
+    /// The same run-level rule, from the other side: a fleet of skips writes
+    /// `exit_code = 0`, so the audit trail does not contradict the process.
+    #[test]
+    fn a_run_of_only_skips_records_a_zero_exit_code() {
+        let (tmp, conn) = super::tests::setup();
+        let remote = super::tests::init_bare_remote(tmp.path());
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let local_path = tmp.path().join("local").join("proj1");
+        std::fs::create_dir_all(&local_path).unwrap();
+        super::tests::run_git(&local_path, &["clone", &remote.to_string_lossy(), "."]);
+        super::tests::run_git(&local_path, &["config", "user.email", "test@example.com"]);
+        super::tests::run_git(&local_path, &["config", "user.name", "Test"]);
+        super::tests::run_git(&local_path, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        super::tests::run_git(&local_path, &["push", "-q", "-u", "origin", "main"]);
+
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+
+        // Dirty, with no --autostash: the tool refuses to throw the work
+        // away, which is the correct answer and not a failure.
+        std::fs::write(local_path.join("a.txt"), "uncommitted\n").unwrap();
+        let results = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
+        assert_eq!(results[0].status, "skipped", "the fixture must skip: {:?}", results[0]);
+
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT exit_code FROM runs WHERE command = 'sync' ORDER BY started_at DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "a run of skips is a good run, and the table must say so"
+        );
+    }
+}
+
+/// A conflict is reported **once**, and the sync after it is clean.
+///
+/// This is the wedge seen from `ro sync` rather than from git: the detector
+/// asked whether any line of `git stash list` contained the word
+/// `autostash`, so the stash the *first* sync left behind — correctly, it is
+/// the user's only route back to their work — was reported as the *second*
+/// sync's. From there on every `ro sync --autostash` on that repo was a red
+/// `autostash_conflict` over a healthy worktree, with no way out short of
+/// the user going and dropping a stash by hand.
+///
+/// The discriminator is age, not wording: a stash is this pull's only if it
+/// was not there before the pull started.
+#[cfg(test)]
+mod autostash_wedge_tests {
+    use super::*;
+
+    /// Register a real clone of `remote` at `local_path`.
+    fn track_clone(conn: &Connection, remote: &Path, local_path: &Path) {
+        std::fs::create_dir_all(local_path).unwrap();
+        super::tests::run_git(local_path, &["clone", &remote.to_string_lossy(), "."]);
+        super::tests::run_git(local_path, &["config", "user.email", "test@example.com"]);
+        super::tests::run_git(local_path, &["config", "user.name", "Test"]);
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+    }
+
+    fn sync_with_autostash(conn: &Connection) -> Vec<SyncResult> {
+        sync_all(
+            conn,
+            &SyncOptions {
+                autostash: true,
+                ..SyncOptions::default()
+            },
+            &[],
+        )
+        .unwrap()
+    }
+
+    /// The defect, end to end, as the user meets it.
+    #[test]
+    fn a_conflict_is_reported_once_and_the_next_sync_is_clean() {
+        let (tmp, conn) = super::tests::setup();
+        let remote = super::tests::init_bare_remote(tmp.path());
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let local_path = tmp.path().join("local").join("proj1");
+        track_clone(&conn, &remote, &local_path);
+
+        // Both sides rewrite the same line, so the pop must conflict.
+        std::fs::write(local_path.join("a.txt"), "LOCAL UNCOMMITTED WORK").unwrap();
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "REMOTE MOVED AHEAD");
+
+        // Sync #1: the conflict, reported once.
+        let first = sync_with_autostash(&conn);
+        assert_eq!(
+            first[0].status, "autostash_conflict",
+            "the pop conflicts here, so this sync must say so: {:?}",
+            first[0]
+        );
+        let held = super::tests::run_git(&local_path, &["stash", "list", "--format=%H"]);
+        assert_eq!(
+            String::from_utf8_lossy(&held.stdout).lines().count(),
+            1,
+            "a failed pop keeps the user's work in a stash, and that is the \
+             whole point: {}",
+            String::from_utf8_lossy(&held.stdout)
+        );
+
+        // The user resolves the conflict markers and commits the resolution.
+        // The stash is still there — it is their work, and nothing has any
+        // business dropping it for them.
+        super::tests::run_git(&local_path, &["checkout", "--theirs", "a.txt"]);
+        super::tests::run_git(&local_path, &["add", "a.txt"]);
+        super::tests::run_git(
+            &local_path,
+            &["commit", "-q", "-m", "resolved: keep the local work"],
+        );
+        let still_there = super::tests::run_git(&local_path, &["stash", "list", "--format=%H"]);
+        assert_eq!(
+            String::from_utf8_lossy(&still_there.stdout).lines().count(),
+            1,
+            "the stash must survive the resolution, or the user has lost work"
+        );
+
+        // Sync #2: the tree is clean and the pull is a no-op. It stashes
+        // nothing and pops nothing, so the stash above is not its stash.
+        let second = sync_with_autostash(&conn);
+        assert_ne!(
+            second[0].status, "autostash_conflict",
+            "a leftover autostash from an EARLIER sync must not be reported \
+             as this one's — that wedges the repo permanently, with no way \
+             out short of dropping the stash by hand. Got {:?}",
+            second[0]
+        );
+        assert_eq!(
+            second[0].status, "success",
+            "and a clean sync over a clean tree is a success: {:?}",
+            second[0]
+        );
+
+        // The run agrees: a clean sync is a run that exits 0, in the table
+        // as well as on the wire.
+        assert_eq!(
+            run_exit_code(&second),
+            0,
+            "the second sync is a good run and must not be reported as failed"
+        );
+    }
+
+    /// The other half of the same defect, from `ro sync`.
+    ///
+    /// A stash the user made by hand is not this pull's stash, even when
+    /// its message says `autostash` — which is a thing people write, because
+    /// it is the word in the flag they just used. A substring match cannot
+    /// tell the two apart, and invents a conflict on a sync that
+    /// fast-forwarded perfectly.
+    #[test]
+    fn a_stash_the_user_made_is_not_reported_as_a_conflict() {
+        let (tmp, conn) = super::tests::setup();
+        let remote = super::tests::init_bare_remote(tmp.path());
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let local_path = tmp.path().join("local").join("proj1");
+        track_clone(&conn, &remote, &local_path);
+        std::fs::write(local_path.join("a.txt"), "LOCAL UNCOMMITTED WORK").unwrap();
+
+        // The user's own stash, made by hand, before the sync.
+        super::tests::run_git(
+            &local_path,
+            &["stash", "push", "-m", "autostash of the report rewrite"],
+        );
+
+        // The remote moves, so the sync has real work to do.
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "REMOTE MOVED AHEAD");
+
+        let results = sync_with_autostash(&conn);
+        assert_eq!(
+            results[0].status, "success",
+            "this is an ordinary fast-forward over a clean tree; a stash the \
+             user made is not this pull's stash, whatever it is called: {:?}",
+            results[0]
+        );
+        assert_eq!(
+            std::fs::read_to_string(local_path.join("a.txt")).unwrap(),
+            "REMOTE MOVED AHEAD",
+            "the remote's version must have landed"
+        );
+        assert_eq!(
+            run_exit_code(&results),
+            0,
+            "and a clean sync over a clean tree is not a failure"
+        );
     }
 }

@@ -173,11 +173,12 @@ impl AgentEngine {
         if self.bin.contains('/') || self.bin.contains('\\') {
             return configured.to_path_buf();
         }
-        for ext in [".exe", ".cmd", ".bat", ".com"] {
-            let candidate = format!("{}{ext}", self.bin);
-            if let Some(found) = ro_git::which(&candidate) {
-                return found;
-            }
+        if let Some(found) = std::env::var_os("PATH").and_then(|path| {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            find_with_extensions(&self.bin, &path, &pathext)
+        }) {
+            return found;
         }
         // Nothing found. The bare name goes back to `Command`, which will
         // report "program not found" naming what it tried — the same
@@ -351,8 +352,9 @@ impl Engine for AgentEngine {
             return EngineOutcome::Failed {
                 // The whole stream, not its first line: an agent that
                 // prints a banner before explaining itself would
-                // otherwise be classified on the banner.
-                error: first_line(&output.stderr).to_string(),
+                // otherwise be *reported* on the banner, even though it
+                // is classified on the whole thing. See `failure_message`.
+                error: failure_message(&output.stderr),
                 // One taxonomy: the same `FailureClass` every other part
                 // of ro uses, not a second one for agents.
                 class: classify_agent_output(&output.stderr, &output.stdout),
@@ -577,8 +579,162 @@ fn classify_agent_output(stderr: &str, stdout: &str) -> FailureClass {
     FailureClass::MissingProvider
 }
 
-fn first_line(s: &str) -> &str {
-    s.lines().next().unwrap_or("").trim()
+/// The whole of an agent's stderr, trimmed and bounded.
+///
+/// # Why not the first line
+///
+/// An agent that prints a banner before explaining itself is not a
+/// hypothetical. A real unauthenticated `codex` run on this machine wrote
+/// thirteen lines to stderr — a version banner, a workdir/model/session
+/// preamble, an echo of the prompt, reconnect progress — and only then
+/// the cause:
+///
+/// ```text
+/// Reading additional input from stdin...
+/// OpenAI Codex v0.118.0 (research preview)
+/// ...
+/// ERROR: unexpected status 401 Unauthorized: Missing bearer or basic
+/// authentication in header
+/// ```
+///
+/// Reporting the first line reported the banner. The user was told
+/// "Reading additional input from stdin..." and never told the token was
+/// missing — the one fact that would have made them stop and fix
+/// something. `classify_agent_output` reads the whole stream, so the
+/// taxonomy was right while the human-readable string was a progress
+/// line: the worst shape for this bug, because the JSON looks correct.
+///
+/// # Why not the whole stream, unbounded
+///
+/// Because the same string is rendered into a status-table cell
+/// (`EngineOutcome::render` → `"{class}: {error}"`), and a table cell that
+/// can be four hundred lines is not a table. An agent that streams a
+/// progress bar, or dumps a config it could not parse, writes more than a
+/// human can read in a row that is supposed to be scannable.
+///
+/// So: the whole stream, trimmed, and if it is still longer than
+/// [`MAX_ERROR_LINES`] lines the **first and last** are kept with the
+/// count dropped between them. The first line is where an agent states
+/// what it is doing; the last is where it says what went wrong. The
+/// middle is the part a reader skips, and the count is the part that
+/// says "there is more, and here is how much". A truncation that kept
+/// only the head would hide the cause in exactly the case this function
+/// exists to surface; one that kept only the tail would hide the context
+/// that makes the cause intelligible.
+fn failure_message(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.len() <= MAX_ERROR_LINES {
+        return lines.join("\n");
+    }
+    let mut kept: Vec<String> = lines[..MAX_ERROR_LINES / 2]
+        .iter()
+        .map(|l| (*l).to_string())
+        .collect();
+    kept.push("...".to_string());
+    kept.push(format!(
+        "... ({} more lines of stderr) ...",
+        lines.len() - MAX_ERROR_LINES
+    ));
+    kept.push("...".to_string());
+    kept.extend(
+        lines[lines.len() - MAX_ERROR_LINES / 2..]
+            .iter()
+            .map(|l| (*l).to_string()),
+    );
+    kept.join("\n")
+}
+
+/// How many lines of an agent's stderr a failure report carries before the
+/// middle is elided.
+///
+/// Long enough that a real cause is in the kept part: the `codex` run this
+/// was written from put its error on line 14, and a banner plus preamble
+/// plus progress is the normal shape rather than the exception. Short
+/// enough that the result is still a table cell.
+const MAX_ERROR_LINES: usize = 24;
+
+/// The first spelling of `bin` that exists on `path`, Windows extensions
+/// included.
+///
+/// # The order is the whole point: `PATH` first, extensions second
+///
+/// The obvious loop — for each extension, walk the whole `PATH` — is
+/// wrong, and it is wrong in a way that only shows up on a machine that
+/// has the real agent installed. With `for ext { for dir { ... } }`, a
+/// `.exe` anywhere on `PATH` beats a `.cmd` in the **first** entry, so a
+/// shim or a wrapper a user deliberately put first loses to the real
+/// binary they were trying to shadow. That is not a test-only problem: it
+/// is the semantics of `PATH`, and it is what a user who prepends a
+/// directory means.
+///
+/// So the loops are the other way round: walk `PATH` in order, and within
+/// each entry try the extensions. The first entry that has *any* spelling
+/// of the name wins, and the extension order only breaks a tie inside one
+/// directory. This is also the rule `ro-testkit` established for `gh`
+/// (`git_on_path` in `shim.rs`), and the reason it is written down there
+/// applies here too: a probe on a real `windows-latest` runner showed
+/// `Command::new` not applying `PATHEXT` to a bare name at all, so the
+/// extension walk is the only thing that finds anything.
+///
+/// The extension list is the platform's own, in the platform's own order
+/// (`.COM;.EXE;.BAT;.CMD`), read from `PATHEXT` when it is set — the same list the
+/// loader applies, minus the loader. A hardcoded `[".exe", ".cmd",
+/// ".bat", ".com"]` would be a guess made on a Unix machine about what
+/// Windows does, and it would be wrong in the direction that matters:
+/// `.COM` before `.EXE` is the platform's rule, not an accident.
+///
+/// Empty `PATH` entries are skipped rather than read as the current
+/// directory, for the reason `git_on_path` gives: a binary found relative
+/// to wherever the process happens to be is a resolution that depends on
+/// the working directory.
+///
+/// # Why this is not `#[cfg(windows)]`
+///
+/// The *caller* is Windows-only, because that is the only platform where a
+/// bare name is not a file. The ordering rule is not: it is the semantics
+/// of `PATH`, and the bug it fixes is a loop order, which is platform-neutral
+/// logic. Gating the helper would put the one part of this that can be
+/// tested on a Unix machine behind the one platform that cannot run the
+/// test — and the failure it prevents is invisible exactly where it happens,
+/// on a machine with the real agent installed. So the helper takes `path`
+/// and `PATHEXT` as arguments and is exercised directly; `resolve_program`
+/// is the only Windows-specific part, and it is a three-line call.
+fn find_with_extensions(
+    bin: &str,
+    path: &std::ffi::OsString,
+    pathext: &str,
+) -> Option<std::path::PathBuf> {
+    let extensions: Vec<String> = pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| e.strip_prefix('.').unwrap_or(e).to_ascii_lowercase())
+        .collect();
+    for dir in std::env::split_paths(path) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        // The bare name first: a file called exactly `claude` is what a
+        // user who typed `claude` means, and on Windows it is what
+        // `which` resolves by name.
+        let bare = dir.join(bin);
+        if is_spawnable(&bare) {
+            return Some(bare);
+        }
+        for ext in &extensions {
+            let candidate = dir.join(format!("{bin}.{ext}"));
+            if is_spawnable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// A file that can actually be spawned: present, and a file rather than a
+/// directory an install left behind.
+fn is_spawnable(path: &std::path::Path) -> bool {
+    matches!(std::fs::metadata(path), Ok(m) if m.is_file())
 }
 
 /// Is this a Windows batch file?
@@ -861,5 +1017,165 @@ mod tests {
         assert_eq!(AgentEngine::codex().kind(), EngineKind::Codex);
         assert_eq!(AgentEngine::claude().bin(), "claude");
         assert_eq!(AgentEngine::codex().bin(), "codex");
+    }
+
+    /// The report keeps the cause, which was never on the first line.
+    ///
+    /// A real unauthenticated `codex` run on this machine, verbatim in
+    /// shape: thirteen lines of banner and preamble before the one line
+    /// that says the token is missing.
+    #[test]
+    fn a_failure_message_carries_the_cause_from_a_late_line() {
+        let stderr = "Reading additional input from stdin...\n\
+                       OpenAI Codex v0.118.0 (research preview)\n\
+                       --------\n\
+                       workdir: /tmp/proj\n\
+                       model: gpt-5.3-codex\n\
+                       session id: 01a0e787-5e6d-7e51-bca8-e1ac87a74aab\n\
+                       --------\n\
+                       ERROR: Reconnecting... 1/5\n\
+                       ERROR: Reconnecting... 2/5\n\
+                       ERROR: unexpected status 401 Unauthorized: Missing bearer \
+                       or basic authentication in header\n";
+        let msg = failure_message(stderr);
+        assert!(
+            msg.contains("401") && msg.contains("Unauthorized"),
+            "the cause is the whole point of the report, got: {msg}"
+        );
+        assert!(
+            !msg.starts_with("Reading additional input from stdin...\nERROR"),
+            "the report must not stop where the banner stops, got: {msg}"
+        );
+    }
+
+    /// And it is not the *only* thing it carries: a report that kept just
+    /// the last line would satisfy the assertion above, and would have
+    /// thrown away everything that makes the cause readable.
+    #[test]
+    fn a_failure_message_keeps_the_stream_around_the_cause() {
+        let stderr = "banner\nworkdir: /tmp\nERROR: Reconnecting... 1/5\n\
+                       ERROR: boom\n";
+        let msg = failure_message(stderr);
+        assert!(msg.contains("banner"), "got: {msg}");
+        assert!(msg.contains("Reconnecting"), "got: {msg}");
+        assert!(msg.contains("boom"), "got: {msg}");
+    }
+
+    /// An unbounded report would be a four-hundred-line table cell, so the
+    /// middle is elided — and the elision says how much. A silent
+    /// truncation is the original bug wearing a different hat: the reader
+    /// cannot tell an absent line from a dropped one.
+    #[test]
+    fn a_very_long_failure_is_bounded_and_says_so() {
+        let mut stderr = String::new();
+        for i in 0..500 {
+            stderr.push_str(&format!("line {i}\n"));
+        }
+        let msg = failure_message(&stderr);
+        assert!(
+            msg.lines().count() <= MAX_ERROR_LINES + 3,
+            "the report must stay a table cell, got {} lines",
+            msg.lines().count()
+        );
+        assert!(
+            msg.contains("more lines of stderr"),
+            "an elision that does not announce itself is indistinguishable \
+             from a complete report, got: {msg}"
+        );
+        assert!(
+            msg.contains("line 0"),
+            "the head survives: an agent says what it is doing first, got: {msg}"
+        );
+        assert!(
+            msg.contains("line 499"),
+            "the tail survives: the cause is at the end, got: {msg}"
+        );
+    }
+
+    /// The negative control for the test above: a short stream is not
+    /// annotated, because an elision marker on a complete report is a lie
+    /// about what is missing.
+    #[test]
+    fn a_short_failure_is_not_annotated() {
+        let msg = failure_message("one\ntwo\n");
+        assert_eq!(msg, "one\ntwo");
+    }
+
+    /// `PATH` order beats extension order — the loop nesting, pinned.
+    ///
+    /// This is the fix for the four engine tests that only fail on a
+    /// machine with a real agent installed. It is written here, against
+    /// the loop, rather than only as a spawn test because the spawn test
+    /// passes on CI (no agent installed) and on a dev box whose `PATH`
+    /// happens to work, and fails everywhere else. The order is the claim;
+    /// this is the claim with a machine-independent shape.
+    #[test]
+    fn a_shim_earlier_on_path_beats_a_real_binary_later() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let early = dir.path().join("early");
+        let late = dir.path().join("late");
+        std::fs::create_dir_all(&early).unwrap();
+        std::fs::create_dir_all(&late).unwrap();
+        // The shim a test (or a user) put FIRST, and the real binary LATER.
+        // A `.exe` anywhere beat a `.cmd` anywhere when the loops were
+        // nested the other way round, so the real binary won.
+        std::fs::write(early.join("claude.cmd"), "shim").unwrap();
+        std::fs::write(late.join("claude.exe"), "real").unwrap();
+
+        let path = std::env::join_paths([&early, &late]).unwrap();
+        let found = find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD")
+            .expect("a name on PATH must resolve");
+
+        assert_eq!(
+            found,
+            early.join("claude.cmd"),
+            "the first PATH entry that has ANY spelling wins; the extension \
+             order only breaks a tie inside one directory"
+        );
+    }
+
+    /// Within one directory the platform's own order decides — `.COM`
+    /// before `.EXE`, because that is what `PATHEXT` says. A hardcoded
+    /// `[".exe", ".cmd", …]` would silently be a different rule.
+    #[test]
+    fn within_one_directory_the_platform_extension_order_wins() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("claude.com"), "com").unwrap();
+        std::fs::write(dir.path().join("claude.exe"), "exe").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+
+        let found = find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD").unwrap();
+        assert_eq!(found, dir.path().join("claude.com"));
+    }
+
+    /// A directory named after the binary is not a binary. Without the
+    /// `is_file` check, an install that left `claude/` behind would read
+    /// as present and the spawn would fail with a message about the wrong
+    /// thing.
+    #[test]
+    fn a_directory_on_path_is_not_a_spawnable_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("claude.exe")).unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        assert_eq!(find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD"), None);
+    }
+
+    /// An empty `PATH` entry means "the current directory" to a shell, and
+    /// is a resolution that depends on where the process happens to be
+    /// running. `ro-testkit::git_on_path` skips them for the same reason.
+    #[test]
+    fn an_empty_path_entry_is_skipped_rather_than_read_as_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("claude.exe"), "exe").unwrap();
+        // Leading empty entry: if it were honoured, the lookup would
+        // consult the process's working directory and this test's answer
+        // would depend on where the test binary was started.
+        let path = std::env::join_paths([
+            std::path::PathBuf::from(""),
+            dir.path().to_path_buf(),
+        ])
+        .unwrap();
+        let found = find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD").unwrap();
+        assert_eq!(found, dir.path().join("claude.exe"));
     }
 }

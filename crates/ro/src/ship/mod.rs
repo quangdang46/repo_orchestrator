@@ -107,10 +107,21 @@ pub fn run_verb(
     // A name someone typed outranks a flag left in a shell profile, so the
     // positional list wins when both are given. `--all` is explicit and
     // beats both: it is the only way to say "everything".
-    let selection: Option<String> = if all {
-        None
-    } else if !named.is_empty() {
-        Some(named.join(","))
+    //
+    // Joined with a **space**, not a comma. `resolve_targets` splits the
+    // pattern on whitespace, so `ro ship a b` arrived as the single token
+    // `"a,b"` — a glob that matched nothing, reported as a cheerful empty
+    // run. `--help` on all three verbs gives the two-name form as the
+    // canonical invocation, so the documented plural form was unusable.
+    //
+    // `--all` is a **default**, not an override. It used to be computed as
+    // `if all { None } else { ... }`, so `--all --pattern alpha` silently
+    // discarded the pattern and ran the whole fleet — the exact failure the
+    // comment above says was fixed, arriving through a different door. A
+    // narrower request always wins; `--all` only fills the gap when nothing
+    // narrower was given.
+    let selection: Option<String> = if !named.is_empty() {
+        Some(named.join(" "))
     } else {
         pattern.map(str::to_string)
     };
@@ -142,18 +153,35 @@ pub fn run_verb(
     };
 
     if targets.is_empty() {
-        // Names the user typed and nothing matched is a **usage** error, not
-        // an empty run. `ro ship alpha` used to print this and exit 0 —
-        // a typo reported as a success, in a script's terms indistinguishable
-        // from having done the work. Only a request that named nothing (a
-        // bare `ro ship`, or a filter that selected none) is exit 0.
-        let named_something = !named.is_empty() || pattern.is_some();
+        // Anything the user **narrowed by** and that matched nothing is a
+        // **usage** error, not an empty run. That covers a typed name, a
+        // `--pattern`, and a `--filter`/`--tag`.
+        //
+        // `--all` used to be excluded from that rule, on the reading that it
+        // "beats both". But the narrower request is still *given*, and
+        // `--all --pattern 'work/nomatch*'` then acted on every repo in the
+        // fleet and reported "4 failed" as though four repos were what was
+        // asked for. `resolve_targets` states the rule the flag is supposed
+        // to follow: "`--all` means 'no narrower request given', not 'ignore
+        // any that was'". With a pattern that matched nothing, the narrower
+        // request is given and is being ignored.
+        //
+        // The error message used to suggest `--all` as the remedy for the
+        // exact command that already contained it, so a run that matched
+        // nothing exited 0 while the same verb over five protected repos
+        // exited 2 — "nothing to do" and "nothing asked for" were
+        // indistinguishable to a script.
+        //
+        // A bare `ro commit` on an empty registry is still exit 0. Asking
+        // for everything when there is nothing is not a mistake, and that is
+        // the case this rule is scoped away from.
+        let narrowed = !named.is_empty() || pattern.is_some() || filter.is_some();
+        if narrowed {
+            eprintln!("no repos matched the names, pattern or filter given; nothing was run.");
+            std::process::exit(crate::exit::EX_USAGE as i32);
+        }
         eprintln!("no repos matched. Use --all, or a --repos pattern.");
-        std::process::exit(if named_something {
-            crate::exit::EX_USAGE as i32
-        } else {
-            0
-        });
+        std::process::exit(0);
     }
 
     let slots = ro_engine::EngineSlots::default();

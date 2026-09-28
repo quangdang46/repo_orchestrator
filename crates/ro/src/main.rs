@@ -910,15 +910,34 @@ fn run() -> Result<()> {
                 eprintln!("Will delete the working copy at:");
                 eprintln!("  {}", path.display());
 
-                // (2) Refuse if this directory is a *different* registered
-                // repo. Two repos pointing at one path is the copy-paste
-                // accident, and deleting through it removes someone else's
-                // work to reclaim this one's disk.
+                // (2) Refuse if this directory is, or *contains*, a
+                // different registered repo. Two repos pointing at one path
+                // is the copy-paste accident, and deleting through it removes
+                // someone else's work to reclaim this one's disk.
+                //
+                // Containment is the case the exact-equality check missed,
+                // and it is the worse one: a repo registered *inside* the
+                // one being deleted has a different `local_path`, so the
+                // check did not fire, `remove_dir_all` took the nested
+                // checkout with it, and the nested row was left dangling at
+                // a path that no longer exists — so the next `ro ship` or
+                // `ro doctor` reports "not a git repo" for a repo the user
+                // never asked to touch. The help text promises a directory
+                // belonging to another registered repo is "refused outright";
+                // a directory *containing* one belongs to it at least as much.
                 let wanted = path.to_string_lossy().to_string();
                 let clash = manage::list(&conn, None)
                     .unwrap_or_default()
                     .into_iter()
-                    .find(|r| r.id != target.id && r.local_path == wanted);
+                    .find(|r| {
+                        if r.id == target.id {
+                            return false;
+                        }
+                        let other = r.local_path.as_str();
+                        other == wanted
+                            || other.starts_with(&format!("{wanted}/"))
+                            || other.starts_with(&format!("{wanted}\\"))
+                    });
                 if let Some(other) = clash {
                     eprintln!(
                         "refused: {} is also the working copy of {}/{}; \
@@ -1058,6 +1077,28 @@ fn run() -> Result<()> {
                         eprintln!("error: {e:#}");
                         std::process::exit(exit::EX_USAGE as i32);
                     })?;
+                    // A selector that matched nothing is a **usage** error,
+                    // not a clean run over the whole fleet. `sync_all`
+                    // filters with `selected.is_empty() || …`, where an
+                    // empty list is indistinguishable from "no selector
+                    // given" — and both mean "everything". So
+                    // `--filter tag:nonexistent` synced every repo in the
+                    // fleet and reported success, while `ro status` with the
+                    // identical filter correctly returned nothing. The
+                    // resolver's own guarantee is that the two verbs cannot
+                    // disagree about identical input.
+                    //
+                    // A bare `ro sync` on an empty registry stays exit 0:
+                    // there is nothing wrong with asking for everything when
+                    // there is nothing, and that is the case this refusal is
+                    // scoped away from.
+                    if targets.is_empty() && (filter.is_some() || tag.is_some()) {
+                        eprintln!(
+                            "no repo matched the given --filter/--tag. \
+                             Nothing was synced."
+                        );
+                        std::process::exit(exit::EX_USAGE as i32);
+                    }
                     targets.iter().map(|t| t.repo_id.clone()).collect()
                 } else {
                     Vec::new()
@@ -1106,13 +1147,46 @@ fn run() -> Result<()> {
                             .get(&r.repo_id)
                             .cloned()
                             .unwrap_or_else(|| r.repo_id.clone());
-                        println!("{} action={} status={}", label, r.action, r.status);
+                        // The reason belongs on the default line whenever
+                        // there is one. It used to be printed only by the
+                        // JSON arm, so a plain `ro sync` on a tree whose
+                        // autostash pop conflicted said
+                        //
+                        //     work/mixed action=pull status=autostash_conflict
+                        //
+                        // and nothing else — dropping the very text the
+                        // autostash fix was written to surface, which names
+                        // `git stash list`, where the stash is, and how to
+                        // bring the work back. `skipped_dirty`'s "(use
+                        // --autostash)" was lost the same way, so a user who
+                        // ran the obvious command got the status word and no
+                        // explanation of it.
+                        match r.error.as_deref().filter(|_| r.status != "success") {
+                            Some(why) => {
+                                println!("{label} action={} status={} — {why}", r.action, r.status)
+                            }
+                            None => println!("{label} action={} status={}", r.action, r.status),
+                        }
                     }
                     OutputFormat::Json | OutputFormat::Ndjson => {
                         println!("{}", serde_json::to_string(r)?);
                     }
                 }
             }
+
+            // The run-level verdict has to reach the shell.
+            //
+            // `sync_all` computes `run_exit_code(&results)` and writes it to
+            // the `runs` table via `finalize_run`, and then this arm used to
+            // print the rows and fall off the end of `run()` — so the verdict
+            // was computed, persisted, and dropped before any script could
+            // see it. `doctor` and `ship` both call `process::exit`; `sync`
+            // was the only fleet verb that did not, which meant a run whose
+            // only bad repo was an autostash conflict — a tree full of
+            // conflict markers with the user's work parked in a stash —
+            // exited 0. FEATURES.md promises "the exit code carries the
+            // run-level verdict"; this is where that promise is kept.
+            std::process::exit(sync::run_exit_code(&results));
         }
 
         Commands::Status {
@@ -1144,6 +1218,29 @@ fn run() -> Result<()> {
                     eprintln!("error: {e:#}");
                     std::process::exit(exit::EX_USAGE as i32);
                 })?;
+                // A name that matches nothing is a **usage** error, the same
+                // code `ro sync` reports it as. It used to print nothing on
+                // stdout, nothing on stderr, and exit 0 — while `ro sync
+                // <name>` exited 64, `ro tag <name>` exited 70, and `ro
+                // remove <name>` succeeded. Four verbs, four answers to
+                // "what does the name alpha mean", and the silent one is
+                // indistinguishable from "that repo is clean".
+                //
+                // Scoped to a typed **name**. A `--filter` matching nothing
+                // stays an empty report, because a filter is a question
+                // about the fleet rather than a claim about a specific repo,
+                // and "none of them are dirty" is a real answer to it.
+                if targets.is_empty() && !named.is_empty() {
+                    eprintln!(
+                        "no repo matched {}",
+                        named
+                            .iter()
+                            .map(|r| format!("`{r}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
                 let mut out = Vec::with_capacity(targets.len());
                 for t in &targets {
                     out.push(status::status_repo(&conn, &t.repo_id)?);

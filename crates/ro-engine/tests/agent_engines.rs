@@ -10,6 +10,33 @@ use std::time::Duration;
 use ro_engine::{AgentEngine, BUILTIN_PROMPT, Engine, EngineContext, EngineOutcome};
 use ro_testkit::{TestEnv, Worktree};
 
+/// The engine for `kind`, pointed at `shim` by **path**.
+///
+/// # Why every test in this file goes through here
+///
+/// `AgentEngine::claude()` and `AgentEngine::codex()` name a bare binary
+/// and let `PATH` resolution find it. That is right for production and
+/// wrong for a test, for one reason: the answer depends on what the
+/// machine has installed. On CI no agent is installed, the shim directory
+/// prepended to `PATH` is the only `claude` there is, and the test passes.
+/// On a developer machine with the real `claude` in it, the same test
+/// spawns the **real agent** — the shim records nothing, the assertion
+/// fails, and the failure says nothing about the code under test.
+///
+/// Naming the shim by path removes `PATH` from the question entirely: the
+/// engine is handed the one file the test created, so the result is the
+/// same on every machine. `AgentEngine::with` is the constructor for
+/// exactly this — a different binary and the same arguments — and it is
+/// the one the extensibility note in `agent.rs` describes.
+///
+/// The defaults are deliberately `None`, so each slot gets the same
+/// argument list its built-in constructor would have used: the prompt
+/// assertions below are about argv, and a test that silently changed the
+/// flags would be testing something else.
+fn engine_for(shim: &ro_testkit::FakeBinary, kind: ro_engine::EngineKind) -> AgentEngine {
+    AgentEngine::with(kind, shim.program().to_string_lossy().to_string(), None)
+}
+
 /// A missing binary is `Unavailable`, and the process does not fail.
 ///
 /// The failure this guards is a spawn error escaping as a non-zero exit,
@@ -114,8 +141,18 @@ fn the_prompt_arrives_as_exactly_one_argument() {
     w.write("a.txt", "x\n");
 
     // A shim that records its argv, one invocation per line.
+    //
+    // Named by **path**, not left to `PATH` resolution — the same reason
+    // `a_failure_is_reported_from_the_whole_of_stderr_not_its_first_line`
+    // names its shim that way, and the comment there explains it at
+    // length. In short: on a machine with a real agent installed, a
+    // bare-name spawn runs the *real* agent and the shim records nothing,
+    // so the assertion below would fail on a developer machine and pass
+    // on CI, which has no agent installed. A test whose result depends
+    // on what the machine happens to have is not hermetic, and a green
+    // run of one is a claim about CI rather than about the code.
     let shim = ro_testkit::FakeBinary::recording("claude");
-    let engine = AgentEngine::claude();
+    let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
 
     // SAFETY: the body only runs the shim under a scrubbed PATH.
     let outcome = unsafe {
@@ -164,7 +201,7 @@ fn a_custom_prompt_replaces_the_builtin() {
     let w = Worktree::with_one_commit();
     w.write("a.txt", "x\n");
     let shim = ro_testkit::FakeBinary::recording("codex");
-    let engine = AgentEngine::codex();
+    let engine = engine_for(&shim, ro_engine::EngineKind::Codex);
 
     unsafe {
         TestEnv::new().shim(&shim).run(|| {
@@ -192,7 +229,7 @@ fn a_hanging_engine_is_killed_and_reported_as_timed_out() {
     w.write("a.txt", "x\n");
 
     let shim = ro_testkit::FakeBinary::hanging("claude");
-    let engine = AgentEngine::claude();
+    let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_millis(300));
 
     let started = std::time::Instant::now();
@@ -307,7 +344,7 @@ fn a_non_zero_agent_exit_is_classified() {
 
     let shim =
         ro_testkit::FakeBinary::failing("claude", 1, "Error: rate limit exceeded, try later later");
-    let engine = AgentEngine::claude();
+    let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(10));
 
     let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
