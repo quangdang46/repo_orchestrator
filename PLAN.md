@@ -255,8 +255,10 @@ ro [<GLOBAL FLAGS>] <COMMAND>
                      #   --prompt <TEXT>     overrides [agent] prompt for this run
                      #   --message <MSG>     one commit with this subject
                      #   --amend             fold into HEAD. Refuses if HEAD is pushed.
-                     #   --dry-run           THE DEFAULT
-                     #   --execute           --format text|json|ndjson
+                     #   --dry-run           preview; the run writes by default.
+                     #                      See the note below — this line was
+                     #                      once "THE DEFAULT" and the plan was wrong.
+                     #   --format text|json|ndjson
 
   push [<REPO>…]     # the remote half. Commits first if there is anything uncommitted.
                      #   per repo: rebase -> [commit] -> push
@@ -264,7 +266,6 @@ ro [<GLOBAL FLAGS>] <COMMAND>
                      #   --onto <BRANCH>    rebase onto something other than the
                      #                       repo's own default branch
                      #   --resolve           let the engine resolve REAL conflicts
-                     #   --yes               auto-answer the rebase prompt
                      #   --include-archived  --format text|json|ndjson
 
   ship [<REPO>…]     # THE command. commit + push, end to end, in one word.
@@ -1416,7 +1417,7 @@ Additions, each with a reason:
 | `--no-push` | Commit locally without pushing. Keeps checkpoint usable on a plane, where `--dry-run` is useless (there is nothing to preview when you just want the commit). |
 | `--include-archived` | The escape hatch for the `archived = 0 AND disabled = 0` filter (§6.3). Without it, archived repos become unreachable to checkpoint; with it, the safe default is still safe. |
 | `--resolve` | On a **real** merge conflict, dispatch the engine a second time to resolve the conflicted paths. The engine edits and stages; ro runs `rebase --continue` and pushes. Off by default because it is the only step in the tool that lets a model touch files mid-rebase — the mechanical non-fast-forward fix happens regardless and never needs it. |
-| `--yes` | Answer the "rebase and retry?" prompt affirmatively. For CI and for a fleet run where the repos are already yours. Does **not** imply `--resolve`: auto-rebasing is mechanical and safe to automate, auto-resolving a semantic conflict is not. |
+| ~~`--yes`~~ | **Not shipped, and not shippable as described.** The rebase step runs `git rebase --autostash` non-interactively and reports a conflict rather than asking, so there is no "rebase and retry?" prompt for the flag to answer. A flag whose only effect would be to skip a question that does not exist is the same inert surface this pass has been deleting; `--non-interactive` is already global for the prompts that are. |
 | ~~`-j <N>`~~ | **Not shipped.** `ro schema` reports no `-j` and no `--parallel`; bounded concurrency is a §6.5 property of the coordinator's executor, not a flag. |
 | `--timeout <SECS>` | Per-git-command and per-engine timeout. Overrides `[core].timeout_secs`, which becomes live. |
 | `--engine-bin <PATH>` | Per-run engine binary override. Replaces the free-form `[engines.*]` table; valid only together with `--engine`. |
@@ -1825,7 +1826,7 @@ If any GitHub call *does* survive elsewhere, it needs a `base_uri` parameter on 
 
 **Rebase before agent**
 104. A push rejected as non-fast-forward is rebase-and-retry **without dispatching an engine**. Assert the fake engine's invocation count did not increase.
-105. `--yes` makes the rebase-and-retry non-interactive, and does **not** enable `--resolve` — `--yes` alone on a real conflict still hands over to the user.
+105. ~~`--yes`~~ — **dropped**, see the flag table. There is no rebase prompt to auto-answer, and the two tests that would have covered it were asserting behaviour that did not exist.
 106. A real conflict with `--resolve` dispatches the engine exactly once more, with a different prompt, and the engine's captured output contains no `rebase --continue` and no `push`. ro runs both afterwards.
 107. The rebase retry uses `--force-with-lease` and never `--force`. Assert the recorded invocation's argv.
 108. A branch that is still non-fast-forward after a successful rebase is reported and the repo is marked failed — no second blind retry.
@@ -1922,6 +1923,68 @@ CI runs a 3-OS matrix and the two red tests today are Windows-only, so the Windo
 ---
 
 ## 9. Risks and open decisions
+
+### What the audit found that reading had not
+
+Everything in this section was found by *running* the fleet — a real bare
+remote, a real `claude` install, a real `ro init` on a clean machine — and
+none of it by reading the source. They are recorded because the pattern is
+the point: the failures were all in the seams between working parts.
+
+**`ro sync` never worked.** `git pull` is `git pull [remote] [branch]`
+positionally; the caller passed a branch and no remote, so git read the
+branch as a *remote name* and every sync in the fleet failed with
+"does not appear to be a git repository". Fixed in `pull`, where git's
+grammar is known.
+
+**A test was reading that bug as the behaviour it wanted.** A test that moved
+only the local branch asserted the pull was refused — and it was, for the
+wrong reason. With the fix, a local-ahead branch correctly reports "already
+up to date" and exits 0. **A test that passes for the wrong reason is worse
+than no test**, because it pins the bug in place.
+
+**Ten of fourteen config tables had no reader at all.** `[mcp]`, `[jobs]`,
+`[safety]`, `[git]`, `[checkpoint]`, `[review]`, `[providers]`,
+`[engines]` were written into every new user's file and never read again —
+and `[safety] secret_scan` and `[checkpoint] secret_scan` were both
+*validated*, so `ro doctor` would refuse to start over a bad value in a key
+that changed nothing. The file's own comment had said it: "a key that is
+checked and then ignored is worse than one that is absent."
+
+**`ro doctor --fix` was making it worse.** Its section list contained the
+two cut tables and omitted three that are read, so the repair command wrote
+empty tables the user would fill in — and nothing would read what they wrote.
+
+**The default engine's arguments were rejected by the binary.**
+`claude -p --output-format=stream-json` needs `--verbose`, so `ro commit`
+with no flags failed on the first real invocation, on the one machine that
+had `claude` installed at all.
+
+**The engine's "several logical commits" never became several commits.**
+The plan parser took subject lines, and the loop committed the whole index
+once per subject — first commit took everything, the rest failed. And when an
+agent read "group the changes into commits" as an instruction and committed
+itself, the tree came back clean and ro reported "nothing to commit" about
+work that had already happened. Fixed by changing the contract to a plan
+naming files per group, so `ro` stages each group itself.
+
+**An identity was resolved and then thrown away.** `AppConfig` had no
+`identity` field, so `global_identity` was hardcoded to `None` and every
+commit fell through to git's own config; and `author_ref` was read as a
+literal name, so `ro add --author work` produced a real commit authored
+`work@localhost`, reported as success. The `git` engine also took no
+author at all — the engine with no external binary to install, and the one a
+new user reaches first.
+
+**Eleven flags the plan promised did not exist**, and two that did existed
+meant the same thing to both engines (`--prompt` and `--message` shared
+one field, so the raw backend got a prompt where it wanted a subject).
+
+The through-line: **every one of these was in code that was individually
+correct.** The config tables were valid TOML. The pull arguments were valid
+git. The subject lines were parsed correctly. Nothing about reading the
+source would have found them, and the test suite was green through all of
+it because the tests were written against the same wrong model.
 
 ### Real risks
 

@@ -268,7 +268,7 @@ pub fn sync_repo(
         };
 
         let pull_opts = ro_git::mutation::PullOpts {
-            branch: Some(branch),
+            branch: Some(branch.clone()),
             strategy: pull_strategy,
             ..Default::default()
         };
@@ -373,11 +373,47 @@ pub fn sync_repo(
                 })
             }
             Ok(outcome) => {
-                let stderr = outcome.result.stderr.trim();
+                // A branch that has never been pushed has no remote-tracking
+                // ref, and `git pull` answers "couldn't find remote ref".
+                //
+                // That is the *normal* state of a branch someone just made
+                // with `git checkout -b`, so recording it as a sync failure
+                // fills a fleet board with red for repos that are exactly
+                // as they should be. It is a skip with a reason, not an
+                // error — and there is nothing to fetch, which is the point.
+                let stderr = outcome.result.stderr.trim().to_string();
+                if stderr.contains("couldn't find remote ref")
+                    || stderr.contains("does not appear to be a git repository")
+                {
+                    let detail = format!(
+                        "{branch} has no remote branch yet — it has never been pushed. \
+                         Nothing to fetch."
+                    );
+                    record_result(
+                        conn,
+                        run_id,
+                        &repo.id,
+                        "pull",
+                        "skipped_unpushed",
+                        duration,
+                        Some(&detail),
+                        &pre_oid,
+                        &post_oid,
+                    )?;
+                    return Ok(SyncResult {
+                        repo_id: repo.id.clone(),
+                        action: "skipped_unpushed".into(),
+                        status: "skipped".into(),
+                        duration_ms: duration,
+                        error: None,
+                        pre_oid,
+                        post_oid,
+                    });
+                }
                 let err_msg = if stderr.is_empty() {
                     format!("git pull failed with status {}", outcome.result.status)
                 } else {
-                    stderr.to_string()
+                    stderr
                 };
                 record_result(
                     conn,
@@ -536,7 +572,7 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn setup() -> (TempDir, Connection) {
+    pub(crate) fn setup() -> (TempDir, Connection) {
         let tmp = TempDir::new().unwrap();
         let conn = ro_state::open_memory().unwrap();
         (tmp, conn)
@@ -549,7 +585,7 @@ mod tests {
     /// "Author identity unknown" on the other. The identity comes from
     /// the environment git documents for exactly this, and the config
     /// files are neutralised — `NUL` on Windows, `/dev/null` elsewhere.
-    fn run_git(dir: &Path, args: &[&str]) -> std::process::Output {
+    pub(crate) fn run_git(dir: &Path, args: &[&str]) -> std::process::Output {
         let mut cmd = std::process::Command::new("git");
         cmd.args(args)
             .current_dir(dir)
@@ -568,14 +604,14 @@ mod tests {
         cmd.output().expect("git runs")
     }
 
-    fn init_bare_remote(dir: &Path) -> PathBuf {
+    pub(crate) fn init_bare_remote(dir: &Path) -> PathBuf {
         let remote = dir.join("remote.git");
         std::fs::create_dir_all(&remote).unwrap();
         run_git(&remote, &["init", "--bare", "-b", "main"]);
         remote
     }
 
-    fn commit_to_remote(dir: &Path, remote: &Path, name: &str, content: &str) {
+    pub(crate) fn commit_to_remote(dir: &Path, remote: &Path, name: &str, content: &str) {
         let clone_dir = dir.join("tmp-clone");
         std::fs::create_dir_all(&clone_dir).unwrap();
         run_git(&clone_dir, &["clone", &remote.to_string_lossy(), "."]);
@@ -1082,5 +1118,66 @@ mod filter_and_skip_tests {
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null");
         cmd.output().expect("git runs")
+    }
+}
+
+/// A branch that was never pushed is a skip, not a failure.
+///
+/// `git checkout -b` is the normal way a branch starts, so "no remote
+/// branch yet" is the state of most repos an hour after they were created.
+/// Recording it as a sync error fills a fleet board with red for repos that
+/// are exactly as they should be, and the message a user sees is git's
+/// ("couldn't find remote ref") rather than anything they can act on.
+#[cfg(test)]
+mod unpushed_branch_tests {
+    use super::*;
+
+    #[test]
+    fn an_unpushed_branch_is_skipped_rather_than_recorded_as_an_error() {
+        let (tmp, conn) = super::tests::setup();
+        let remote = super::tests::init_bare_remote(tmp.path());
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "hello");
+        let local_path = tmp.path().join("local").join("proj1");
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+        sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
+
+        // A branch made locally and never pushed — the state right after
+        // `git checkout -b`.
+        super::tests::run_git(&local_path, &["checkout", "-b", "fresh"]);
+
+        let results = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
+        let r = &results[0];
+        assert_eq!(
+            r.status, "skipped",
+            "a branch with no remote yet must not be an error, got {r:?}"
+        );
+        assert_eq!(r.action, "skipped_unpushed");
+        assert!(r.error.is_none(), "a skip carries no error: {r:?}");
+
+        // And it must not be counted as a failed sync in the table either.
+        let failed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_results WHERE repo_id = ?1 AND status = 'error'",
+                params![repo_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed, 0, "a never-pushed branch is not a sync failure");
     }
 }
