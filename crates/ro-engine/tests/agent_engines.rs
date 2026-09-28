@@ -209,6 +209,93 @@ fn a_hanging_engine_is_killed_and_reported_as_timed_out() {
     );
 }
 
+/// The reported error must be the one the agent actually failed on.
+///
+/// The test above passes with a single line of stderr, which is the shape
+/// `claude` tends to produce and the only shape this code was exercised
+/// against. `codex` does not produce it: `codex exec` writes a version
+/// banner, a workdir/model/session preamble, an echo of the prompt, and
+/// reconnect progress to **stderr**, and only then the error. A real
+/// unauthenticated run on this machine put the actual cause —
+///
+///     unexpected status 401 Unauthorized: Missing bearer or basic
+///     authentication in header
+///
+/// thirteen lines down, with `Reading additional input from stdin...` on
+/// line one. Reporting only the first line reports the banner.
+///
+/// `classify_agent_output` already reads the whole stream, so `class` is
+/// computed correctly and only `error` is wrong — which is the worst shape
+/// for this bug: the taxonomy looks right in the JSON while the human-
+/// readable string is a progress line.
+#[test]
+fn a_failure_is_reported_from_the_whole_of_stderr_not_its_first_line() {
+    let w = Worktree::with_one_commit();
+    w.write("a.txt", "x\n");
+
+    // The shape `codex exec` actually produces, in order. Built line by
+    // line: `FakeBinary::failing` writes one `echo`, which on Windows
+    // collapses to a single line and would make this test pass against a
+    // build that reports only the first line — the exact blindness this is
+    // here to remove.
+    let stderr = [
+        "Reading additional input from stdin...",
+        "OpenAI Codex v0.118.0 (research preview)",
+        "--------",
+        "workdir: /tmp/proj",
+        "model: gpt-5.3-codex",
+        "session id: 01a0e787-5e6d-7e51-bca8-e1ac87a74aab",
+        "--------",
+        "ERROR: Reconnecting... 1/5",
+        "ERROR: Reconnecting... 2/5",
+        "ERROR: unexpected status 401 Unauthorized: Missing bearer or basic \
+         authentication in header, url: https://api.openai.com/v1/responses",
+    ];
+
+    let shim = ro_testkit::FakeBinary::failing_lines("codex", 1, &stderr);
+    // The shim is named by **path**, not left to PATH resolution.
+    //
+    // `AgentEngine::codex()` resolves the bare name `codex` and tries
+    // `.exe` first *across the whole PATH* before it ever tries `.cmd`, so
+    // on a machine with a real `codex.exe` installed — or a real
+    // `claude.exe`, which is what breaks the sibling tests in this file —
+    // the real binary wins and the shim is never spawned. This test was
+    // first written with the bare name and went red reporting
+    // `Error loading config.toml: invalid type: string "wwwww"` — the
+    // operator's own `~/.codex/config.toml`, read by a real codex. Naming
+    // the file removes PATH from the question entirely.
+    let engine = AgentEngine::with(
+        ro_engine::EngineKind::Codex,
+        shim.program().to_string_lossy().to_string(),
+        None,
+    );
+    let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(10));
+
+    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
+
+    match outcome {
+        EngineOutcome::Failed { error, .. } => {
+            // The banner *may* be in there — carrying the whole stream is a
+            // fine way to fix this. What must not happen is the banner being
+            // all there is, because that is the run where the user is told
+            // "Reading additional input from stdin..." and never told the
+            // token is missing.
+            assert!(
+                error.contains("401") && error.contains("Unauthorized"),
+                "the reported error must name the real cause, which is on a \
+                 later line of stderr. Got only: {error}"
+            );
+            assert!(
+                error.contains("Reconnecting"),
+                "the progress lines are part of the stream too, so a report \
+                 that skipped to the last line would also satisfy this test; \
+                 this one must not be the *only* thing reported: {error}"
+            );
+        }
+        other => panic!("a non-zero exit must be Failed, got {other:?}"),
+    }
+}
+
 /// A non-zero agent exit is classified into the shared taxonomy.
 ///
 /// One taxonomy, not a second one for agents: a caller that has to learn

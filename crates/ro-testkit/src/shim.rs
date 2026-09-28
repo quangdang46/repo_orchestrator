@@ -148,6 +148,50 @@ exit /b 0"##,
         }
     }
 
+    /// A failing shim whose stderr really is **several lines**.
+    ///
+    /// [`failing`](Self::failing) writes the whole message with one `echo`,
+    /// so on Windows it arrives as a single line — `cmd.exe` has no way to
+    /// carry an embedded newline in an argument. That is a convenience, and
+    /// it is also a blind spot: code that reads only the first line of an
+    /// agent's stderr is indistinguishable from code that reads all of it,
+    /// when every fixture happens to be one line long.
+    ///
+    /// Real agents are not one line long. `codex exec` writes a version
+    /// banner, a workdir/model/session preamble, an echo of the prompt and
+    /// reconnect progress to stderr before the failure — the actual error was
+    /// on line 14 of a real run here. This constructor emits one `echo` per
+    /// line so the child sees the real line structure on both platforms.
+    ///
+    /// A line that is empty or would be swallowed by `echo` is written as
+    /// `echo.`, which is `cmd.exe`'s way of emitting a blank line.
+    pub fn failing_lines(name: &str, code: i32, lines: &[&str]) -> Self {
+        let joined = lines.join("\n");
+        let unix = format!("cat >&2 <<'RO_TESTKIT_EOF'\n{joined}\nRO_TESTKIT_EOF\nexit {code}");
+        let windows = {
+            let mut body = String::from("@echo off\r\n");
+            for line in lines {
+                if line.trim().is_empty() {
+                    body.push_str("echo. 1>&2\r\n");
+                } else {
+                    // `echo` treats a bare `on`/`off`/`?` and a trailing
+                    // backslash specially; `ECHO OFF` state is already off
+                    // and a line that is only whitespace is handled above.
+                    body.push_str(&format!("echo {} 1>&2\r\n", line));
+                }
+            }
+            body.push_str(&format!("exit /b {code}"));
+            body
+        };
+        let dir = TempDir::new().expect("the shim dir is creatable");
+        let log = dir.path().join("argv.log");
+        write_shim(dir.path(), name, &shim_body(&unix, &windows, &log));
+        Self {
+            dir: OwnedDir::Temp(dir),
+            name: name.to_string(),
+        }
+    }
+
     /// A fake agent engine: it makes a real commit, like the engines do.
     ///
     /// Returns the working directory the shim commits in, read from

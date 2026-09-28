@@ -524,7 +524,7 @@ pub fn commit(repo: &Path, files: &[PathBuf], message: &str) -> Result<String> {
 /// premise is that a credential in the wrong place leaks should not be the one
 /// putting it there. `RunOpts` already exists to carry per-invocation
 /// environment, which is why this is not a `-c` argument.
-fn extraheader_env(host: &str, token: &SecretString) -> Vec<(String, String)> {
+fn extraheader_env(origin: &str, token: &SecretString) -> Vec<(String, String)> {
     // GitHub's documented form for a token over HTTPS. The password half is
     // the token; the username is a fixed marker, not a login.
     let credentials = format!("x-access-token:{}", token.expose());
@@ -533,7 +533,20 @@ fn extraheader_env(host: &str, token: &SecretString) -> Vec<(String, String)> {
         ("GIT_CONFIG_COUNT".to_string(), "1".to_string()),
         (
             "GIT_CONFIG_KEY_0".to_string(),
-            format!("http.https://{host}/.extraheader"),
+            // `origin` is scheme **and** host — `https://github.com`, not
+            // `github.com`.
+            //
+            // It used to be assembled as `http.https://{host}/`, which
+            // hardcoded the scheme. A plain-HTTP remote — a self-hosted
+            // Gitea, a mirror, anything without TLS — then had its
+            // credential scoped to a `https://` URL that is never
+            // requested. The header was silently dropped, git fell back to
+            // the machine's credential helper, and the push either failed or
+            // succeeded as the *wrong account* — the exact identity leak the
+            // per-invocation header exists to make impossible. It also
+            // opened a modal credential dialog on the user's machine and
+            // hung the run.
+            format!("http.{origin}/.extraheader"),
         ),
         (
             "GIT_CONFIG_VALUE_0".to_string(),

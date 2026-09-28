@@ -696,6 +696,124 @@ mod tests {
         assert_eq!(open, 0, "a finished sync run must be finalised");
     }
 
+    /// `--autostash` is the flag that makes a dirty worktree syncable, and
+    /// the case that needs it is the one where the remote moved **on the file
+    /// the tree is dirty in**. Anything less is a false pass: if the remote
+    /// only touched a different file, `git pull --ff-only` fast-forwards
+    /// straight past the dirty file, leaves it dirty, and reports success —
+    /// so the test passes on a build that never stashed anything and never
+    /// popped anything. `git stash list` is empty in that case too, because
+    /// no stash was ever created. Asserting on the pull's *success* alone
+    /// therefore proves nothing about `--autostash` at all.
+    ///
+    /// Here the remote rewrites the same line the tree has uncommitted, so a
+    /// pull without `--autostash` is refused by git itself:
+    ///
+    ///     Your local changes to the following files would be overwritten
+    ///     by merge
+    ///
+    /// That refusal is what the flag is supposed to prevent. The run must
+    /// stash, pull, and pop.
+    ///
+    /// Two facts about git that shape the fix, both measured here rather
+    /// than assumed:
+    ///
+    ///  * `git pull --autostash` **exits 0 even when the pop conflicts.** On
+    ///    a real tree with the remote and the worktree both rewriting the
+    ///    same line, the pull fast-forwards, the pop conflicts, and git
+    ///    prints `Applying autostash resulted in conflicts` and returns
+    ///    success. So `status == "success"` alone does not mean the work
+    ///    came back; a fix has to read the tree or the stream, not the code.
+    ///  * A failed pop **keeps** the stash (`git stash list` still shows
+    ///    `stash@{0}: autostash`), and the work is then reachable only
+    ///    through that stash. The plan's rule — a failed pop is a per-repo
+    ///    failure naming `git stash list`, never a proceed on a half-popped
+    ///    tree — is therefore a real requirement, not a nicety: a silent
+    ///    success here is a user's uncommitted work that nothing mentions.
+    ///
+    /// Leaving the local edit back on top of the
+    /// remote's version, with no stash left behind.
+    #[test]
+    fn autostash_pulls_a_tree_that_is_dirty_in_a_file_the_remote_moved() {
+        let (tmp, conn) = setup();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        // A real clone, so there is a real `origin` and a real worktree.
+        let local_path = tmp.path().join("local").join("proj1");
+        std::fs::create_dir_all(&local_path).unwrap();
+        run_git(&local_path, &["clone", &remote.to_string_lossy(), "."]);
+        run_git(&local_path, &["config", "user.email", "test@example.com"]);
+        run_git(&local_path, &["config", "user.name", "Test"]);
+
+        // The tree goes dirty, in the file the remote is about to change.
+        std::fs::write(local_path.join("a.txt"), "LOCAL UNCOMMITTED WORK").unwrap();
+        let dirty = run_git(&local_path, &["status", "--porcelain"]);
+        assert!(
+            dirty.status.success() && !dirty.stdout.is_empty(),
+            "the worktree must actually be dirty before the sync, or this test \
+             proves nothing: {}",
+            String::from_utf8_lossy(&dirty.stdout)
+        );
+
+        // Now the remote moves, rewriting that exact file.
+        commit_to_remote(tmp.path(), &remote, "a.txt", "REMOTE MOVED AHEAD");
+
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+
+        let results = sync_all(
+            &conn,
+            &SyncOptions {
+                autostash: true,
+                ..SyncOptions::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(
+            results[0].status, "success",
+            "--autostash must let a dirty tree pull; the flag only bypasses \
+             ro's own skip and never reaches git, so git refuses the merge \
+             over the local change. error: {:?}",
+            results[0].error
+        );
+
+        // The pull actually landed.
+        let after = std::fs::read_to_string(local_path.join("a.txt")).unwrap();
+        assert!(
+            after.contains("REMOTE MOVED AHEAD") || after.contains("LOCAL UNCOMMITTED WORK"),
+            "the file must not be left in a state neither side wrote, got: {after}"
+        );
+
+        // And the stash did not leak. `--autostash` promises a pop, and a
+        // pop that did not happen leaves the user's work sitting in a stash
+        // they were never told about.
+        let stashes = run_git(&local_path, &["stash", "list"]);
+        assert!(
+            stashes.stdout.is_empty(),
+            "--autostash must pop what it stashed; a leftover entry means the \
+             work is only recoverable by hand: {}",
+            String::from_utf8_lossy(&stashes.stdout)
+        );
+    }
+
     /// Without this, the test above would also pass on a database where
     /// nothing can be inserted at all — the assertion would be true for a
     /// reason that has nothing to do with the run row.

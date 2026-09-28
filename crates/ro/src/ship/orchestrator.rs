@@ -546,7 +546,10 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                     .unwrap_or_else(|| plan.base_branch.clone()),
             ),
             set_upstream: true,
-            host: Some(plan.host_for_extraheader()),
+            // `None` for an SSH remote, which is correct: the header is an
+            // HTTP mechanism and SSH authenticates with keys. Inventing a
+            // host for it would only aim the token at nothing.
+            host: plan.host_for_extraheader(),
             ..Default::default()
         },
         secret.as_ref(),
@@ -568,17 +571,29 @@ impl RepoPlan {
     ///
     /// A local path has no host, and a credential scoped to
     /// `github.com` must not be offered to one.
-    fn host_for_extraheader(&self) -> String {
-        if self.clone_url.starts_with("http") {
-            self.clone_url
-                .split("//")
-                .nth(1)
-                .and_then(|r| r.split('/').next())
-                .unwrap_or("github.com")
-                .to_string()
-        } else {
-            "localhost".into()
+    /// The **scheme and host** the credential's extraheader is scoped to.
+    ///
+    /// Scheme included, and that is the whole point: the header used to be
+    /// assembled as `http.https://{host}/`, so a plain-HTTP remote had its
+    /// credential scoped to a URL that is never requested. The header was
+    /// dropped, git fell back to the machine's credential helper, and the
+    /// push either failed or succeeded as the *wrong account* — plus a modal
+    /// dialog on the user's screen.
+    ///
+    /// A non-HTTP remote (SSH) returns `None` rather than a fake origin: SSH
+    /// authenticates with keys, not this header, so there is nothing to
+    /// scope and a made-up host would only send the token somewhere it has
+    /// no business going.
+    fn host_for_extraheader(&self) -> Option<String> {
+        let (scheme, rest) = self.clone_url.split_once("://")?;
+        if !matches!(scheme, "http" | "https") {
+            return None;
         }
+        let host = rest.split('/').next().unwrap_or_default();
+        if host.is_empty() {
+            return None;
+        }
+        Some(format!("{scheme}://{host}"))
     }
 }
 
