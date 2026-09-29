@@ -491,3 +491,147 @@ fn delete_still_removes_the_working_copy_it_can_prove() {
         "the working copy is the one thing this flag is for; it must be gone"
     );
 }
+
+/// A checkout containing an **unregistered** nested repository must not be
+/// deleted.
+///
+/// The registered-row check above only fires when the nested repository
+/// happens to be a row too. A stray `git clone` inside a checkout is not a
+/// row — it is exactly the thing nobody registered — and it sailed straight
+/// through, destroying a user's uncommitted work with exit 0 and "Deleted
+/// working copy" in the log. Reproduced on a real directory before the fix.
+///
+/// The registry cannot answer this question, because the thing at risk is
+/// the thing nobody registered. The directory is where it has to be read.
+#[test]
+fn delete_refuses_a_checkout_containing_an_unregistered_nested_repo() {
+    // A real clone with a real `origin`, because the gate that fires before
+    // the nested check is the origin one: a checkout with no remote is
+    // refused for a different reason, and the test would then assert
+    // nothing about the check it exists for. This is the same trap the
+    // parent test's doc comment records.
+    let bare_root = TempDir::new().unwrap();
+    let bare = bare_root.path().join("origin.git");
+    ro_testkit::worktree::run(
+        bare_root.path(),
+        &["init", "-q", "--bare", &bare.to_string_lossy()],
+    );
+    let seed = bare_root.path().join("seed");
+    ro_testkit::worktree::run(
+        bare_root.path(),
+        &["clone", "-q", &bare.to_string_lossy(), "seed"],
+    );
+    ro_testkit::worktree::run(&seed, &["config", "user.email", "t@e.com"]);
+    ro_testkit::worktree::run(&seed, &["config", "user.name", "T"]);
+    std::fs::write(seed.join("README.md"), "# fixture\n").unwrap();
+    ro_testkit::worktree::run(&seed, &["add", "-A"]);
+    ro_testkit::worktree::run(&seed, &["commit", "-q", "-m", "initial"]);
+    ro_testkit::worktree::run(&seed, &["push", "-q", "-u", "origin", "HEAD:main"]);
+
+    let repo_dir = TempDir::new().unwrap();
+    ro_testkit::worktree::run(
+        repo_dir.path(),
+        &["clone", "-q", &bare.to_string_lossy(), "checkout"],
+    );
+    let checkout = repo_dir.path().join("checkout");
+    ro_testkit::worktree::run(&checkout, &["config", "user.email", "t@e.com"]);
+    ro_testkit::worktree::run(&checkout, &["config", "user.name", "T"]);
+
+    let config_dir = TempDir::new().unwrap();
+    let state_dir = TempDir::new().unwrap();
+    let mut fresh = Command::cargo_bin("ro").expect("the ro binary compiles");
+    fresh
+        .arg("--config-dir")
+        .arg(config_dir.path())
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .arg("init")
+        .assert()
+        .success();
+    let mut add = Command::cargo_bin("ro").expect("the ro binary compiles");
+    add.arg("--config-dir")
+        .arg(config_dir.path())
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .arg("add")
+        .arg(&checkout)
+        .assert()
+        .success();
+    let key = {
+        let out = Command::cargo_bin("ro")
+            .expect("the ro binary compiles")
+            .arg("--config-dir")
+            .arg(config_dir.path())
+            .arg("--state-dir")
+            .arg(state_dir.path())
+            .args(["list", "--format", "ndjson"])
+            .output()
+            .expect("ro list runs");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(&l).expect("a JSON row"))
+            .find(|v| v["local_path"].as_str() == Some(checkout.to_str().unwrap()))
+            .map(|v| format!("{}/{}", v["owner"].as_str().unwrap(), v["name"].as_str().unwrap()))
+            .expect("the checkout is registered")
+    };
+
+    // A nested clone at a depth the walk has to find. It is **not** a
+    // registered row, which is the whole point: that is what the registry
+    // check cannot see.
+    //
+    // The directory is deliberately not one of the walk's SKIP entries
+    // (`target`, `node_modules`, `vendor`, …): a `.git` in build output is
+    // vendored rather than a working copy, so the walk is right to skip it,
+    // and a fixture placed there would prove nothing.
+    let other = bare_root.path().join("other.git");
+    ro_testkit::worktree::run(
+        bare_root.path(),
+        &["init", "-q", "--bare", &other.to_string_lossy()],
+    );
+    let nested = checkout.join("tools").join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    ro_testkit::worktree::run(
+        &checkout,
+        &["clone", "-q", &other.to_string_lossy(), "tools/nested"],
+    );
+    assert!(
+        nested.join(".git").exists(),
+        "the nested repository must exist for this test to mean anything"
+    );
+    // And something in the outer checkout that must survive.
+    std::fs::write(checkout.join("precious.txt"), "user work\n").unwrap();
+
+    let out = Command::cargo_bin("ro")
+        .expect("the ro binary compiles")
+        .arg("--config-dir")
+        .arg(config_dir.path())
+        .arg("--state-dir")
+        .arg(state_dir.path())
+        .args(["remove", &key, "--delete", "--non-interactive"])
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "a checkout containing a nested repository must be refused, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("contains another git repository"),
+        "the refusal must say what it found, got: {stderr}"
+    );
+    // The directory and its contents survive. This is the assertion that
+    // matters: a gate that deletes the fixture and then reports success
+    // passes for the wrong reason.
+    assert!(
+        checkout.join("precious.txt").exists(),
+        "the user's work must survive the refusal"
+    );
+    assert!(
+        nested.join(".git").exists(),
+        "and so must the nested repository"
+    );
+}

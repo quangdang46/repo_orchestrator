@@ -564,6 +564,64 @@ fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
+/// The first nested git repository at or under `root`, other than `root` itself.
+///
+/// This is a question about the **filesystem**, and it has to be: the thing
+/// at risk from `ro remove --delete` on a directory containing a repository
+/// is that repository, and by definition it is a repository ro has no row
+/// for. Asking the registry instead — which is what the registered-row check
+/// above does — answers the question only when the answer was already known.
+///
+/// A directory containing a `.git` entry is the test, and it is done by
+/// walking rather than by listing depth 1, because a nested repository can
+/// sit at any depth. The walk is bounded: it descends at most
+/// [`NESTED_SCAN_DEPTH`] levels and skips the directories that are build
+/// output, where a vendored copy is not a repository the user would miss.
+fn find_nested_repo(root: &std::path::Path, self_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    /// Deep enough for a `deps/`, shallow enough to be cheap.
+    const NESTED_SCAN_DEPTH: usize = 4;
+    /// Never descended into: build output and dependency trees, where a
+    /// `.git` entry is vendored rather than a working copy.
+    const SKIP: &[&str] = &[
+        "target",
+        "node_modules",
+        ".venv",
+        "vendor",
+        "dist",
+        "build",
+    ];
+
+    fn walk(dir: &std::path::Path, depth: usize, self_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        if depth == 0 {
+            return None;
+        }
+        let entries = std::fs::read_dir(dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if dir == self_dir && name == ".git" {
+                // The repository we were asked about is not a nested one.
+                continue;
+            }
+            if path.is_dir() && path.join(".git").exists() {
+                return Some(path);
+            }
+            if SKIP.contains(&name.as_ref()) {
+                continue;
+            }
+            if path.is_dir() {
+                if let Some(found) = walk(&path, depth - 1, self_dir) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    walk(root, NESTED_SCAN_DEPTH, self_dir)
+}
+
 /// Where does the working tree that contains `dir` actually start?
 ///
 /// `git rev-parse --show-toplevel` is the authority, and it is asked with the
@@ -1405,6 +1463,35 @@ fn run() -> Result<()> {
                         other.owner,
                         other.name,
                         other.local_path
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+
+                // (3c) The same question asked of the **filesystem** rather
+                // than of the registry.
+                //
+                // (3b) consults the rows, so it only fires when the nested
+                // repository happens to be registered too. An unregistered
+                // nested clone — which is what a stray `git clone` inside a
+                // checkout is, and what someone tidying up is most likely to
+                // have — sailed straight through and took a user's uncommitted
+                // work with it. Reproduced on a real directory: `precious.txt`
+                // destroyed, exit 0, "Deleted working copy" in the log.
+                //
+                // The registry cannot answer this question because the thing
+                // at risk is precisely the thing nobody registered. A nested
+                // repository is a fact about the directory being deleted, so
+                // the directory is where it has to be read from — and the
+                // working tree is walked, not the depth-1 listing, because a
+                // clone can sit at any depth under a checkout.
+                if let Some(found) = find_nested_repo(&path, &path) {
+                    eprintln!(
+                        "refused: {} contains another git repository at {}. Deleting it \
+                         would destroy that repository too, and ro has no row saying it \
+                         is safe to lose. Nothing was deleted — remove it first, or point \
+                         this row at its own checkout.",
+                        path.display(),
+                        found.display()
                     );
                     std::process::exit(exit::EX_USAGE as i32);
                 }
