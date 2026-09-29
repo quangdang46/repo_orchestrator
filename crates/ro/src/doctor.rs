@@ -6,6 +6,13 @@
 //! mutation backed up the prior state to `<state_dir>/doctor/runs/<run-id>/`.
 //! No such code existed.
 //!
+//! There is exactly one exception, and it is a copy rather than a deletion:
+//! a `state.db` that is not a database is saved to `state.db.bak` and
+//! replaced with an empty one. That is the only repair here that throws
+//! anything away, so it is the only one that takes a backup first — and the
+//! only one that refuses when the backup could not be written. See
+//! [`repair_state_db`].
+//!
 //! Checks (per rfo-47 spec):
 //!
 //! * `git` binary is on `PATH` and reports a parseable version
@@ -184,6 +191,25 @@ pub struct DoctorOptions {
     /// ... --state-dir ... doctor` actually inspect the paths the user asked
     /// about instead of always reporting on the default XDG location.
     pub paths: Option<ConfigPaths>,
+    /// Where `--fix` writes a repaired state database.
+    ///
+    /// `None` means "the path `paths` names", which is what the CLI passes
+    /// and what every test that drives `run()` wants. A test that needs to
+    /// assert on the *file* — that a backup was written, that a corrupt
+    /// database was replaced rather than edited in place — passes the path
+    /// it already holds.
+    pub state_db_path: Option<PathBuf>,
+}
+
+/// The state database this run is acting on.
+///
+/// One place, so the check and the repair cannot disagree about which file
+/// they are talking about — a check that judges one path and a fix that
+/// writes another is a repair command that reports on work it did not do.
+fn state_db_path(paths: &ConfigPaths, opts: &DoctorOptions) -> PathBuf {
+    opts.state_db_path
+        .clone()
+        .unwrap_or_else(|| paths.state_db())
 }
 
 /// Run all checks and return a [`DoctorReport`].
@@ -212,13 +238,26 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
     let (cfg_check, applied_fix_count) = check_and_optionally_fix_config(&paths, opts.fix);
     checks.push(cfg_check);
 
-    checks.push(check_state(&paths, opts.fix));
+    let (state_check, state_fixes) = check_and_optionally_fix_state(&paths, &opts);
+    checks.push(state_check);
+    let applied_fix_count = applied_fix_count + state_fixes;
 
     // Per-repository write access, one row each. This is the check that turns a
     // 403 discovered at the push step — after four other repos have already
     // been pushed — into a warning before any of them were touched.
-    if let Ok(conn) = ro_state::open_db(&paths.state_dir.join("state.db")) {
-        checks.extend(check_repo_write_access(&conn, None));
+    //
+    // Only when the database is already there. `open_db` **creates** it —
+    // `ro_state::open_db` runs `create_dir_all` on the parent and then
+    // `Connection::open` — so probing a missing database with it silently
+    // manufactures a 160KB `state.db` and then reports "state db ok" about
+    // the file it just made. A diagnostic run that writes to the user's
+    // machine is not a diagnostic run, and the "ok" is worse than the write:
+    // it tells the user their state is healthy when the only thing that
+    // happened is that ro created it.
+    if paths.state_db().exists() {
+        if let Ok(conn) = ro_state::open_db(&paths.state_db()) {
+            checks.extend(check_repo_write_access(&conn, None));
+        }
     }
 
     // Previously `let _ = applied_fix_count; // reserved for future scoring` —
@@ -727,46 +766,344 @@ fn write_default_config(path: &Path) -> std::io::Result<()> {
     std::fs::write(path, default_config_toml())
 }
 
-fn check_state(paths: &ConfigPaths, fix: bool) -> CheckResult {
-    let db_path = paths.state_db();
+/// Is this a directory of files that is not a database?
+///
+/// Walked rather than string-matched, because the only things `ro` itself
+/// ever writes here are `state.db`, SQLite's `state.db-wal` / `state.db-shm`
+/// sidecars, and the `state.db.bak` / `state.db.N.bak` backups
+/// [`back_up_state_db`] writes — all of them ro's files in ro's directory.
+/// A state directory containing anything else (a checkouted tree someone
+/// pointed `--state-dir` at, a `notes.txt`) is not ro's, and neither its
+/// contents nor anything above it is touched on the strength of a `--fix`.
+///
+/// The backups are the reason this list is not just the three SQLite names:
+/// the second `--fix` on a still-broken database finds `state.db.bak` in
+/// the directory, and a check that called that a stranger would refuse to
+/// write the numbered backup it is about to need — the check would get in
+/// the way of the repair it exists to guard.
+///
+/// The emptiness is a precondition rather than a conclusion: the "refused"
+/// message is a claim about what was left alone, and it can only be made
+/// for a directory whose entire contents were listed.
+fn looks_like_ro_state_dir(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).all(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n == "state.db" || n.starts_with("state.db-") || is_state_db_backup(n))
+    })
+}
+
+/// Is this the name of a backup [`back_up_state_db`] would have written?
+///
+/// `state.db.bak` and `state.db.7.bak`, and nothing else. Both come from
+/// `Path::with_extension`, which replaces the existing `.db` — so the
+/// generated names are `state.db` + `bak` and `state.db` + `7.bak`, and the
+/// match is on the suffix first and on what precedes it second.
+///
+/// Deliberately not a `starts_with`: `state.db.important-things` is a file a
+/// user made, and treating it as ro's would be the exact mistake this
+/// function exists to prevent.
+fn is_state_db_backup(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".bak") else {
+        return false;
+    };
+    match stem.strip_prefix("state.db") {
+        Some("") => true,
+        Some(number) => {
+            !number.is_empty()
+                && number.starts_with('.')
+                && number[1..].bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// The one operation in `ro doctor --fix` that destroys anything, and what
+/// it does about it.
+///
+/// `state.db` **is** the registry: every tracked repo, every tag, every
+/// recorded run. Recreating a corrupt one is a repair only if the old
+/// bytes are still somewhere to be recovered from, so the old file is
+/// copied to `state.db.bak` before anything else happens — `copy`, not
+/// `rename`, because the original stays exactly where SQLite expects to
+/// find it and a half-applied repair is worse than an unapplied one. The
+/// copy is verified before it is called a backup: a backup that silently
+/// truncated is worse than no backup, because it is reported.
+///
+/// The directory holding the file is not required to be empty — see
+/// [`looks_like_ro_state_dir`], which scopes the check rather than letting
+/// a `--fix` run destroy a directory that was never ro's.
+fn back_up_state_db(db_path: &Path) -> Result<(PathBuf, u64), String> {
+    let bytes =
+        std::fs::read(db_path).map_err(|e| format!("reading {}: {e}", db_path.display()))?;
+    let mut dest = db_path.with_extension("db.bak");
+    // Never overwrite an existing backup. Each attempt is numbered, and a
+    // backup that already exists is a user decision this run does not get
+    // to make again.
+    let mut n = 1u32;
+    while dest.exists() {
+        dest = db_path.with_extension(format!("db.{n}.bak"));
+        n += 1;
+    }
+    std::fs::copy(db_path, &dest).map_err(|e| {
+        format!(
+            "backing up {} to {}: {e}",
+            db_path.display(),
+            dest.display()
+        )
+    })?;
+    let written = std::fs::metadata(&dest)
+        .map_err(|e| format!("checking the backup {}: {e}", dest.display()))?
+        .len();
+    if written != bytes.len() as u64 {
+        return Err(format!(
+            "the backup {} is {written} bytes but the original was {}",
+            dest.display(),
+            bytes.len()
+        ));
+    }
+    Ok((dest, written))
+}
+
+/// Judge the state database, and repair it when `--fix` was asked for.
+///
+/// Four states, and each one gets a different answer:
+///
+/// | state | without `--fix` | with `--fix` |
+/// |---|---|---|
+/// | missing | warn, "run `--fix`" | created |
+/// | opens | ok | ok (an existing file is never rewritten) |
+/// | a file that is not a database | fail, and what to do | **backed up, replaced** |
+/// | anything else that will not open | fail, left alone | fail, left alone |
+///
+/// The last row is the one that makes the third safe. "Could not open" is
+/// not "corrupt": a full disk, a directory where the file should be, a
+/// permission problem and a truncated page header all surface as an error
+/// from `open_db`, and only the second is a thing the repair path is
+/// allowed to throw away. The reason is therefore looked for in the
+/// SQLite error and nowhere else.
+fn check_and_optionally_fix_state(
+    paths: &ConfigPaths,
+    opts: &DoctorOptions,
+) -> (CheckResult, usize) {
+    let db_path = state_db_path(paths, opts);
+    let fix = opts.fix;
     let parent_exists = db_path.parent().is_some_and(Path::exists);
 
     if !parent_exists {
         if !fix {
-            return CheckResult::warn(
-                "state",
-                Severity::Required,
-                format!("state dir missing: {}", db_path.display()),
-                Some(format!(
-                    "run `ro doctor --fix` to create {}",
-                    db_path.parent().unwrap_or(Path::new("")).display()
-                )),
+            return (
+                CheckResult::warn(
+                    "state",
+                    Severity::Required,
+                    format!("state dir missing: {}", db_path.display()),
+                    Some(format!(
+                        "run `ro doctor --fix` to create {}",
+                        db_path.parent().unwrap_or(Path::new("")).display()
+                    )),
+                ),
+                0,
             );
         }
         if let Some(parent) = db_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                return CheckResult::fail(
-                    "state",
-                    Severity::Required,
-                    format!("cannot create state dir {}: {e}", parent.display()),
-                    "check XDG_STATE_HOME permissions",
+                return (
+                    CheckResult::fail(
+                        "state",
+                        Severity::Required,
+                        format!("cannot create state dir {}: {e}", parent.display()),
+                        "check XDG_STATE_HOME permissions",
+                    ),
+                    0,
                 );
             }
         }
     }
 
     match open_db(&db_path) {
-        Ok(_) => CheckResult::ok(
-            "state",
-            Severity::Required,
-            format!("state db ok at {}", db_path.display()),
+        Ok(_) => (
+            CheckResult::ok(
+                "state",
+                Severity::Required,
+                format!("state db ok at {}", db_path.display()),
+            ),
+            0,
         ),
-        Err(e) => CheckResult::fail(
-            "state",
-            Severity::Required,
-            format!("cannot open state db {}: {e}", db_path.display()),
-            "delete the file to recreate, or check disk space",
+        Err(e) => {
+            if !fix {
+                return (
+                    CheckResult::fail(
+                        "state",
+                        Severity::Required,
+                        format!("cannot open state db {}: {e}", db_path.display()),
+                        "delete the file to recreate, or check disk space",
+                    ),
+                    0,
+                );
+            }
+            repair_state_db(&db_path, &e)
+        }
+    }
+}
+
+/// The one destructive repair `--fix` performs, and everything it refuses to.
+///
+/// An error that is not "this file is not a database" is never repaired,
+/// because the repair throws the file away and the reason is the only
+/// evidence of what was wrong with it.
+fn repair_state_db(db_path: &Path, error: &anyhow::Error) -> (CheckResult, usize) {
+    let not_a_database = error
+        .downcast_ref::<ro_state::rusqlite::Error>()
+        .and_then(|e| match e {
+            ro_state::rusqlite::Error::SqliteFailure(f, _) => Some(f.code),
+            _ => None,
+        })
+        .is_some_and(|c| c == ro_state::rusqlite::ErrorCode::NotADatabase);
+
+    if !not_a_database {
+        return (
+            CheckResult::fail(
+                "state",
+                Severity::Required,
+                format!(
+                    "cannot open state db {}: {error} — `--fix` did not touch it, \
+                     because this is not a database that is merely unreadable",
+                    db_path.display()
+                ),
+                "check disk space and permissions; the file was left exactly as it was".to_string(),
+            ),
+            0,
+        );
+    }
+
+    // A file that is not a database is a file that is not ours, and a
+    // directory that has ever contained anything but `state.db*` is a
+    // directory that is not ours. Neither is repaired, and both say so —
+    // the refusal names what it saw so the user can tell this from "ro is
+    // broken".
+    let not_a_repo_state_dir = match db_path.parent() {
+        Some(dir) => !looks_like_ro_state_dir(dir),
+        None => false,
+    };
+    if not_a_repo_state_dir {
+        // Named, not just counted. A refusal that says "this directory holds
+        // files that are not ro's" tells the user a fact they already know
+        // (something is wrong); naming the file tells them which one, and
+        // that is the difference between a message and a riddle.
+        let foreign: Vec<String> = std::fs::read_dir(db_path.parent().unwrap_or(Path::new("")))
+            .map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| {
+                        n != "state.db" && !n.starts_with("state.db-") && !is_state_db_backup(n)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (
+            CheckResult::fail(
+                "state",
+                Severity::Required,
+                format!(
+                    "{} is not a database, and {} holds files that are not ro's \
+                     state ({}) — `--fix` refused to replace it, because a \
+                     directory that is not ro's is not ro's to destroy",
+                    db_path.display(),
+                    db_path.parent().unwrap_or(Path::new("")).display(),
+                    foreign.join(", ")
+                ),
+                "point --state-dir at the directory that holds ro's state.db, \
+                 or move the offending files out of it yourself"
+                    .to_string(),
+            ),
+            0,
+        );
+    }
+
+    match back_up_state_db(db_path) {
+        Err(why) => (
+            CheckResult::fail(
+                "state",
+                Severity::Required,
+                format!(
+                    "{} is not a database ({why}); nothing was changed — \
+                     ro will not replace a registry whose backup it could not write",
+                    db_path.display()
+                ),
+                "fix the filesystem problem (space, permissions) and re-run \
+                 `ro doctor --fix`; the original file is untouched"
+                    .to_string(),
+            ),
+            0,
         ),
+        Ok((backup, bytes)) => {
+            // Truncate rather than unlink. A `recover` step in between — say
+            // a reader that opened the file while this ran — writes into the
+            // same inode, so removing the name would leave those writes in
+            // a file with no name, and an operation that can lose writes is
+            // not one to take a lock-free.
+            if let Err(e) = std::fs::File::create(db_path) {
+                return (
+                    CheckResult::fail(
+                        "state",
+                        Severity::Required,
+                        format!(
+                            "{} is not a database, and it could not be replaced: {e} — \
+                             the backup at {} is intact, and the original is untouched",
+                            db_path.display(),
+                            backup.display()
+                        ),
+                        "check the file's permissions and re-run `ro doctor --fix`".to_string(),
+                    ),
+                    0,
+                );
+            }
+            match open_db(db_path) {
+                Ok(_) => (
+                    CheckResult::warn(
+                        "state",
+                        Severity::Required,
+                        format!(
+                            "{} was not a database; it was replaced with an empty one",
+                            db_path.display()
+                        ),
+                        Some(format!(
+                            "the previous registry is at {}; re-add each repo with `ro add`",
+                            backup.display()
+                        )),
+                    )
+                    .with_applied_fix(format!(
+                        "backed up the unreadable registry to {} ({bytes} bytes) and \
+                         created a fresh state.db — every tracked repo is in that backup, \
+                         and `ro add` is how they come back",
+                        backup.display()
+                    )),
+                    2,
+                ),
+                Err(e) => (
+                    CheckResult::fail(
+                        "state",
+                        Severity::Required,
+                        format!(
+                            "replacing {} failed: {e} — the original is at {}; \
+                             restore it with `mv {} {}` and re-run `ro doctor --fix`",
+                            db_path.display(),
+                            backup.display(),
+                            backup.display(),
+                            db_path.display()
+                        ),
+                        "the backup is intact; move it back over the file and re-run \
+                         `ro doctor --fix`"
+                            .to_string(),
+                    ),
+                    0,
+                ),
+            }
+        }
     }
 }
 
@@ -959,7 +1296,16 @@ mod tests {
     /// repair.
     #[test]
     fn fix_only_adds_sections_that_are_actually_read() {
-        for gone in ["git", "jobs", "mcp", "safety", "checkpoint", "review", "providers", "engines"] {
+        for gone in [
+            "git",
+            "jobs",
+            "mcp",
+            "safety",
+            "checkpoint",
+            "review",
+            "providers",
+            "engines",
+        ] {
             assert!(
                 !EXPECTED_SECTIONS.contains(&gone),
                 "--fix would add [{gone}], which nothing reads"
@@ -980,9 +1326,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
         paths.ensure_all().unwrap();
-        fs::write(paths.config_toml(), "[core]
+        fs::write(
+            paths.config_toml(),
+            "[core]
 layout = \"flat\"
-").unwrap();
+",
+        )
+        .unwrap();
 
         let (_, added) = check_and_optionally_fix_config(&paths, true);
         assert_eq!(added, EXPECTED_SECTIONS.len() - 1, "everything but [core]");
@@ -1067,17 +1417,408 @@ layout = \"flat\"
     fn state_check_warns_when_missing_without_fix() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let result = check_state(&paths, false);
+        let (result, applied) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: false,
+                ..Default::default()
+            },
+        );
         assert_eq!(result.status, Status::Warn);
+        assert_eq!(
+            applied, 0,
+            "a check that repairs nothing reports nothing applied"
+        );
+        assert!(
+            !paths.state_db().exists(),
+            "a run without --fix must not create the database"
+        );
     }
 
     #[test]
     fn state_check_creates_db_when_fix_set() {
         let tmp = TempDir::new().unwrap();
         let paths = paths_in(&tmp);
-        let result = check_state(&paths, true);
+        let (result, applied) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(result.status, Status::Ok);
+        assert_eq!(
+            applied, 0,
+            "creating a database that is not there is not a count of fixes"
+        );
         assert!(paths.state_db().exists());
+    }
+
+    // ── `--fix` on a state.db that is not a database ─────────────────────────
+    //
+    // The one repair in the doctor that destroys anything, and the one that
+    // has never been exercised on a real broken file. Every earlier test
+    // used a database that was missing or healthy; a file that is present
+    // and unreadable is a different state, and the difference is the whole
+    // point: the repair throws the file away, so it has to be the one
+    // operation that takes a backup first.
+
+    /// A `state.db` that is not a database is backed up and replaced.
+    ///
+    /// The backup is the assertion. A repair that reports "replaced" while
+    /// the old bytes are gone is a lie with a good exit code, and the old
+    /// bytes are the only record of what was tracked.
+    #[test]
+    fn fix_backs_up_and_replaces_a_state_db_that_is_not_a_database() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        // Not a database: a file SQLite will refuse to open. The header is
+        // the first thing SQLite reads, so anything else is "not a database"
+        // rather than "corrupt".
+        fs::write(&db_path, b"this is not a database, not even a little bit").unwrap();
+
+        let (result, applied) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: true,
+                state_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            result.status,
+            Status::Warn,
+            "a replaced registry is a warning, not a clean bill of health: \
+             the repos it tracked are gone until they are re-added. got: {}",
+            result.message
+        );
+        assert_eq!(applied, 2, "a backup and a replacement are two repairs");
+        assert!(
+            result.applied_fix.is_some(),
+            "the applied fix must be reported, not just counted"
+        );
+
+        let backups: Vec<_> = fs::read_dir(paths.state_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup, got: {backups:?}");
+        let backup_bytes = fs::read(&backups[0].path()).unwrap();
+        assert_eq!(
+            backup_bytes, b"this is not a database, not even a little bit",
+            "the backup must be the original file, byte for byte"
+        );
+
+        // And the replacement is a real, empty, usable database — not a
+        // zero-byte file that will fail the same way on the next run.
+        let conn = ro_state::open_db(&db_path).expect("the replacement opens");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM repos", [], |r| r.get(0))
+            .expect("the replacement has the schema");
+        assert_eq!(count, 0, "a fresh registry is empty");
+    }
+
+    /// The backup is never overwritten.
+    ///
+    /// A second `--fix` on a still-broken file must not destroy the first
+    /// backup: each attempt is numbered, and the oldest copy is the only
+    /// one that has never been through this path.
+    #[test]
+    fn fix_never_overwrites_an_existing_backup() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        fs::write(&db_path, b"first corruption").unwrap();
+        let first = paths.state_dir.join("state.db.bak");
+        fs::write(&first, b"the original, from before the first fix").unwrap();
+
+        let (result, _) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: true,
+                state_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.status, Status::Warn);
+
+        assert_eq!(
+            fs::read(&first).unwrap(),
+            b"the original, from before the first fix",
+            "an existing backup is a user decision this run does not get to make again"
+        );
+        let second = paths.state_dir.join("state.db.1.bak");
+        assert!(
+            second.exists(),
+            "the new backup must be numbered, not written over the old one"
+        );
+        assert_eq!(fs::read(&second).unwrap(), b"first corruption");
+    }
+
+    /// A directory that is not ro's is not repaired.
+    ///
+    /// The refusal is the point. `--fix` is a command that destroys a file,
+    /// and the only thing that makes that safe is knowing the file is ro's.
+    /// A state directory holding anything but `state.db*` is not ro's, and
+    /// the message has to say what it saw so the user can tell this from
+    /// "ro is broken".
+    #[test]
+    fn fix_refuses_to_touch_a_state_dir_that_is_not_ros() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        fs::write(&db_path, b"not a database").unwrap();
+        // A file that is not ro's, in the directory that is.
+        fs::write(paths.state_dir.join("notes.txt"), b"the user's own file").unwrap();
+
+        let (result, applied) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: true,
+                state_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(applied, 0, "a refused repair is not a repair");
+        assert!(
+            result.message.contains("notes.txt"),
+            "the refusal must name what it saw; got: {}",
+            result.message
+        );
+        assert_eq!(
+            fs::read(&db_path).unwrap(),
+            b"not a database",
+            "the file must be untouched"
+        );
+        assert_eq!(
+            fs::read(paths.state_dir.join("notes.txt")).unwrap(),
+            b"the user's own file",
+            "and so must everything else in the directory"
+        );
+    }
+
+    /// An error that is not "not a database" is never repaired.
+    ///
+    /// "Could not open" is not "corrupt". A full disk, a directory where
+    /// the file should be, and a permission problem all surface as an error
+    /// from `open_db`, and the repair for all of them is to throw the file
+    /// away — which is exactly what must not happen.
+    #[test]
+    fn fix_leaves_a_file_it_cannot_understand_alone() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        // A directory where the database should be: `open_db` fails, and
+        // the reason is not "not a database".
+        fs::create_dir_all(&db_path).unwrap();
+
+        let (result, applied) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: true,
+                state_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(applied, 0);
+        assert!(
+            result.message.contains("did not touch it"),
+            "the message must say the file was left alone; got: {}",
+            result.message
+        );
+        assert!(
+            db_path.is_dir(),
+            "a directory where the database should be is not a database to replace"
+        );
+    }
+
+    /// A backup that could not be written is a refusal, not a repair.
+    ///
+    /// The registry is the only copy of what is tracked. Replacing it
+    /// without a verified backup is a data-loss event wearing a repair
+    /// command's costume, so the check fails and says where the original
+    /// is.
+    ///
+    /// The state directory is made read-only rather than planting a
+    /// directory at `state.db.bak`: the backup writer numbers past an
+    /// existing backup (`state.db.1.bak`), so a single blocked name is
+    /// stepped over and the repair goes ahead — correctly, and which would
+    /// make this test pass for the wrong reason.
+    #[test]
+    #[cfg(unix)]
+    fn fix_refuses_to_replace_a_registry_it_could_not_back_up() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        fs::write(&db_path, b"not a database").unwrap();
+        fs::set_permissions(paths.state_dir.clone(), fs::Permissions::from_mode(0o500)).unwrap();
+
+        let (result, applied) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: true,
+                state_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        );
+
+        // Restore before asserting, so a failing assertion still cleans up.
+        fs::set_permissions(paths.state_dir.clone(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(result.status, Status::Fail);
+        assert_eq!(applied, 0);
+        assert!(
+            result.message.contains("backup"),
+            "the refusal must name the backup; got: {}",
+            result.message
+        );
+        assert_eq!(
+            fs::read(&db_path).unwrap(),
+            b"not a database",
+            "the original must be untouched"
+        );
+    }
+
+    /// An existing backup is stepped over, not overwritten — and the refusal
+    /// to overwrite it is a property of the *writer*, not of the directory
+    /// check.
+    ///
+    /// A directory at `state.db.bak` makes the first backup name unusable;
+    /// the repair must still find somewhere to put the original rather than
+    /// concluding it cannot be saved. (The companion test above covers the
+    /// case where there is nowhere at all to write.)
+    #[test]
+    fn an_unusable_backup_name_is_stepped_over_not_treated_as_a_blocker() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        fs::write(&db_path, b"not a database").unwrap();
+        fs::create_dir_all(paths.state_dir.join("state.db.bak")).unwrap();
+
+        let (result, _) = check_and_optionally_fix_state(
+            &paths,
+            &DoctorOptions {
+                fix: true,
+                state_db_path: Some(db_path.clone()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            result.status,
+            Status::Warn,
+            "the repair must proceed; got: {}",
+            result.message
+        );
+        let numbered = paths.state_dir.join("state.db.1.bak");
+        assert!(
+            numbered.exists(),
+            "the backup went to the numbered name; the directory is still there"
+        );
+        assert_eq!(
+            fs::read(&numbered).unwrap(),
+            b"not a database",
+            "and it is the original file"
+        );
+    }
+
+    /// A second `--fix` on a repaired database is a no-op.
+    ///
+    /// The repair converges: a fresh database opens, so the second run
+    /// reports it healthy and changes nothing. A repair command that keeps
+    /// "repairing" the same file is one a user stops running.
+    #[test]
+    fn fix_converges_after_replacing_a_broken_database() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        fs::write(&db_path, b"not a database").unwrap();
+
+        let opts = || DoctorOptions {
+            fix: true,
+            state_db_path: Some(db_path.clone()),
+            ..Default::default()
+        };
+        let (first, applied_first) = check_and_optionally_fix_state(&paths, &opts());
+        assert_eq!(first.status, Status::Warn);
+        assert_eq!(applied_first, 2);
+
+        let (second, applied_second) = check_and_optionally_fix_state(&paths, &opts());
+        assert_eq!(
+            second.status,
+            Status::Ok,
+            "a repaired database must read as healthy on the next run"
+        );
+        assert_eq!(applied_second, 0, "the second run must change nothing");
+        let backups: Vec<_> = fs::read_dir(paths.state_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
+            .collect();
+        assert_eq!(
+            backups.len(),
+            1,
+            "the second run must not back up a healthy database"
+        );
+    }
+
+    /// The applied fix is rendered, not just counted.
+    ///
+    /// A `--fix` run that silently changed three things and said nothing
+    /// is the behaviour users are asked to trust with a repair command. The
+    /// count reaches the exit code; the sentence reaches the person.
+    #[test]
+    fn the_replacement_is_rendered_in_the_report() {
+        let tmp = TempDir::new().unwrap();
+        let paths = paths_in(&tmp);
+        paths.ensure_all().unwrap();
+        let db_path = paths.state_db();
+        fs::write(&db_path, b"not a database").unwrap();
+
+        let report = run(DoctorOptions {
+            fix: true,
+            state_db_path: Some(db_path.clone()),
+            paths: Some(paths.clone()),
+            ..Default::default()
+        });
+        let state = report
+            .checks
+            .iter()
+            .find(|c| c.name == "state")
+            .expect("the state check is in the report");
+        let applied = state
+            .applied_fix
+            .as_deref()
+            .expect("an applied fix is reported");
+        assert!(
+            applied.contains("state.db.bak"),
+            "the applied fix must name the backup it wrote; got: {applied}"
+        );
+        assert!(
+            applied.contains("ro add"),
+            "the applied fix must say how the tracked repos come back; got: {applied}"
+        );
+        let text = render_text(&report);
+        assert!(
+            text.contains("fix applied:"),
+            "the rendered report carries the applied fix; got:\n{text}"
+        );
     }
 
     #[test]
@@ -1112,6 +1853,7 @@ layout = \"flat\"
             fix: true,
             binary_lookup_path: Some(tmp.path().to_path_buf()),
             paths: Some(paths_in(&tmp)),
+            ..Default::default()
         };
         let report = run(opts);
         // git, github_auth, config, state, provider:claude, provider:codex
@@ -1222,7 +1964,11 @@ layout = \"flat\"
         if reader.read_line(&mut line)? == 0 {
             return Ok(());
         }
-        let path = line.split_whitespace().nth(1).unwrap_or_default().to_string();
+        let path = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_default()
+            .to_string();
 
         let mut authorization = String::new();
         loop {
@@ -1250,7 +1996,9 @@ layout = \"flat\"
             let push = if grant_push { "true" } else { "false" };
             (
                 "200 OK",
-                format!(r#"{{"permissions":{{"push":{push},"maintain":false,"admin":false,"triage":false,"pull":true}}}}"#),
+                format!(
+                    r#"{{"permissions":{{"push":{push},"maintain":false,"admin":false,"triage":false,"pull":true}}}}"#
+                ),
             )
         };
 
@@ -1311,10 +2059,7 @@ layout = \"flat\"
         assert_eq!(repo.name, name);
     }
 
-    fn rows_for<'a>(
-        checks: &'a [CheckResult],
-        slug: &str,
-    ) -> Vec<&'a CheckResult> {
+    fn rows_for<'a>(checks: &'a [CheckResult], slug: &str) -> Vec<&'a CheckResult> {
         checks
             .iter()
             .filter(|c| c.name == format!("repo:{slug}"))
@@ -1329,7 +2074,9 @@ layout = \"flat\"
     /// probe used the credential the row points at.
     #[test]
     fn a_row_with_a_set_credential_ref_is_probed_with_that_credential() {
-        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ro_testkit::shim::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
             std::env::set_var("GH_TOKEN_WORK", "ghp_worktoken1234567890123456789012345");
@@ -1340,13 +2087,8 @@ layout = \"flat\"
         paths.ensure_all().unwrap();
         let conn = ro_state::open_db(&paths.state_db()).expect("the db opens");
         track_repo(&conn, "acme/api");
-        ro_sync::manage::set_repo_config(
-            &conn,
-            "acme/api",
-            "credential_ref",
-            "env:GH_TOKEN_WORK",
-        )
-        .expect("the row is updated");
+        ro_sync::manage::set_repo_config(&conn, "acme/api", "credential_ref", "env:GH_TOKEN_WORK")
+            .expect("the row is updated");
 
         let fake = FakeGitHub::start("quangdang46", true);
         let checks = check_repo_write_access(&conn, Some(&fake.base_uri));
@@ -1384,7 +2126,9 @@ layout = \"flat\"
     /// variable — never a silent fall-back to the ambient token.
     #[test]
     fn a_row_with_an_unset_credential_ref_fails_and_names_the_variable() {
-        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ro_testkit::shim::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
             std::env::remove_var("GH_TOKEN_MISSING");
@@ -1442,7 +2186,9 @@ layout = \"flat\"
     /// A malformed `credential_ref` is a clear failure, not a fall-back.
     #[test]
     fn a_malformed_credential_ref_is_a_clear_failure() {
-        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ro_testkit::shim::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
         }
@@ -1495,7 +2241,9 @@ layout = \"flat\"
     /// regression on the common case.
     #[test]
     fn a_row_without_a_credential_ref_uses_the_ambient_token() {
-        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ro_testkit::shim::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
         }
@@ -1531,7 +2279,9 @@ layout = \"flat\"
     /// have".
     #[test]
     fn the_message_names_the_credential_it_probed_with() {
-        let _guard = ro_testkit::shim::path_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ro_testkit::shim::path_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             std::env::set_var("GH_TOKEN", "ghp_ambienttoken123456789012345678901234");
             std::env::set_var("GH_TOKEN_WORK", "ghp_worktoken1234567890123456789012345");
@@ -1542,13 +2292,8 @@ layout = \"flat\"
         paths.ensure_all().unwrap();
         let conn = ro_state::open_db(&paths.state_db()).expect("the db opens");
         track_repo(&conn, "acme/api");
-        ro_sync::manage::set_repo_config(
-            &conn,
-            "acme/api",
-            "credential_ref",
-            "env:GH_TOKEN_WORK",
-        )
-        .expect("the row is updated");
+        ro_sync::manage::set_repo_config(&conn, "acme/api", "credential_ref", "env:GH_TOKEN_WORK")
+            .expect("the row is updated");
 
         let fake = FakeGitHub::start("quangdang46", true);
         let checks = check_repo_write_access(&conn, Some(&fake.base_uri));

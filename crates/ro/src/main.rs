@@ -92,12 +92,17 @@ enum Commands {
         key: String,
         /// Also delete the working copy on disk
         ///
-        /// Destructive, and gated four ways. Deleting a working copy is the
+        /// Destructive, and gated five ways. Deleting a working copy is the
         /// only way to reclaim disk, and it is also the exact operation a
-        /// path-arithmetic bug would aim at *other* repositories — so the
-        /// path is printed in full, checked against the registry again
-        /// immediately before the removal, and a directory whose origin
-        /// belongs to a different registered repo is refused outright.
+        /// path-arithmetic bug — or a corrupted row — would aim at some
+        /// *other* directory, so before anything is removed the target has
+        /// to be provably the working copy of a still-registered repo: it
+        /// must be a git checkout whose `origin` is the URL on the row. A
+        /// path that is not a checkout, or whose origin belongs to someone
+        /// else, is refused by name. Around that: the path is printed in
+        /// full, a directory that is another registered repo's working copy
+        /// is refused outright, the registry is consulted again immediately
+        /// before the removal, and an interactive run asks.
         #[arg(long)]
         delete: bool,
     },
@@ -337,10 +342,19 @@ enum Commands {
         /// row in `repo_tags`, and there is no second concept it aliases.
         #[arg(long, visible_alias = "group")]
         tag: Option<String>,
+        /// Every tracked repo — the default, stated out loud. Archived and
+        /// switched-off rows are still left out unless `--include-archived`
+        /// says otherwise.
         #[arg(long)]
         all: bool,
+        /// Engine that commits this run: `claude`, `codex`, or `git`.
+        /// Overrides `[agent].engine` from the config for this run only; it
+        /// is never written to a row.
         #[arg(long)]
         engine: Option<String>,
+        /// A binary that answers to a different name — a nightly build, or
+        /// an engine installed outside `PATH`. Overrides
+        /// `[agent].command`, and like `--engine` is not written to a row.
         #[arg(long)]
         engine_bin: Option<String>,
         /// The branch the work should land on, when it is not the current one
@@ -354,6 +368,7 @@ enum Commands {
         /// branch, which is three git commands and no model.
         #[arg(long)]
         resolve: bool,
+        /// Preview without writing
         #[arg(long)]
         dry_run: bool,
         /// Retired repos, and repos switched off, are skipped unless this
@@ -392,10 +407,19 @@ enum Commands {
         /// row in `repo_tags`, and there is no second concept it aliases.
         #[arg(long, visible_alias = "group")]
         tag: Option<String>,
+        /// Every tracked repo — the default, stated out loud. Archived and
+        /// switched-off rows are still left out unless `--include-archived`
+        /// says otherwise.
         #[arg(long)]
         all: bool,
+        /// Engine that commits this run: `claude`, `codex`, or `git`.
+        /// Overrides `[agent].engine` from the config for this run only; it
+        /// is never written to a row.
         #[arg(long)]
         engine: Option<String>,
+        /// A binary that answers to a different name — a nightly build, or
+        /// an engine installed outside `PATH`. Overrides
+        /// `[agent].command`, and like `--engine` is not written to a row.
         #[arg(long)]
         engine_bin: Option<String>,
         /// The branch the work should land on, when it is not the current one
@@ -409,6 +433,7 @@ enum Commands {
         /// branch, which is three git commands and no model.
         #[arg(long)]
         resolve: bool,
+        /// Preview without writing
         #[arg(long)]
         dry_run: bool,
         /// The old `ro sweep commit-sweep`, for one release.
@@ -517,6 +542,58 @@ fn confirm(prompt: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Does a checkout's origin refer to the same repository as the URL on the
+/// registry row?
+///
+/// Both spellings of the same remote are accepted, and nothing else: a
+/// `git@host:owner/repo` and an `https://host/owner/repo` URL for one repo
+/// are the same repository, while two different hosts, owners, or names are
+/// not. The comparison is on the URL's shape, not on its byte string,
+/// because the row was written from one spelling and git is holding
+/// another — `ro add <path>` records the checkout's own `origin` verbatim,
+/// and that is very often the SSH form.
+///
+/// Credentials are stripped before comparing. A `https://user:pass@host/…`
+/// URL carries a secret in its path, and a checkout recorded that way is
+/// still the same repository — but comparing the two forms with the
+/// credential in place would refuse every such checkout, and printing the
+/// credential to explain why would put a secret on stderr.
+fn origin_matches(origin: &str, clone_url: &str) -> bool {
+    /// `git@host:owner/repo`, `ssh://git@host/owner/repo` and
+    /// `https://host/owner/repo` all reduce to `host/owner/repo`.
+    ///
+    /// The scp-like form is the reason this function is not a `trim` pair:
+    /// it has no scheme and separates host from path with a colon, so a
+    /// `://`-only normalization leaves `github.com:acme/api` to be compared
+    /// against `github.com/acme/api` and never matches. Git accepts both
+    /// spellings for the same remote, so a gate that rejected one of them
+    /// would refuse a `git clone` of it — a checkout made with the SSH key
+    /// rather than a token.
+    fn normalize(url: &str) -> String {
+        let trimmed = url.trim();
+        // `.git` is a repository-name suffix, not part of the name, and
+        // either side may or may not carry it.
+        let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+        // No scheme means the scp-like spelling, where a colon separates the
+        // host from the path. With a scheme, a colon is a port and must be
+        // left alone.
+        let (after_scheme, scp_form) = match trimmed.find("://") {
+            Some(i) => (&trimmed[i + 3..], false),
+            None => (trimmed, true),
+        };
+        let no_credentials = match after_scheme.rfind('@') {
+            Some(i) => &after_scheme[i + 1..],
+            None => after_scheme,
+        };
+        let slash_form = match (scp_form, no_credentials.find(':')) {
+            (true, Some(i)) => format!("{}/{}", &no_credentials[..i], &no_credentials[i + 1..]),
+            _ => no_credentials.to_string(),
+        };
+        slash_form.trim_matches('/').to_ascii_lowercase()
+    }
+    normalize(origin) == normalize(clone_url)
+}
+
 /// Fold `--tag <T>` into the single filter string the resolver takes.
 ///
 /// `--tag` is shorthand for `--filter tag:<T>`, not a second selector, so
@@ -524,11 +601,7 @@ fn confirm(prompt: &str) -> bool {
 /// error rather than a silent precedence rule: picking one would mean a run
 /// the user did not ask for, over a fleet that pushes with their
 /// credentials.
-fn selector_filter(
-    verb: &str,
-    filter: Option<&str>,
-    tag: Option<&str>,
-) -> Result<Option<String>> {
+fn selector_filter(verb: &str, filter: Option<&str>, tag: Option<&str>) -> Result<Option<String>> {
     match (filter, tag) {
         (Some(_), Some(_)) => Err(exit::FatalError::usage(format!(
             "`{verb}` takes one selector. `--tag` is shorthand for `--filter tag:<T>` — \
@@ -855,8 +928,23 @@ fn run() -> Result<()> {
                 author_ref: author,
                 tags,
             };
-            let repo = manage::add_from_input(&conn, &spec, &projects_dir, &opts)
-                .context("adding repo")?;
+            let repo = manage::add_from_input(&conn, &spec, &projects_dir, &opts).map_err(|e| {
+                // A bad invocation is a usage error, not a broken
+                // installation. `add_from_input` refuses three things
+                // that are all the caller's fault and none of which
+                // retrying unchanged can fix: a spec that is neither a
+                // remote nor a checkout, a destination that already
+                // exists, and a repo that is already tracked. All three
+                // used to surface as `EX_FATAL` — the same code as a
+                // config file that will not parse — so a typo read as a
+                // broken install and invited a retry that cannot work.
+                // `exit.rs` already says a duplicate add is a usage
+                // problem; this is where that promise is kept.
+                // Raised rather than printed: `main`'s top-level
+                // handler prints it once, so the message appears
+                // exactly one time on the way out.
+                exit::FatalError::usage(format!("adding repo: {e:#}"))
+            })?;
             eprintln!("Added: {}/{} (id={})", repo.owner, repo.name, repo.id);
             eprintln!("  path: {}", repo.local_path);
 
@@ -949,14 +1037,89 @@ fn run() -> Result<()> {
                     std::process::exit(exit::EX_USAGE as i32);
                 }
 
-                // (3) Consent: an interactive confirmation, or the caller
+                // (3) The target must actually BE the working copy of the
+                // row being removed — not merely the path the row happens
+                // to name. A row is a claim about the filesystem, and a
+                // claim is not evidence: a corrupted row, or one written by
+                // path arithmetic that resolved wrong, names a directory
+                // that has nothing to do with this repo, and the only thing
+                // standing between it and `remove_dir_all` was the row
+                // itself. So the check is made against the filesystem,
+                // and it is made against the *origin*, not against the
+                // row's `clone_url` column: a checkout whose origin is a
+                // fork, a mirror, or a local path is a real checkout of a
+                // real repo, and refusing it would make `--delete` unusable
+                // for exactly the repos people keep locally. What has to
+                // match is that the directory is a git repository at all,
+                // and that it has an origin to compare — a checkout with no
+                // remote is not this repo's working copy, whatever the row
+                // says.
+                //
+                // This is the gate that makes `--non-interactive` safe. It
+                // is the only one of the five that does not consult the
+                // registry, so it is the only one a corrupted row cannot
+                // defeat.
+                //
+                // A path that does not exist is refused here rather than
+                // falling through to the "already absent" branch below.
+                // That branch is for a checkout that was moved or deleted
+                // out from under the row; a path that was never there is
+                // the row naming something that is not this repo, and the
+                // two are different facts with different fixes.
+                if !path.exists() {
+                    eprintln!(
+                        "refused: {} does not exist, so it is not the working copy \
+                         of {}/{}; nothing was deleted. The row names this path, \
+                         and the filesystem does not agree — fix the row, or \
+                         restore the checkout, before deleting through it.",
+                        path.display(),
+                        target.owner,
+                        target.name
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+                let origin = match ro_git::read::remote_url(&path, "origin") {
+                    Ok(Some(url)) => url,
+                    Ok(None) => {
+                        eprintln!(
+                            "refused: {} is a git checkout with no origin remote, \
+                             so it cannot be the working copy of {}/{}; \
+                             nothing was deleted.",
+                            path.display(),
+                            target.owner,
+                            target.name
+                        );
+                        std::process::exit(exit::EX_USAGE as i32);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "refused: {} is not a git repository ({e:#}); \
+                             nothing was deleted.",
+                            path.display()
+                        );
+                        std::process::exit(exit::EX_USAGE as i32);
+                    }
+                };
+                if !origin_matches(&origin, &target.clone_url) {
+                    eprintln!(
+                        "refused: {} has origin {origin}, which is not the clone URL \
+                         on the {}/{} row ({}); nothing was deleted.",
+                        path.display(),
+                        target.owner,
+                        target.name,
+                        target.clone_url
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+
+                // (4) Consent: an interactive confirmation, or the caller
                 // having said up front that it is not going to answer.
                 if !non_interactive && !confirm("Type 'y' to delete it: ") {
                     eprintln!("Not deleted.");
                     std::process::exit(exit::EX_USAGE as i32);
                 }
 
-                // (4) The registry, one last time, immediately before the
+                // (5) The registry, one last time, immediately before the
                 // removal. Between (2) and here the only thing that ran was
                 // a human reading a line.
                 if ro_sync::manage::find_repo(&conn, &key).is_err() {
@@ -970,6 +1133,10 @@ fn run() -> Result<()> {
                     })?;
                     eprintln!("Deleted working copy: {}", path.display());
                 } else {
+                    // Unreachable in practice: (3) refused above if the path
+                    // was not there. Kept so a removal that races a
+                    // concurrent delete is reported as what happened rather
+                    // than as a `remove_dir_all` failure on a missing path.
                     eprintln!("Working copy already absent: {}", path.display());
                 }
             }
@@ -985,7 +1152,12 @@ fn run() -> Result<()> {
             eprintln!("Removed: {}/{}", repo.owner, repo.name);
         }
 
-        Commands::List { owner, tag, paths, format } => {
+        Commands::List {
+            owner,
+            tag,
+            paths,
+            format,
+        } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             let mut repos = manage::list(&conn, owner.as_deref()).context("listing repos")?;
@@ -1208,7 +1380,11 @@ fn run() -> Result<()> {
                 let names = named.join(" ");
                 let targets = ro_sync::targets::resolve_targets(
                     &conn,
-                    if names.is_empty() { None } else { Some(names.as_str()) },
+                    if names.is_empty() {
+                        None
+                    } else {
+                        Some(names.as_str())
+                    },
                     filter.as_deref(),
                     true,
                     &paths.state_dir.join("projects"),
@@ -1380,6 +1556,7 @@ fn run() -> Result<()> {
                 fix,
                 binary_lookup_path: None,
                 paths: Some(paths.clone()),
+                state_db_path: None,
             };
             let report = doctor::run(opts);
             match format {
@@ -1448,4 +1625,114 @@ fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two spellings of one remote are the same repository.
+    ///
+    /// A row is written from whatever the user typed; git is holding
+    /// whatever the remote answered with. Refusing a checkout because the
+    /// two strings differ would make `--delete` unusable for the common
+    /// case, and the common case is the one that runs unattended.
+    #[test]
+    fn an_ssh_origin_matches_the_https_url_on_the_row() {
+        assert!(origin_matches(
+            "git@github.com:acme/api.git",
+            "https://github.com/acme/api.git"
+        ));
+        assert!(origin_matches(
+            "https://github.com/acme/api.git",
+            "git@github.com:acme/api.git"
+        ));
+    }
+
+    /// Case and a trailing slash are spelling, not identity. GitHub is
+    /// case-insensitive in both host and path, and a URL with and without
+    /// the trailing slash is the same repository.
+    #[test]
+    fn case_and_a_trailing_slash_do_not_change_which_repo_it_is() {
+        assert!(origin_matches(
+            "https://github.com/Acme/API",
+            "https://github.com/acme/api/"
+        ));
+        assert!(origin_matches(
+            "git@github.com:ACME/api",
+            "https://github.com/acme/api"
+        ));
+    }
+
+    /// A different owner, name, or host is a different repository.
+    ///
+    /// This is the check the whole gate rests on: the two URLs must name
+    /// the same repository, and "close enough" is not a property a
+    /// destructive command can be built on.
+    #[test]
+    fn a_different_repo_is_a_different_repo() {
+        assert!(!origin_matches(
+            "https://github.com/acme/other.git",
+            "https://github.com/acme/api.git"
+        ));
+        assert!(!origin_matches(
+            "https://github.com/other/api.git",
+            "https://github.com/acme/api.git"
+        ));
+        assert!(!origin_matches(
+            "https://gitlab.com/acme/api.git",
+            "https://github.com/acme/api.git"
+        ));
+    }
+
+    /// A fork is not the upstream, and a mirror is not the origin.
+    ///
+    /// The gate compares the checkout's origin against the row's clone
+    /// URL, so a checkout of a fork — a perfectly ordinary thing to have
+    /// on disk — must be refused rather than deleted.
+    #[test]
+    fn a_fork_is_not_the_upstream() {
+        assert!(!origin_matches(
+            "https://github.com/contributor/api.git",
+            "https://github.com/acme/api.git"
+        ));
+    }
+
+    /// A credential in the URL is stripped before comparing, and never
+    /// printed.
+    ///
+    /// `https://user:pass@github.com/…` is the same repository as
+    /// `https://github.com/…`. Comparing the two forms with the credential
+    /// in place would refuse every checkout recorded that way; printing it
+    /// to explain the refusal would put a secret on stderr.
+    #[test]
+    fn a_credential_in_the_url_is_stripped_not_compared() {
+        assert!(origin_matches(
+            "https://x-access-token:ghp_faketoken123@github.com/acme/api.git",
+            "https://github.com/acme/api.git"
+        ));
+        assert!(origin_matches(
+            "https://github.com/acme/api.git",
+            "https://x-access-token:ghp_faketoken123@github.com/acme/api.git"
+        ));
+    }
+
+    /// A local path as an origin is not a GitHub URL, and the two must
+    /// never compare equal — a checkout whose origin is a directory on
+    /// disk is not the repo the row points at.
+    #[test]
+    fn a_local_path_origin_is_not_a_github_url() {
+        assert!(!origin_matches(
+            "/home/me/projects/acme/api",
+            "https://github.com/acme/api.git"
+        ));
+        assert!(!origin_matches("../api", "https://github.com/acme/api.git"));
+    }
+
+    /// The empty string is not a URL, and must not match anything.
+    #[test]
+    fn an_empty_origin_matches_nothing() {
+        assert!(!origin_matches("", "https://github.com/acme/api.git"));
+        assert!(!origin_matches("https://github.com/acme/api.git", ""));
+    }
 }

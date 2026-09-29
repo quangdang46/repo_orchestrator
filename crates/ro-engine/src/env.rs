@@ -234,12 +234,24 @@ impl ChildEnv {
     /// the first `AUTHORIZATION` or `TOKEN`-suffixed variable.
     pub fn contains_token_shaped(&self) -> Option<String> {
         for (k, v) in &self.vars {
-            if v.contains("ghp_") || v.contains("github_pat_") {
+            if is_token_shaped(v) {
                 return Some(format!("{k} carries a PAT-shaped value"));
             }
         }
         None
     }
+}
+
+/// Does this value look like a GitHub credential?
+///
+/// Named and **free-standing** rather than only a method, because the same
+/// question gets asked about text that never passed through an environment:
+/// `agent.rs` reports changes to `.git/config`, where a value an agent
+/// wrote can be a token. Two copies of this test would be two places for
+/// the next token format to be missed, and one of them would be the copy
+/// nobody looks at.
+pub fn is_token_shaped(value: &str) -> bool {
+    value.contains("ghp_") || value.contains("github_pat_")
 }
 
 #[cfg(test)]

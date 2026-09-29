@@ -147,6 +147,72 @@ fn matches_filter_repo(conn: &ro_state::Connection, repo_id: &str, flag: &str) -
         .unwrap_or(false)
 }
 
+/// The health score `--filter health:<N>` actually compares against.
+///
+/// `score_repo_health` in `ro-state` penalises `sync_results.status =
+/// 'error'` and nothing else. That deny-list is the same shape as the bug it
+/// was written to fix — `run_exit_code` in `ro-sync` counted `error` and
+/// missed `autostash_conflict`, so a run whose only bad repo was a tree full
+/// of conflict markers with the user's work parked in a stash exited 0 — and
+/// it is the same shape one layer up: a repo whose uncommitted work is
+/// sitting in an autostash loses **zero** penalty points, is scored 100, and
+/// is selected by `--filter health:50` for a run. A filter that selects the
+/// repos it is supposed to keep out of a run is worse than no filter.
+///
+/// The penalty is added here rather than in `ro-state` because this is the
+/// crate that owns which statuses mean "the repo is not in the state the
+/// user asked for": the list is written down in `sync::status_fails_run`, and
+/// the same list is what makes a sync run fail. The sync module is therefore
+/// the one place that already knows the truth.
+pub(crate) fn effective_health_score(
+    conn: &ro_state::Connection,
+    repo_id: &str,
+    stored: i64,
+) -> i64 {
+    // Every status that fails a run, read from the table rather than
+    // hard-coded, so a status added to `sync` cannot be forgotten here. An
+    // unknown status fails the run and fails this check — see
+    // `status_fails_run` for why that is the safe default.
+    const FAILING: &[&str] = &["error", "autostash_conflict", "conflict"];
+    // The statuses bind to `?1..` and the repo id to the next one, in that
+    // order, so the parameter list below and the `?n` in the SQL are read
+    // off the same place and cannot drift apart.
+    let mut placeholders = String::new();
+    for i in 0..FAILING.len() {
+        if i > 0 {
+            placeholders.push_str(", ");
+        }
+        placeholders.push_str(&format!("?{}", i + 1));
+    }
+    let sql = format!(
+        "SELECT COUNT(*) FROM sync_results WHERE status IN ({placeholders}) \
+         AND repo_id = ?{}",
+        FAILING.len() + 1
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        // A score that cannot be read is not a score that can be trusted.
+        // Failing closed is the same default `status_fails_run` uses for an
+        // unknown status, and for the same reason.
+        Err(_) => return 0,
+    };
+    let params: Vec<&dyn rusqlite::ToSql> = FAILING
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .chain(std::iter::once(&repo_id as &dyn rusqlite::ToSql))
+        .collect();
+    let failed: i64 = stmt.query_row(params.as_slice(), |r| r.get(0)).unwrap_or(0);
+    if failed == 0 {
+        return stored;
+    }
+    // Capped at the same 30 points `ro-state` caps its own failed-sync
+    // penalty at, so this term cannot dominate the score and turn a healthy
+    // repo into a zero. A repo with work in a stash is *not* a repo to keep
+    // out of a run entirely — it is a repo to look at first, which is what
+    // a lowered score says and what a zero would not.
+    (stored - (failed * 5).min(30)).max(0)
+}
+
 /// Does one repo satisfy `--filter`?
 ///
 /// An **unrecognised** filter is an error, not a silent false. `has:x`
@@ -173,7 +239,7 @@ fn matches_filter(
             .parse::<i64>()
             .with_context(|| format!("--filter health:<N> needs a number, got {rest:?}"))?;
         let snap = ro_state::queries::score_repo_health(conn, repo_id).ok();
-        return Ok(snap.is_some_and(|s| s.score < threshold));
+        return Ok(snap.is_some_and(|s| effective_health_score(conn, repo_id, s.score) < threshold));
     }
 
     // Tags live in `repo_tags`, not in the label. Matching on `owner/name`
@@ -522,7 +588,10 @@ mod filter_contract {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        for (name, archived) in [("api", 0i64), ("oss", 1)] {
+        // `svc` is neither archived nor disabled, so its score is 100 and it is the
+        // control the health assertions need: a repo with nothing wrong with
+        // it, sitting in the same fleet.
+        for (name, archived) in [("api", 0i64), ("oss", 1), ("svc", 0)] {
             conn.execute(
                 "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at, archived)
                  VALUES (?1, 'github.com', 'acme', ?2, 'https://example.com/x.git', ?3, ?4, ?4, ?5)",
@@ -621,7 +690,7 @@ mod filter_contract {
         // Both rows carry a local_path, so both are cloned. The assertion
         // is that the flag reads the *row* rather than answering `true`
         // for everything, which is what it used to do for any suffix.
-        assert_eq!(selected(&conn, "has:cloned").len(), 2);
+        assert_eq!(selected(&conn, "has:cloned").len(), 3);
     }
 
     /// The failure this function's own comment warns about: an
@@ -665,6 +734,78 @@ mod filter_contract {
                 .unwrap_or_default();
             assert_eq!(t.len(), 1, "{token:?} should select the one repo");
         }
+    }
+
+    /// The bug the health selector was letting through.
+    ///
+    /// `score_repo_health` in `ro-state` penalises `sync_results.status =
+    /// 'error'` and nothing else, so a repo whose pull landed and whose
+    /// autostash pop did not — status `autostash_conflict`, the user's work
+    /// sitting in a stash, conflict markers in the tree — loses **zero**
+    /// penalty points. It was scored 100 and selected by `--filter health:50`
+    /// for a run. A filter that selects the very repos it exists to keep out
+    /// of a run is not a filter.
+    ///
+    /// This is the sync module's side of it: the list of statuses that mean
+    /// "the repo is not in the state the user asked for" is written down in
+    /// `sync::status_fails_run`, and this is the same list applied where the
+    /// score is read.
+    #[test]
+    fn a_repo_whose_work_is_in_an_autostash_is_not_scored_healthy() {
+        let (tmp, conn) = fixture();
+        // `sync_results` is unique per (run, repo), and `run_id` is a
+        // foreign key — which is the whole reason the table was empty for so
+        // long. Two real runs are opened rather than a made-up id, so the
+        // fixture lands in the same state a real sync leaves behind rather
+        // than in a state the database forbids.
+        for _ in 0..6 {
+            let run = ro_jobs::open_run(&conn, "sync", &[]).unwrap();
+            conn.execute(
+                "INSERT INTO sync_results
+                 (run_id, repo_id, action, status, duration_ms, error, pre_oid, post_oid)
+                 VALUES (?1, 'id-api', 'pull', 'autostash_conflict', 1, NULL, NULL, NULL)",
+                rusqlite::params![run.id],
+            )
+            .unwrap();
+            ro_jobs::finalize_run(&conn, &run.id, 1).unwrap();
+        }
+        // Nothing at all for `oss`.
+        ro_state::queries::score_repo_health(&conn, "id-api").unwrap();
+        ro_state::queries::score_repo_health(&conn, "id-oss").unwrap();
+
+        assert_eq!(
+            effective_health_score(&conn, "id-api", 100),
+            70,
+            "six runs that all ended with the user's work in a stash must \
+             cost the same points six runs that ended in 'error' would. A \
+             score that stayed at 100 here is the bug: it made a repo that \
+             can never sync cleanly indistinguishable from one that has \
+             never tried."
+        );
+        assert_eq!(
+            effective_health_score(&conn, "id-oss", 100),
+            100,
+            "a repo with no failing runs keeps its stored score"
+        );
+
+        // And the selector, which is where the score is used.
+        //
+        // `health:<N>` selects repos scoring **below** N, so a score that
+        // cannot move is a repo the filter can never reach: `id-api` sat at
+        // 100 however many autostashes it collected, and no threshold would
+        // ever put it in front of a user who asked for the broken ones. That
+        // is the operational half of the bug, and it is what this asserts.
+        let selected_below_80 = selected(&conn, "health:80");
+        assert!(
+            selected_below_80.iter().any(|id| id == "id-api"),
+            "a repo that has failed six times must be reachable by the filter \
+             that exists to find failing repos: {selected_below_80:?}"
+        );
+        assert!(
+            !selected_below_80.iter().any(|id| id == "id-svc"),
+            "a repo with nothing wrong with it must not be selected just for \
+             being in the same fleet: {selected_below_80:?}"
+        );
     }
 
     /// Two names are two selections. Joined into one pattern they became

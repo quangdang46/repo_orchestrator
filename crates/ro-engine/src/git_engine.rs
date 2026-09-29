@@ -179,7 +179,12 @@ fn has_changes(root: &Path) -> Result<(), String> {
 }
 
 /// Files the commit touched, relative to the repo root.
-fn changed_files(root: &Path, before: Option<&str>) -> Vec<String> {
+///
+/// `pub(crate)` because `agent.rs` now needs the same answer for the
+/// `--message` path: one commit of the whole worktree still has to say
+/// which files it carried, and the two engines must not disagree about how
+/// that list is read.
+pub(crate) fn changed_files(root: &Path, before: Option<&str>) -> Vec<String> {
     let spec = match before {
         Some(oid) => format!("{oid}..HEAD"),
         None => "HEAD".to_string(),

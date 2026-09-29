@@ -1,7 +1,9 @@
 //! Configuration file loader.
 
 use crate::paths::{ConfigPaths, default_config_toml};
-use crate::schema::AppConfig;
+use crate::schema::{
+    AppConfig, IDENTITY_PROFILE_KEYS, is_modelled_field, known_keys_for, nearest_key,
+};
 use crate::validate::validate;
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -87,6 +89,154 @@ pub fn load_default() -> Result<AppConfig> {
     load_config(&paths.config_toml())
 }
 
+/// What `ro config set` decided about a dotted key.
+///
+/// Three verdicts, not two, and the middle one is the load-bearing choice.
+///
+/// # Why an unknown KEY is fatal and an unknown TABLE is not
+///
+/// `ro config set` is how a config is written without an editor, so its
+/// failure mode matters more than usual: a key it accepts and nothing reads
+/// leaves the file holding a setting that *looks* live. The user changes it,
+/// nothing happens, and the only evidence is the absence of an effect — which
+/// is indistinguishable from ro being broken.
+///
+/// The tempting fix is to reject everything unrecognised. That is wrong, and
+/// it breaks a promise ro has already made twice:
+///
+///   - **The loader tolerates unknown tables.** `AppConfig` has no
+///     `deny_unknown_fields` on purpose, so a config written for a newer ro
+///     loads. A script that provisions a box for the *next* ro must be able to
+///     seed a key this ro has never heard of.
+///   - **doctor's `--fix` adds and never removes, and says so.** It writes
+///     `left unrecognised table(s) in place: <names>`. A repair command that
+///     names a table it declined to touch is making a promise; `config set`
+///     deleting that table would break it.
+///
+/// So: an unknown **table** is written, with a warning naming it — the same
+/// thing `--fix` does. An unknown **key inside a table ro reads** is refused,
+/// because a table ro reads is a closed set: nothing is gained by a typo there,
+/// and forward compatibility for a *new key on an existing table* is a much
+/// smaller promise than a new table, and one a hand-edited file still offers.
+/// The escape hatch is not "silently accept it" — it is editing the file, which
+/// was always available and is now not contradicted by the tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyVerdict {
+    /// ro reads this key.
+    Known,
+    /// A table ro no longer reads. Refused, naming where the setting went.
+    Cut {
+        table: &'static str,
+        migrate_to: &'static str,
+    },
+    /// A table ro has never heard of. Written anyway, with a warning — a
+    /// setting from a newer ro, and not ours to delete.
+    UnknownTable,
+    /// A key inside a table ro reads that this ro does not have.
+    UnknownKey {
+        /// The full dotted key, for the message.
+        dotted: String,
+        /// The keys that are valid under the same prefix.
+        valid: Vec<String>,
+        /// The nearest valid key, when the edit distance says it was a typo.
+        suggestion: Option<String>,
+    },
+}
+
+/// Decide what to do with a `dotted.key` before anything is written.
+///
+/// Split out from [`set_key_in_file`] so the decision is testable on its own,
+/// and so the rule lives in one place rather than being re-derived at each
+/// call site. `repos.<name>.<key>` never reaches here — `main.rs` routes it to
+/// the registry, which is a different store with a different key space.
+pub fn classify_key(dotted_key: &str) -> KeyVerdict {
+    let segments: Vec<&str> = dotted_key.split('.').collect();
+    let table = segments[0];
+
+    // A table ro no longer reads. This is the case the docs get wrong:
+    // FEATURES.md tells a user to write `checkpoint.secret_scan = "warn"`,
+    // and the file would then carry a table `load_config` warns about on the
+    // very next run. Refusing with the migration note is the honest answer —
+    // the preflight is unconditional, and there is no warn mode to select.
+    if let Some((name, to)) = CUT_TABLES.iter().find(|(name, _)| *name == table) {
+        return KeyVerdict::Cut {
+            table: name,
+            migrate_to: to,
+        };
+    }
+
+    // A table ro has never heard of. Forward compatibility: written, warned
+    // about, never deleted. This is the same posture `doctor --fix` takes and
+    // reports ("left unrecognised table(s) in place").
+    let Some(valid) = known_keys_for(table) else {
+        return KeyVerdict::UnknownTable;
+    };
+
+    // `[identity]` is a map of user-named profiles, so `identity.work.name` is
+    // a real key and `identity.work.emali` is a typo inside a real profile.
+    if table == "identity" && segments.len() >= 3 {
+        let leaf = segments[segments.len() - 1];
+        let profile = format!("{}.<profile>", segments[..2].join("."));
+        let valid: Vec<String> = IDENTITY_PROFILE_KEYS
+            .iter()
+            .map(|k| format!("{profile}.{k}"))
+            .collect();
+        if IDENTITY_PROFILE_KEYS.contains(&leaf) {
+            return KeyVerdict::Known;
+        }
+        return KeyVerdict::UnknownKey {
+            dotted: dotted_key.to_string(),
+            suggestion: nearest_key(leaf, IDENTITY_PROFILE_KEYS)
+                .map(|k| format!("{profile}.{k}")),
+            valid,
+        };
+    }
+
+    // A table with no leaf: `ro config set core=4`. The value would land where
+    // a table is expected and the file would then fail to parse — the one
+    // outcome the round-trip check exists to prevent. Refusing earlier, with
+    // the keys named, is strictly kinder.
+    let Some(leaf) = segments.last().copied() else {
+        return KeyVerdict::UnknownKey {
+            dotted: dotted_key.to_string(),
+            valid: valid.iter().map(|k| format!("{table}.{k}")).collect(),
+            suggestion: None,
+        };
+    };
+
+    if valid.contains(&leaf) {
+        return KeyVerdict::Known;
+    }
+
+    // The depth is wrong even though the leaf is real: `core.layout.x`.
+    if segments.len() > 2 {
+        return KeyVerdict::UnknownKey {
+            dotted: dotted_key.to_string(),
+            valid: valid.iter().map(|k| format!("{table}.{k}")).collect(),
+            suggestion: None,
+        };
+    }
+
+    // A key ro does not read. Back it with the struct, so the message cannot
+    // name a key the schema rejects: `identity.default` and
+    // `identity.personal` are both structurally `Option<String>`-shaped, and
+    // only the first is a real key.
+    if !is_modelled_field::<AppConfig>(dotted_key) {
+        return KeyVerdict::UnknownKey {
+            dotted: dotted_key.to_string(),
+            valid: valid.iter().map(|k| format!("{table}.{k}")).collect(),
+            suggestion: nearest_key(leaf, valid).map(|k| format!("{table}.{k}")),
+        };
+    }
+
+    // Structurally real but not a key of this table — a flatten collision.
+    KeyVerdict::UnknownKey {
+        dotted: dotted_key.to_string(),
+        valid: valid.iter().map(|k| format!("{table}.{k}")).collect(),
+        suggestion: None,
+    }
+}
+
 /// Set one `dotted.key` in a TOML file, in place.
 ///
 /// This exists because the alternative is data loss on every call.
@@ -118,6 +268,58 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
     if segments.iter().any(|s| s.is_empty()) {
         anyhow::bail!("config key {dotted_key:?} has an empty path segment");
     }
+
+    // The key is checked before the document is touched, so a rejected write
+    // has nothing to roll back. The round-trip validation further down is
+    // still load-bearing — it is what catches a bad *value* — but it cannot
+    // catch a bad *key*, because `AppConfig` ignores what it does not model.
+    match classify_key(dotted_key) {
+        KeyVerdict::Known => {}
+        KeyVerdict::UnknownTable => {
+            // Loud, and non-fatal. This is the forward-compatibility case, and
+            // it is the same posture `doctor --fix` takes: the table stays,
+            // and the user is told which one ro did not recognise. Silently
+            // writing it is what makes a future key look like a live one.
+            let note = format!(
+                "warning: [{table}] is not a table this version of ro reads; \
+                 writing {dotted_key} anyway in case it belongs to a newer ro. \
+                 `ro doctor` will name it as unrecognised.",
+                table = segments[0]
+            );
+            tracing::warn!("{note}");
+            eprintln!("{note}");
+        }
+        KeyVerdict::Cut { table, migrate_to } => {
+            // Refused. The setting would be written into a table the loader
+            // warns about on the next run, so the file would contradict
+            // itself within one command. This is also the shape FEATURES.md
+            // walks a user into with `checkpoint.secret_scan`.
+            anyhow::bail!(
+                "[{table}] is no longer read — {migrate_to}. \
+                 `ro config set {dotted_key}` would write a setting that has no effect, \
+                 so it is refused; edit the file by hand if you need it for a different version."
+            );
+        }
+        KeyVerdict::UnknownKey {
+            dotted,
+            valid,
+            suggestion,
+        } => {
+            let valid = valid.join(", ");
+            let mut msg = format!(
+                "{dotted} is not a setting ro reads. Valid keys here: {valid}."
+            );
+            if let Some(s) = suggestion {
+                msg.push_str(&format!(" Did you mean {s}?"));
+            }
+            anyhow::bail!(
+                "{msg} Nothing was written. A key that no longer exists and one that \
+                 was never read look identical from the outside, so this is an error \
+                 rather than a silent no-op."
+            );
+        }
+    }
+
     let (leaf, parents) = segments
         .split_last()
         .expect("split('.').collect() always yields at least one segment");
@@ -398,5 +600,260 @@ bin = \"claude\"
         let path = dir.path().join("ro/config.toml");
         write_default(&path).unwrap();
         assert!(deprecated_tables(&std::fs::read_to_string(&path).unwrap()).is_empty());
+    }
+
+    // ── Key validation ────────────────────────────────────────────────────
+    //
+    // The bug: `ro config set core.paralel=4` succeeded, wrote `paralel`, and
+    // nothing read it. The file then held a setting that looked live and was
+    // not, and the only evidence was that nothing happened.
+
+    /// The bug itself. A typo is refused, the valid keys are named, and the
+    /// file is untouched.
+    #[test]
+    fn a_typo_is_refused_with_the_valid_keys_named() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = default_config_toml();
+        std::fs::write(&path, original).unwrap();
+
+        let err = set_key_in_file(&path, "core.paralel", "4").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("core.paralel"),
+            "the error must name the key that was rejected, got: {msg}"
+        );
+        assert!(
+            msg.contains("parallel"),
+            "the error must name the valid keys, got: {msg}"
+        );
+        assert!(
+            msg.contains("Did you mean core.parallel?"),
+            "a typo this close should be named, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a refused key must not be written"
+        );
+    }
+
+    /// The key the docs name. FEATURES.md's Safety-net section tells a user to
+    /// write `checkpoint.secret_scan = "warn"` to downgrade the preflight. The
+    /// preflight is unconditional, so that key does not exist — and writing it
+    /// would put a table in the file that `load_config` warns about on the
+    /// very next run.
+    #[test]
+    fn the_documented_secret_scan_key_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = default_config_toml();
+        std::fs::write(&path, original).unwrap();
+
+        let err = set_key_in_file(&path, "checkpoint.secret_scan", "\"warn\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("checkpoint"),
+            "the error must name the table, got: {msg}"
+        );
+        assert!(
+            msg.contains("no longer read"),
+            "the error must say the table is not read, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a dead key must not be written"
+        );
+    }
+
+    /// The same shape under the other name the docs and the migration note
+    /// use for it.
+    #[test]
+    fn the_safety_table_is_refused_too() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+        assert!(set_key_in_file(&path, "safety.secret_scan", "\"warn\"").is_err());
+    }
+
+    /// Forward compatibility. A script provisioning a box for a newer ro must
+    /// be able to seed a key this ro has never heard of — and `doctor --fix`
+    /// already promises to leave unrecognised tables alone rather than delete
+    /// them. So an unknown *table* is written, with a warning, and never
+    /// deleted.
+    #[test]
+    fn an_unknown_table_is_written_with_a_warning_not_deleted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        set_key_in_file(&path, "future_feature.experimental", "true").unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("[future_feature]") && after.contains("experimental = true"),
+            "an unmodelled table must survive, got:\n{after}"
+        );
+        // And the rest of the file is intact — the point of the warning is
+        // that the user can see what was written and decide.
+        assert!(after.contains("[core]"), "got:\n{after}");
+    }
+
+    /// A key inside a table ro reads is a closed set, so a typo there is
+    /// refused even though the table is fine.
+    #[test]
+    fn a_typo_inside_a_live_table_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        let err = set_key_in_file(&path, "github.aut", "\"gh\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("github.aut"), "got: {msg}");
+        assert!(msg.contains("auth"), "the valid keys must be named, got: {msg}");
+        assert!(msg.contains("Did you mean github.auth?"), "got: {msg}");
+    }
+
+    /// A key that is structurally real but not a key of this table. The
+    /// `identity` table is a `BTreeMap` of user-named profiles, so
+    /// `identity.personal` parses cleanly and is not a setting.
+    #[test]
+    fn a_profile_name_is_not_a_setting() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        let err = set_key_in_file(&path, "identity.personal", "\"work\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("identity.personal"), "got: {msg}");
+        assert!(msg.contains("identity.default"), "got: {msg}");
+    }
+
+    /// The other direction: a real key inside a real profile is accepted, and
+    /// two sets into the same profile accumulate rather than replace. The
+    /// check must not be so strict that it refuses the settings it exists to
+    /// write — and a profile that can only be built by a struct round-trip
+    /// would be a profile no one could configure.
+    #[test]
+    fn a_real_key_inside_a_profile_is_accepted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        set_key_in_file(&path, "identity.work.name", "\"Dev Work\"").unwrap();
+        set_key_in_file(&path, "identity.work.email", "\"dev@corp.com\"").unwrap();
+
+        let cfg = load_config(&path).unwrap();
+        let id = cfg.identity.resolve("work").expect("both keys were written");
+        assert_eq!(id.name, "Dev Work");
+        assert_eq!(id.email, "dev@corp.com");
+    }
+
+    /// Half a profile is a well-formed config that names what it is missing,
+    /// rather than a file that no longer parses.
+    #[test]
+    fn a_profile_may_be_built_a_key_at_a_time() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        set_key_in_file(&path, "identity.work.email", "\"dev@corp.com\"").unwrap();
+
+        // The file still loads — this is the point of `name`/`email` being
+        // optional. What is refused is the *use* of an incomplete profile.
+        let cfg = load_config(&path).expect("an incomplete profile still loads");
+        let err = cfg
+            .identity
+            .resolve("work")
+            .expect_err("an incomplete profile must not resolve to an address")
+            .to_string();
+        assert!(err.contains("name"), "it must say what is missing, got: {err}");
+    }
+
+    /// A typo inside a profile is refused, and the message names the profile
+    /// keys rather than the top-level ones.
+    #[test]
+    fn a_typo_inside_a_profile_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        let err = set_key_in_file(&path, "identity.work.emali", "\"x@y.z\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("identity.work.emali"), "got: {msg}");
+        assert!(msg.contains("name"), "the profile keys must be named, got: {msg}");
+        assert!(msg.contains("email"), "the profile keys must be named, got: {msg}");
+    }
+
+    /// Every key in the shipped default config must be one `ro config set`
+    /// will write. A default the tool refuses to set is a setting the user
+    /// cannot change from the command line.
+    #[test]
+    fn every_key_in_the_default_config_is_settable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        for key in [
+            "core.projects_dir",
+            "core.layout",
+            "core.parallel",
+            "core.timeout_secs",
+            "github.host",
+            "github.auth",
+            "agent.engine",
+        ] {
+            assert_eq!(
+                classify_key(key),
+                KeyVerdict::Known,
+                "{key} is in the shipped default config and must be settable"
+            );
+        }
+    }
+
+    /// The mirror: a key the table declares must be one the structs accept.
+    /// This is the property that would have caught a key added to the schema
+    /// and forgotten in the table, or vice versa.
+    #[test]
+    fn classify_key_agrees_with_the_schema_table() {
+        for (table, keys) in crate::schema::CONFIG_KEYS {
+            for key in *keys {
+                let dotted = format!("{table}.{key}");
+                assert_eq!(
+                    classify_key(&dotted),
+                    KeyVerdict::Known,
+                    "{dotted} is declared in CONFIG_KEYS and must classify as Known"
+                );
+            }
+        }
+    }
+
+    /// A key with no leaf at all. `ro config set core=4` would put a value
+    /// where a table is expected and the file would then fail to parse.
+    #[test]
+    fn a_bare_table_name_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        let err = set_key_in_file(&path, "core", "4").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("core"), "got: {msg}");
+        assert!(msg.contains("layout"), "the valid keys must be named, got: {msg}");
+    }
+
+    /// A key too deep to be real. `core.layout.x` parses, and nothing reads
+    /// it.
+    #[test]
+    fn a_key_too_deep_to_be_real_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        let err = set_key_in_file(&path, "core.layout.x", "1").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("core.layout.x"), "got: {msg}");
+        assert!(msg.contains("core.layout"), "got: {msg}");
     }
 }

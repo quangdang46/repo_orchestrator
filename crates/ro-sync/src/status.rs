@@ -67,6 +67,35 @@ pub struct RepoStatus {
     /// the text renderer prints.
     pub conflict_kind: Option<String>,
     pub last_synced_at: Option<i64>,
+    /// The ref `ahead`/`behind` were measured against, e.g. `origin/main`.
+    ///
+    /// Named on the row because the number is meaningless without it. The
+    /// documented daily loop is `ro status`, *then* `ro sync`, so at the
+    /// moment this row is rendered the remote-tracking ref is whatever the
+    /// previous fetch left behind — and `behind=0` against a ref from this
+    /// morning is not "in sync", it is "nobody has looked since this
+    /// morning".
+    pub measured_against: Option<String>,
+    /// When that ref was last updated locally, in Unix seconds.
+    ///
+    /// `None` when it could not be read, which is a third answer and not a
+    /// synonym for "just now": a repo with reflogs off has no timestamp, and
+    /// guessing `now` there is how a stale board gets to look fresh.
+    pub measured_against_updated_at: Option<i64>,
+    /// Did *this* status call fetch first?
+    ///
+    /// The distinction the age alone cannot carry. A fetch that failed leaves
+    /// the ref exactly as stale as it was, so "how old is the ref" and "is
+    /// the number current" are different questions, and a row that answers
+    /// only the first reads as fresh after a failed fetch.
+    pub measured_after_fetch: bool,
+    /// Why the optional fetch did not happen, when one was asked for and did
+    /// not succeed.
+    ///
+    /// Present so a `--fetch` run that could not reach the remote says so
+    /// instead of quietly printing the same numbers it would have printed
+    /// without the flag.
+    pub fetch_error: Option<String>,
 }
 
 impl RepoStatus {
@@ -85,7 +114,35 @@ impl RepoStatus {
 ///
 /// Queries the state DB for repo metadata, then uses `ro_git::read`
 /// functions to inspect the actual repository on disk.
+///
+/// A **local** measurement: nothing here talks to the network, and the row
+/// says so. See [`status_repo_with`] for the opt-in that does fetch, and
+/// for why it is not the default.
 pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
+    status_repo_with(conn, repo_id, false)
+}
+
+/// Get status for a single tracked repo, optionally fetching first.
+///
+/// `fetch_first` is the `--fetch` opt-in. It is **not** the default, and that
+/// is a decision rather than an oversight: `ro status` is the first half of
+/// the documented daily loop, it runs over a whole fleet, and turning it
+/// into a network operation changes what it costs and what it means to run
+/// it in a script — a status board that blocks for the length of a fetch is
+/// not a board. The default instead says what the number was measured
+/// against and when that ref last moved, so a stale base is visible on the
+/// row rather than hidden inside a zero, and the flag is there for the user
+/// who wants the current answer and is willing to pay for it.
+///
+/// The flag is spelled as a separate function rather than as a parameter on
+/// [`status_repo`] so that every existing caller — and the CLI in
+/// `crates/ro` — keeps compiling unchanged, and wiring `--fetch` is one
+/// call site rather than a workspace-wide signature change.
+pub fn status_repo_with(
+    conn: &Connection,
+    repo_id: &str,
+    fetch_first: bool,
+) -> Result<RepoStatus> {
     let mut stmt =
         conn.prepare("SELECT owner, name, branch, local_path FROM repos WHERE id = ?1")?;
     let row = stmt
@@ -101,6 +158,38 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
 
     let (owner, name, tracked_branch, local_path) = row;
     let path = std::path::PathBuf::from(&local_path);
+
+    // The optional fetch, taken **before** the branch is read, because the
+    // branch the row is on determines which remote-tracking ref is compared
+    // against, and fetching first means that comparison is against the
+    // freshest ref the remote has to offer.
+    //
+    // The failure is swallowed into a field rather than propagated. `ro
+    // status` over twenty repos where one remote is unreachable is still
+    // nineteen good rows, and the abort-the-listing answer is the same
+    // trade-off as every other read on this row: one broken repo must not
+    // cost the user the other nineteen. The unreachable remote is named in
+    // `fetch_error` so it is not mistaken for a successful measurement.
+    let mut fetch_error = None;
+    if fetch_first {
+        match ro_git::mutation::fetch(&path, &ro_git::mutation::FetchOpts::default()) {
+            // `fetch` returns `Ok` for a git that *ran and failed*:
+            // `run_in` reports the exit status in the outcome rather than as
+            // an error, and only a spawn failure is an `Err`. Checking
+            // `ok()` is what turns "the fetch did not happen" into a row that
+            // says so — without it, `--fetch` over an unreachable remote
+            // prints exactly the numbers it would have printed without the
+            // flag, and the flag becomes a claim rather than a measurement.
+            Ok(result) if !result.ok() => {
+                fetch_error = Some(format!(
+                    "fetch did not succeed: {}",
+                    result.stderr.trim()
+                ));
+            }
+            Err(e) => fetch_error = Some(format!("fetch could not run: {e:#}")),
+            Ok(_) => {}
+        }
+    }
 
     let (branch, is_dirty, ahead, behind, unmeasurable_reason) = if path.join(".git").exists() {
         let branch = ro_git::read::current_branch(&path)?;
@@ -179,6 +268,29 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
         .ok()
         .flatten();
 
+    // What the comparison above was measured against, and when that ref last
+    // moved. Read here, off the branch the row actually resolved, because
+    // the whole point is that a reader can tell "in sync" apart from "in
+    // sync with a ref from six hours ago" without running anything.
+    //
+    // The *name* of the ref and the *age* of the ref are separate answers.
+    // A repo whose reflogs are off has a perfectly good `origin/main` and no
+    // timestamp for it, and collapsing that to "unknown" would throw away the
+    // half of the answer that is still true.
+    let (measured_against, measured_against_updated_at) = if ahead.is_some() && behind.is_some() {
+        match branch.as_deref().or(tracked_branch.as_deref()) {
+            Some(b) => (
+                Some(format!("origin/{b}")),
+                ro_git::status::remote_ref_updated_at(&path, "origin", b)
+                    .ok()
+                    .flatten(),
+            ),
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+
     // Resolved before the struct literal, because two of the fields want
     // to *look* at the branch and one wants to own it.
     let effective = branch.clone().or(tracked_branch.clone());
@@ -214,11 +326,26 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
         in_conflict,
         conflict_kind,
         last_synced_at,
+        measured_against,
+        measured_against_updated_at,
+        measured_after_fetch: fetch_first,
+        fetch_error,
     })
 }
 
 /// Get status for all tracked repos.
+///
+/// Local, like [`status_repo`]. See [`status_all_with`] for the fetch opt-in.
 pub fn status_all(conn: &Connection) -> Result<Vec<RepoStatus>> {
+    status_all_with(conn, false)
+}
+
+/// Get status for all tracked repos, optionally fetching each one first.
+///
+/// `fetch_first` is the same opt-in as [`status_repo_with`], threaded
+/// through so `ro status --fetch` is one flag on one command rather than a
+/// per-row decision.
+pub fn status_all_with(conn: &Connection, fetch_first: bool) -> Result<Vec<RepoStatus>> {
     let mut stmt = conn.prepare("SELECT id FROM repos ORDER BY owner, name")?;
     let ids: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -227,7 +354,7 @@ pub fn status_all(conn: &Connection) -> Result<Vec<RepoStatus>> {
 
     let mut statuses = Vec::new();
     for id in ids {
-        statuses.push(status_repo(conn, &id)?);
+        statuses.push(status_repo_with(conn, &id, fetch_first)?);
     }
     Ok(statuses)
 }
@@ -235,6 +362,7 @@ pub fn status_all(conn: &Connection) -> Result<Vec<RepoStatus>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ro_testkit::{BareRemote, Worktree};
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -463,8 +591,12 @@ mod tests {
 
         let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
         conn.execute(
-            "UPDATE repos SET clone_url = ?1 WHERE id = ?2",
-            rusqlite::params![remote.path().to_string_lossy(), repo.id],
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
         )
         .unwrap();
 
@@ -727,7 +859,10 @@ mod tests {
         run_git(&other, &["config", "user.email", "test@example.com"]);
         run_git(&other, &["config", "user.name", "Test"]);
         commit(&other, "shared.txt", "line1\nREMOTE-VERSION\nline3\n");
-        run_git(&other, &["push", "-q", "origin", "main"]);
+        // `HEAD:main` rather than `origin main`: a bare repo created by
+        // `git init --bare` leaves HEAD at `master`, so the clone lands on
+        // `master` and a hard-coded `main` refspec matches nothing.
+        run_git(&other, &["push", "-q", "origin", "HEAD:main"]);
 
         // The local checkout rewrites the same line and does not commit,
         // so the pull has to stash it and the pop is what conflicts.
@@ -778,5 +913,308 @@ mod tests {
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
+    }
+
+    // ── What the row was measured against ──
+
+    /// A status that never fetches measures against whatever the last fetch
+    /// left behind, and the row has to say so.
+    ///
+    /// This is the bug the bead is about. `ro status` is the first half of
+    /// the documented daily loop — status, *then* sync — so at the moment
+    /// the row is rendered the remote-tracking ref is hours old, and
+    /// `behind=0` against a ref from this morning is not "in sync", it is
+    /// "nobody has looked since this morning". The old row printed the same
+    /// `behind=0` for both, which is how a stale board reads as a green one.
+    #[test]
+    fn a_status_that_did_not_fetch_says_what_it_measured_against() {
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        // The remote moves on. The checkout does not fetch — which is the
+        // whole state `ro status` is in during the daily loop.
+        let other = tmp.path().join("other");
+        // `-b main` so the checkout is on the branch the remote actually has.
+        // A bare repo made by `git init --bare` leaves HEAD at `master`,
+        // so a plain clone checks out nothing and the push that follows is
+        // a root commit — rejected as a non-fast-forward.
+        run_git(
+            tmp.path(),
+            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+        );
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test"]);
+        std::fs::write(other.join("b.txt"), "remote moved\n").unwrap();
+        run_git(&other, &["add", "."]);
+        run_git(&other, &["commit", "-q", "-m", "remote moved"]);
+        // `HEAD:main` rather than `origin main`: a bare repo created by
+        // `git init --bare` leaves HEAD at `master`, so the clone lands on
+        // `master` and a hard-coded `main` refspec matches nothing.
+        run_git(&other, &["push", "-q", "origin", "HEAD:main"]);
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+
+        // The number is measured against the ref that is there, and the row
+        // names it — so a reader can tell "in sync" from "in sync with a
+        // ref from before the remote moved".
+        assert_eq!(
+            status.measured_against.as_deref(),
+            Some("origin/main"),
+            "the row must name the ref the counts were measured against: {status:?}"
+        );
+        assert_eq!(status.behind, Some(0), "the local ref is genuinely behind nothing it can see");
+        assert!(
+            status.measured_against_updated_at.is_some(),
+            "a ref that was pushed to has a reflog, and the row must carry \
+             when it last moved: {status:?}"
+        );
+        assert!(
+            !status.measured_after_fetch,
+            "the default `ro status` does not fetch, and the row must not \
+             claim it did"
+        );
+        assert_eq!(status.fetch_error, None);
+    }
+
+    /// The age is the part that stops `behind=0` reading as "in sync".
+    ///
+    /// A ref that was updated an hour ago and a ref that was updated a minute
+    /// ago are both "not behind", and only one of them is a statement about
+    /// the remote as it is now.
+    #[test]
+    fn a_stale_remote_tracking_ref_is_visible_on_the_row() {
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        // The remote-tracking ref is rewound to an hour ago, which is the
+        // state a checkout is in when the last fetch was an hour ago.
+        let reflog = seed
+            .path()
+            .join(".git")
+            .join("logs")
+            .join("refs")
+            .join("remotes")
+            .join("origin")
+            .join("main");
+        let contents = std::fs::read_to_string(&reflog).unwrap();
+        // The head of the line is rewritten and the message after the tab is
+        // left alone. Splitting the whole line on whitespace and rejoining
+        // would collapse the message's own spaces, and the reader counts
+        // fields from the right of the *head* — so a message that had been
+        // squashed to one word would shift every field it is counting.
+        let (head, message) = contents
+            .split_once('\t')
+            .map(|(h, m)| (h, Some(m)))
+            .unwrap_or((contents.trim_end(), None));
+        let mut fields: Vec<&str> = head.split_whitespace().collect();
+        let an_hour_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 3600;
+        // Declared before `fields` so it outlives the borrow taken below.
+        let replacement = an_hour_ago.to_string();
+        // The timestamp is the second field from the right of the head: the
+        // timezone is last, and the committer identity before it may contain
+        // spaces. Counted from the left it would land on the identity.
+        let idx = fields.len().saturating_sub(2);
+        fields[idx] = &replacement;
+        let mut rewritten = fields.join(" ");
+        if let Some(m) = message {
+            rewritten.push('\t');
+            rewritten.push_str(m);
+        }
+        std::fs::write(&reflog, format!("{rewritten}\n")).unwrap();
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        let updated = status
+            .measured_against_updated_at
+            .expect("the reflog was rewritten, so there is a timestamp on it");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            (now - updated).abs() < 3700 && (now - updated) > 3500,
+            "the row must carry the age of the ref, not a fresh timestamp: \
+             updated={updated} now={now}"
+        );
+    }
+
+    /// `--fetch` is the opt-in, and it is opt-in on purpose.
+    ///
+    /// Fetching turns `ro status` from a fast local check into a network
+    /// operation over the whole fleet, which is a real cost and a behaviour
+    /// change — so the default reports the staleness instead, and the flag is
+    /// the way to say "I want the current answer and I am paying for it".
+    #[test]
+    fn fetch_first_measures_against_the_current_remote() {
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        // The remote moves on, and the checkout has not seen it.
+        let other = tmp.path().join("other");
+        // `-b main` so the checkout is on the branch the remote actually has.
+        // A bare repo made by `git init --bare` leaves HEAD at `master`,
+        // so a plain clone checks out nothing and the push that follows is
+        // a root commit — rejected as a non-fast-forward.
+        run_git(
+            tmp.path(),
+            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+        );
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test"]);
+        std::fs::write(other.join("b.txt"), "remote moved\n").unwrap();
+        run_git(&other, &["add", "."]);
+        run_git(&other, &["commit", "-q", "-m", "remote moved"]);
+        // `HEAD:main` rather than `origin main`: a bare repo created by
+        // `git init --bare` leaves HEAD at `master`, so the clone lands on
+        // `master` and a hard-coded `main` refspec matches nothing.
+        run_git(&other, &["push", "-q", "origin", "HEAD:main"]);
+
+        // Without the flag: the local ref, and the row says it did not fetch.
+        let without = status_repo(&conn, &repo.id).unwrap();
+        assert!(!without.measured_after_fetch);
+        assert_eq!(without.behind, Some(0));
+
+        // With the flag: the fetch happens, the ref moves, and the row says
+        // the number is current. This is the assertion the flag exists for —
+        // a `--fetch` that left `behind=0` over a repo that is actually
+        // behind would be the same lie wearing a flag.
+        let with = status_repo_with(&conn, &repo.id, true).unwrap();
+        assert!(
+            with.measured_after_fetch,
+            "the row must say the measurement followed a fetch"
+        );
+        assert_eq!(
+            with.behind,
+            Some(1),
+            "after the fetch the repo is one commit behind, and the row must \
+             say so: {with:?}"
+        );
+        assert_eq!(with.fetch_error, None);
+    }
+
+    /// A fetch that fails leaves the ref exactly as stale as it was.
+    ///
+    /// The two questions — how old is the ref, and is the number current —
+    /// are separate, and a row that answers only the first reads as fresh
+    /// after a failed fetch. The failure is named on the row rather than
+    /// propagated, because `ro status` over twenty repos where one remote is
+    /// unreachable is still nineteen good rows.
+    #[test]
+    fn a_failed_fetch_is_named_on_the_row_not_hidden_behind_a_zero() {
+        let (tmp, conn) = setup();
+        let seed = Worktree::empty();
+        // A remote that does not exist: the fetch cannot succeed.
+        seed.add_remote("origin", &tmp.path().join("no-such-remote.git"));
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                tmp.path().join("no-such-remote.git").to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        let status = status_repo_with(&conn, &repo.id, true).unwrap();
+        assert!(
+            status.fetch_error.is_some(),
+            "a fetch that could not reach the remote must be reported, not \
+             absorbed into a clean row: {status:?}"
+        );
+        assert!(
+            status.measured_after_fetch,
+            "the flag was passed, so the row must say a fetch was attempted"
+        );
+    }
+
+    /// The staleness fields reach the machine formats.
+    ///
+    /// `ro status --format json` and `--format ndjson` serialise this struct
+    /// whole, so a field that is not on it is a field no script ever sees.
+    #[test]
+    fn the_staleness_fields_reach_the_machine_formats() {
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(row["measured_against"], "origin/main");
+        assert!(
+            row["measured_against_updated_at"].is_number(),
+            "the age must reach json: {row}"
+        );
+        assert_eq!(row["measured_after_fetch"], serde_json::Value::Bool(false));
     }
 }

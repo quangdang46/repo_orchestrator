@@ -271,7 +271,7 @@ mod tests {
         }
     }
 
-    /// And the file the user ends up with must not trip the migration note
+    /// And the file the user ends with must not trip the migration note
     /// that `load_config` prints for a config carrying a cut table.
     #[test]
     fn a_fresh_install_does_not_get_told_it_is_outdated() {
@@ -279,5 +279,83 @@ mod tests {
             crate::loader::deprecated_tables(default_config_toml()).is_empty(),
             "ro init would warn a brand-new user about a table it just wrote"
         );
+    }
+
+    /// Every key in the shipped default config is read by something.
+    ///
+    /// This is the property `doctor`'s `EXPECTED_SECTIONS` claims about
+    /// *tables*, and it is the one that would have caught the whole class of
+    /// bug this wave is about: a setting that is written, looks live, and
+    /// does nothing. A table can be checked by name; a key cannot, because a
+    /// key is only "read" if some code path touches it — so this walks the
+    /// default file and asserts each key has a reader.
+    ///
+    /// ## It fails today, and that is the finding
+    ///
+    /// `INERT` below is not a placeholder. Every entry in it was confirmed by
+    /// grepping every consumer of `AppConfig` in the workspace: the only
+    /// fields read outside this crate are `agent.engine` and
+    /// `identity.*`, both in `ro/src/ship/mod.rs`. `core.parallel` and
+    /// `core.timeout_secs` are validated, documented in the shipped file with
+    /// a comment saying what they do, and read by nothing —
+    /// `RunOptions::default()` hardcodes `parallel: 4` and
+    /// `ro_engine::dispatch::default_timeout()`. Same for `github.host`,
+    /// `github.auth`, `core.layout`, `core.projects_dir` and all of `[auth]`.
+    ///
+    /// The fix is a call site in a file this wave does not own, so the list is
+    /// the specification: each name is a key the user can type, the comment
+    /// says what it does, and nothing happens. Removing the keys from the
+    /// default file is a product decision; wiring the readers is not, and is
+    /// the correct one.
+    #[test]
+    fn every_key_in_the_default_config_has_a_reader() {
+        let parsed: toml::Value =
+            toml::from_str(default_config_toml()).expect("default config parses");
+        let root = parsed.as_table().expect("a table at the root");
+
+        let mut inert = Vec::new();
+        for (table, keys) in crate::schema::CONFIG_KEYS {
+            let Some(t) = root.get(*table) else {
+                continue;
+            };
+            let t = t.as_table().expect("a table in the default config");
+            for key in *keys {
+                if !t.contains_key(*key) {
+                    // Shipped commented-out, which is the right call for a
+                    // credential: the file is a template, and an uncommented
+                    // `https = ""` would be a credential that resolves to
+                    // nothing. `[auth]` is the one table whose keys are all
+                    // examples; every other live table ships them set.
+                    continue;
+                }
+                if !has_reader(table, key) {
+                    inert.push(format!("{table}.{key}"));
+                }
+            }
+        }
+        assert!(
+            inert.is_empty(),
+            "these keys are in the shipped default config and read by nothing: {inert:?}\n\
+             Each is a setting a user can type, documented with a comment saying \
+             what it does, that does nothing. Wire the reader (or delete the key \
+             from the default file) — see the doc comment on this test."
+        );
+    }
+
+    /// Does anything read `table.key`?
+    ///
+    /// Only the readers that exist are listed. The ones that do not exist are
+    /// the finding, so they appear in the failure message rather than in a
+    /// `matches!` arm that would make the test green and the bug permanent.
+    fn has_reader(table: &str, key: &str) -> bool {
+        let dotted = format!("{table}.{key}");
+        matches!(
+            dotted.as_str(),
+            // `ro/src/ship/mod.rs:93` — `.or(config.agent.engine.as_deref())`.
+            "agent.engine"
+                // `ro/src/ship/mod.rs:212` — `config.identity.fallback()`, and
+                // `:230` passes `&config.identity` for per-row `author_ref`.
+                | "identity.default"
+        )
     }
 }

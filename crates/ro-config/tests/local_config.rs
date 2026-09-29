@@ -179,3 +179,178 @@ fn a_file_without_a_trailing_newline_is_not_corrupted() {
     );
     assert!(after.contains(LOCAL_IGNORE));
 }
+
+// ── Precedence: every key must actually take effect ─────────────────────
+//
+// The documented chain is flag > local file > registry row > config file.
+// Last wave fixed `credential_ref` — it was merged into a local variable and
+// then thrown away, so the row's value was what left the machine. These tests
+// pin the other three, because the same shape is invisible from the outside:
+// the file parses, the run succeeds, and the setting does nothing.
+
+/// `author` outranks the row's `author_ref`, and the name resolves against
+/// `[identity.*]` in the global config.
+#[test]
+fn the_local_files_author_outranks_the_row() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "author = \"personal\"\n");
+    let c = RepoLocalConfig::load(tmp.path()).unwrap().unwrap();
+
+    let (mut author, mut cred, mut engine, mut args) = (
+        Some("work".to_string()),
+        Some("env:ROW".to_string()),
+        Some("claude".to_string()),
+        None::<String>,
+    );
+    c.apply_to(&mut author, &mut cred, &mut engine, &mut args);
+
+    assert_eq!(author.as_deref(), Some("personal"), "the file wins");
+    assert_eq!(cred.as_deref(), Some("env:ROW"), "untouched keys inherit");
+    assert_eq!(engine.as_deref(), Some("claude"), "untouched keys inherit");
+    assert_eq!(args, None, "untouched keys inherit");
+}
+
+/// `engine` outranks the row's `engine`.
+///
+/// This is the key that is inert in the shipped code. `plan_for` merges the
+/// file's value into a local and then resolves the engine from the value
+/// *passed in* — the CLI flag or `[agent] engine` — so the file's `engine` is
+/// read, merged, and discarded. The merge is correct; the consumer is not.
+/// The fix is in `crates/ro/src/ship/emit.rs`, which this wave does not own.
+#[test]
+fn the_local_files_engine_outranks_the_row() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "engine = \"codex\"\n");
+    let c = RepoLocalConfig::load(tmp.path()).unwrap().unwrap();
+
+    let (mut author, mut cred, mut engine, mut args) = (
+        Some("work".to_string()),
+        Some("env:ROW".to_string()),
+        Some("claude".to_string()),
+        None::<String>,
+    );
+    c.apply_to(&mut author, &mut cred, &mut engine, &mut args);
+
+    assert_eq!(engine.as_deref(), Some("codex"), "the file wins");
+    assert_eq!(author.as_deref(), Some("work"), "untouched keys inherit");
+    assert_eq!(cred.as_deref(), Some("env:ROW"), "untouched keys inherit");
+}
+
+/// `engine-args` outranks the row's `engine_args`.
+///
+/// Same shape as `engine`, and the same defect: `plan_for` merges it into a
+/// local that nothing reads. The row's `engine_args` is what reaches the
+/// engine, so a per-repo `--sandbox danger` is silently dropped.
+#[test]
+fn the_local_files_engine_args_outranks_the_row() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "engine-args = \"--sandbox danger\"\n");
+    let c = RepoLocalConfig::load(tmp.path()).unwrap().unwrap();
+
+    let (mut author, mut cred, mut engine, mut args) = (
+        Some("work".to_string()),
+        Some("env:ROW".to_string()),
+        Some("claude".to_string()),
+        Some("--model opus".to_string()),
+    );
+    c.apply_to(&mut author, &mut cred, &mut engine, &mut args);
+
+    assert_eq!(
+        args.as_deref(),
+        Some("--sandbox danger"),
+        "the file wins"
+    );
+    assert_eq!(engine.as_deref(), Some("claude"), "untouched keys inherit");
+}
+
+/// All four at once, so the merge is checked as a whole rather than one key
+/// at a time.
+#[test]
+fn all_four_keys_outrank_the_row_together() {
+    let tmp = TempDir::new().unwrap();
+    write(
+        tmp.path(),
+        "author = \"personal\"\ncredential = \"env:PERSONAL\"\nengine = \"codex\"\nengine-args = \"--sandbox danger\"\n",
+    );
+    let c = RepoLocalConfig::load(tmp.path()).unwrap().unwrap();
+
+    let (mut author, mut cred, mut engine, mut args) = (
+        Some("work".to_string()),
+        Some("env:ROW".to_string()),
+        Some("claude".to_string()),
+        Some("--model opus".to_string()),
+    );
+    c.apply_to(&mut author, &mut cred, &mut engine, &mut args);
+
+    assert_eq!(author.as_deref(), Some("personal"));
+    assert_eq!(cred.as_deref(), Some("env:PERSONAL"));
+    assert_eq!(engine.as_deref(), Some("codex"));
+    assert_eq!(args.as_deref(), Some("--sandbox danger"));
+}
+
+/// A local file naming an unknown profile is a clear error, not a silent
+/// fall-back to the row's author.
+///
+/// The error is raised where the name is resolved — `IdentityConfig::resolve`
+/// in `ro-config/src/schema.rs` — which is the one place that knows what the
+/// valid names are. A fall-back here would commit every repo under the row's
+/// identity while the user believed the file had pinned their own.
+#[test]
+fn an_unknown_profile_in_the_local_file_is_an_error_not_a_fallback() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "author = \"nosuchprofile\"\n");
+    let c = RepoLocalConfig::load(tmp.path()).unwrap().unwrap();
+
+    // The file loads — it is well-formed. The error is at resolution, which
+    // is where a name is checked against the profiles that exist.
+    let mut author = c.author.clone();
+    let (mut cred, mut engine, mut args) = (
+        Some("env:ROW".to_string()),
+        Some("claude".to_string()),
+        None::<String>,
+    );
+    c.apply_to(&mut author, &mut cred, &mut engine, &mut args);
+    assert_eq!(author.as_deref(), Some("nosuchprofile"), "the file wins");
+
+    // And resolving it against an `[identity]` table that does not have it
+    // is an error naming the known profiles.
+    let profiles = ro_config::schema::IdentityConfig::default();
+    let err = profiles
+        .resolve("nosuchprofile")
+        .expect_err("an unknown profile must not resolve");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nosuchprofile"),
+        "the error must name the profile that failed, got: {msg}"
+    );
+}
+
+/// A local file naming an unknown engine is not silently accepted, and the
+/// three built-ins are the whole set.
+///
+/// `ro-config` does not depend on `ro-engine`, so the check itself lives
+/// there — `ro_engine::dispatch::resolve` turns an unknown name into an error
+/// naming the three, rather than a fall-through to the raw backend. What is
+/// pinned *here* is the half this crate owns: the file carries the name
+/// through unchanged and without validation of its own, so the two layers
+/// cannot disagree about which names exist.
+#[test]
+fn the_local_files_engine_is_carried_through_unchanged_for_the_engine_layer_to_check() {
+    let tmp = TempDir::new().unwrap();
+    write(tmp.path(), "engine = \"cladue\"\n");
+    let c = RepoLocalConfig::load(tmp.path()).unwrap().unwrap();
+
+    // Not validated here, and not defaulted either: the value arrives at the
+    // engine layer verbatim, which is where the "unknown engine" error with
+    // the three names lives.
+    assert_eq!(
+        c.engine.as_deref(),
+        Some("cladue"),
+        "this crate must not rewrite the name; ro-engine owns that error"
+    );
+    assert_eq!(
+        RepoLocalConfig::keys(),
+        &["author", "credential", "engine", "engine-args"],
+        "and the accepted keys are exactly the four the file documents"
+    );
+}

@@ -30,20 +30,26 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main
 ## 🤖 Agent Quickstart (Robot Mode)
 
 ```bash
-# Fleet health
+# The live CLI, as JSON — do not parse --help
+ro schema
 
 # Status of all tracked repos
 ro status --format json
 
-# Ranked attention
+# What is tracked, one JSON object per line
+ro list --format json
 
-# Plan automation
+# A whole fleet: fetch, rebase, commit, push. One line per repo, then counts.
+ro ship --format json
+
+# The same run, previewed. Without --dry-run it really does commit and push.
+ro ship --dry-run
 ```
 
 **Output conventions**
 - stdout = structured data (JSON)
 - stderr = diagnostics, warnings
-- exit 0 = success
+- exit 0 = success, 1 = partial, 2 = all failed, 64 = bad usage, 70 = fatal
 
 ---
 
@@ -56,10 +62,9 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 | Pain | Symptom |
 |------|---------|
 | Drift | Working copies behind / dirty / conflicted |
-| Noise | Issues/PRs/CI mixed without ranking |
-| Blind automation | Scripts mutate without a reviewable plan |
+| Blind automation | Scripts mutate with nothing to check them against |
 | Agent shell chaos | Models run raw `git`/`gh` with no safety gates |
-| No audit trail | “What did we change last Tuesday?” |
+| No record | “What did ro do to this repo?” — answered per run, not per week |
 
 ### The Solution
 
@@ -67,23 +72,23 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 
 | Capability | Command surface |
 |------------|-----------------|
-| Track & sync | `add` · `import` · `sync` · `status` · `prune` |
-| Attention | `health` |
-| Risky ops | `review plan` · plan → apply → rollback |
-| Safety | secret scan · denylist · quality gates |
-| Agents | `--format text|json|toon` · `ro schema` · MCP-friendly structure |
+| Track & sync | `add` · `remove` · `list` · `sync` · `status` |
+| Group | `tag` · `untag` · `tags` |
+| Commit & push | `commit` · `push` · `ship` |
+| Safety | secret scan · denylist · protected-branch refusal |
+| Agents | `--format text\|json\|ndjson` · `ro schema` |
 
-> **Status:** early development (v0.2.x) — public API and flags may shift before v1.0.
+> **Status:** early development (v0.3.x) — public API and flags may shift before v1.0.
 
 ### Why Use ro?
 
 | Feature | What it does |
 |---------|--------------|
 | **Fleet inventory** | One SQLite DB for all tracked repos |
-| **First-class sync** | ff-only / rebase / merge, parallel, resume, autostash |
-| **Ranked attention** | Health scores instead of tab soup |
-| **Plan-then-apply** | The preflight reports before it mutates |
-| **Agent-ready JSON** | Structured reads for coding agents and MCP |
+| **First-class sync** | ff-only / rebase / merge, parallel, autostash |
+| **Attention** | `ro status --dirty --ahead --behind` — the repos that need you |
+| **An agent in the loop** | `claude` by default, `codex` or `git` — you choose per run |
+| **Agent-ready JSON** | Structured reads for coding agents |
 | **Doctor** | Diagnose and repair the local environment |
 
 ---
@@ -93,7 +98,7 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 ```bash
 ro init
 ro add quangdang46/repo_orchestrator
-ro sync -j 4
+ro sync
 ro status --format json
 ro doctor
 ```
@@ -105,14 +110,16 @@ ro doctor
 1. **GitHub-first, local source of truth.**  
    Remote is GitHub; authority for *what we track and did* is local SQLite.
 
-2. **Plan before mutate.**  
-   Every mutation reports what it will do before doing it.
+2. **Preview is opt-in, and it is there.**  
+   `--dry-run` on `commit`, `push` and `ship` shows the plan without writing
+   it. Without the flag, the verb acts.
 
 3. **Agents get JSON, not scraped TUI.**  
    Prefer `--format json` and `ro schema` over parsing human text.
 
 4. **Safety gates over clever scripts.**  
-   Secret scan, denylist paths, and quality checks beat “trust the model with raw git.”
+   Secret scan, denylist paths, and protected-branch refusal beat “trust the
+   model with raw git.”
 
 5. **Degrade cleanly.**  
    Absent optional tools must not produce silent half-applies.
@@ -126,12 +133,12 @@ ro doctor
 | Manual `gh`/`git` | Manual | Manual | No | Fragile |
 | Ad-hoc scripts | Partial | No | Rarely | Opaque |
 | IDE multi-root | UI-only | Partial | No | Weak CLI |
-| **ro** | First-class | Ranked health | Plan/apply | JSON + MCP |
+| **ro** | First-class | Status filters | Preflight + gates | JSON + `ro schema` |
 
 **When to use ro:**
 - You maintain a fleet of GitHub repos (personal monorepo farm, org mirror, agent lab)
-- You want agents to sync/status/health without raw destructive git
-- You need an audit trail of runs and plans
+- You want an agent to commit and push across many repos without raw destructive git
+- You want a per-run record of what was done to each repo
 
 **When ro might not be ideal:**
 - Single-repo day-to-day work (plain `git`/`gh` is enough)
@@ -203,13 +210,14 @@ Prefer structured reads over scraping TUI/text when driving agents.
 ## Commands
 
 ```text
-ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interactive] <COMMAND>
+ro [--config-dir <DIR>] [--state-dir <DIR>] [--non-interactive] <COMMAND>
 ```
 
 | Group | Command | What it does |
 |-------|---------|--------------|
 | Setup | `init` · `doctor [--fix]` | Config + SQLite; diagnose/repair |
-| Repos | `add` · `remove` · `list` · `import` · `prune --orphans --archive` | Track inventory |
+| Repos | `add` · `remove [--delete]` · `list` | Track inventory |
+| Group | `tag` · `untag` · `tags` | Tags, and `--tag` selection on the fleet verbs |
 | Sync | `sync` · `status` | Working copies + attention |
 | Commit | `commit` · `push` · `ship` | Engine, then commit, then push |
 | Config | `config` | Show / set configuration |
@@ -218,21 +226,24 @@ ro [--config-dir <DIR>] [--state-dir <DIR>] [--quiet] [--verbose] [--non-interac
 ```bash
 # Inventory
 ro add owner/repo
+ro add .                       # adopt a checkout you already have
 ro list --owner my-org --format json
 
 # Sync fleet
-ro sync --strategy ff-only -j 8 --autostash
+ro sync --strategy ff-only --autostash
 ro sync --dry-run
-ro sync --resume
+ro sync --prune                # git remote prune, not a verb
 
 # Attention
 ro status my-org/service-a
+ro status --dirty --behind
 
 # Safety-oriented automation
 ro doctor --fix
 ```
 
-Run `ro --help` / `ro <cmd> --help` for full flags.
+Run `ro --help` / `ro <cmd> --help` for full flags, or `ro schema` for the
+same tree as JSON.
 
 ---
 
@@ -240,10 +251,10 @@ Run `ro --help` / `ro <cmd> --help` for full flags.
 
 | Gate | Default |
 |------|---------|
-| Secret scan | On before risky apply |
-| Denylist paths | Blocks dangerous globs |
-| Quality checks | Configurable |
-| Plan-first | The preflight reports before it mutates |
+| Secret scan | Blocks the commit; not configurable |
+| Denylist paths | Blocks dangerous globs, at any depth |
+| Protected branches | Refused: `main`, `master`, `production`, `staging`, `release/*` |
+| Dry run | Opt-in: `--dry-run` on `commit`, `push`, `ship`, `sync` |
 | Non-interactive | `--non-interactive` never prompts |
 
 Absent tools degrade cleanly where the design allows — never silent half-applies.
@@ -256,13 +267,17 @@ Absent tools degrade cleanly where the design allows — never silent half-appli
 |------|---------|
 | Config dir | `$XDG_CONFIG_HOME/ro` (override: `--config-dir`) |
 | State dir | `$XDG_STATE_HOME/ro` (override: `--state-dir`) |
-| SQLite | Inventory, runs, health — under state dir |
+| SQLite | Inventory, tags, per-repo settings — under state dir |
 
 ```bash
 ro init
 ro config
 ro doctor
 ```
+
+`ro config set KEY=VALUE` parses the value as TOML, so a string needs quotes:
+`ro config set 'agent.engine="codex"'`. An integer does not:
+`ro config set core.parallel=4`.
 
 ---
 
@@ -271,14 +286,17 @@ ro doctor
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │ CLI (crates/ro)                                            │
-│  init · add · sync · health · review · schema · …          │
+│  init · add · remove · list · sync · status · tag ·       │
+│  untag · tags · commit · push · ship · doctor · config ·   │
+│  schema                                                     │
 └────────────────────────────┬────────────────────────────────┘
                              │
      ┌───────────────────────┼───────────────────────┐
      ▼                       ▼                       ▼
 ┌──────────┐          ┌────────────┐          ┌────────────┐
-│ ro-git  │          │ ro-github │          │ ro-sync   │
-│ local vc │          │ API / gh   │          │ strategies │
+│ ro-git  │          │ ro-engine  │          │ ro-sync   │
+│ local vc │          │ claude /   │          │ strategies │
+│ + safety │          │ codex / git│          │ + targets │
 └────┬─────┘          └─────┬──────┘          └─────┬──────┘
      │                      │                       │
      └──────────────────────┼───────────────────────┘
@@ -291,11 +309,14 @@ ro doctor
                             │
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼
-        ro-jobs       ro-engine       safety      
-        plan/apply    run timeline     agent surfaces
+        ro-config     ro-sweep       ro-core
+        config file   denylist +     credentials,
+        + identity    secret scan    exit codes
 ```
 
-Workspace highlights: `ro-core`, `ro-config`, `ro-state`, `ro-git`, `ro-github`, `ro-sync`, `ro-engine`, `ro-sweep`, `ro-jobs`, …
+Workspace: `ro-core`, `ro-config`, `ro-state`, `ro-git`, `ro-github`, `ro-sync`,
+`ro-engine`, `ro-sweep`, `ro-jobs`, `ro-testkit`. The CLI depends on all of
+them.
 
 ---
 
@@ -322,7 +343,7 @@ ro doctor --fix
 ### Conflicts
 
 There is no `ro conflict` verb. A conflict is a **stage** inside
-`ro ship`:
+`ro ship` and `ro push`:
 
 ```bash
 ro ship                       # rebases; on a conflict, reports and hands over
@@ -339,11 +360,41 @@ ignore it.
 files mid-rebase, and the overwhelmingly common cause of a rejected push
 is a stale branch — three git commands that need no model at all.
 
-### Interrupted parallel sync
+### A rejected push: `non-fast-forward`
+
+The remote moved after your last fetch. `ro ship` fetches and rebases first,
+so this usually means the branch was pushed earlier and the remote has since
+advanced. Integrate by hand:
 
 ```bash
-ro sync --resume
+git rebase origin/<branch>   # or: git pull
+ro ship
 ```
+
+### A blocked commit
+
+`blocked: denylisted path(s): …` means a denylisted path is in the diff;
+`blocked: possible secret in <path> (<rule>)` means the secret scan matched.
+Neither is configurable. Remove the file, or commit it yourself.
+
+### Interrupted sync
+
+There is no `ro sync --resume` and no daemon. A run is a process; re-run it.
+A sync is idempotent by construction.
+
+### `ro config set` rejects a value
+
+The value is parsed as TOML, not as a string. `ro config set
+agent.engine=codex` fails with `is not a valid TOML value` — quote it:
+
+```bash
+ro config set 'agent.engine="codex"'
+```
+
+`[identity]` and `[agent]` are the tables that do something. `[core]`'s
+`layout`, `parallel`, `projects_dir` and `timeout_secs` and `[github]`'s
+`host` and `auth` are accepted and printed but read by nothing — see
+FEATURES.md.
 
 ### Checksum verification failed
 
@@ -367,9 +418,11 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main
 | Capability | Current state | Notes |
 |------------|---------------|-------|
 | Multi-host VCS | ⚠️ Secondary | GitHub is the primary path |
-| Network-free mode | ⚠️ Limited | Sync/import need API + git |
+| Network-free mode | ⚠️ Limited | `sync`/`add` of a remote need API + git |
+| Quality gates | ❌ | No flag, no config key; nothing runs the build |
+| Run history | ❌ | The per-run summary is the record |
+| Health scoring | ❌ | `ro status` filters; there is no ranking |
 | Pixel-perfect TUI | ❌ | CLI + JSON first |
-| Fully autonomous merge | ❌ | Plan/apply still needs human/agent policy |
 
 ---
 
@@ -377,11 +430,14 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/repo_orchestrator/main
 
 ### vs plain `gh`?
 
-`gh` is one-repo oriented. `ro` tracks a fleet, ranks attention, and gates automation.
+`gh` is one-repo oriented. `ro` tracks a fleet, filters attention, and gates
+automation.
 
 ### Safe for agents?
 
-Prefer JSON reads + plan commands. Do not give bare destructive git without review plans. Use `--non-interactive` in automation.
+Prefer JSON reads (`ro status --format json`, `ro list --format json`,
+`ro schema`). Do not give bare destructive git. Use `--non-interactive` in
+automation, and `--dry-run` when you want the plan before the write.
 
 ### Where is state?
 
@@ -396,6 +452,14 @@ fleet, and `ro import` was removed. Register the repos you want:
 ro add owner/repo        # clone and track
 ro add .                 # track a repo you already have
 ```
+
+### Does `ro` use an AI to write commit messages?
+
+Yes. `ro commit`, `ro push` and `ro ship` hand the worktree to an agent before
+anything is written. The default engine is `claude`; `codex` and `git` are the
+other two, chosen per run with `--engine` or per repo with `ro add --engine`.
+`git` is the raw backend — it stages everything and writes `wip on <branch>`.
+`--message <MSG>` overrides the subject.
 
 ### How do I install or upgrade?
 

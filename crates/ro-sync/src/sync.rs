@@ -9,7 +9,7 @@ use clap::ValueEnum;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::manage::TrackedRepo;
 
@@ -68,6 +68,58 @@ impl Default for SyncOptions {
     }
 }
 
+impl SyncOptions {
+    /// The deadline for one git invocation, from [`Self::timeout_secs`].
+    ///
+    /// `None` for a zero, and that is deliberate rather than a coercion: a
+    /// zero-length deadline is not a fast git, it is a git killed before it
+    /// has finished starting. The field is a `u32` with a documented
+    /// "must be >= 1" in the config schema, so zero only arrives when
+    /// somebody typed `--timeout 0`; the honest reading of that is "no
+    /// deadline", which is what git did before this field was wired up and
+    /// what a user asking for it is asking for.
+    pub fn git_timeout(&self) -> Option<Duration> {
+        (self.timeout_secs > 0).then(|| Duration::from_secs(self.timeout_secs as u64))
+    }
+
+    /// `RunOpts` carrying this run's deadline and nothing else.
+    ///
+    /// The deadline is **not** cosmetic. `RunOpts::timeout` is what makes
+    /// `ro_git` spawn the child into its own process group and `killpg` the
+    /// whole tree on expiry — killing only the direct child would leave the
+    /// `ssh` and credential helpers it started holding the worktree lock,
+    /// which stalls the fleet exactly as much as never killing anything at
+    /// all, and then reports success.
+    pub fn run_opts(&self) -> ro_git::mutation::RunOpts<'static> {
+        ro_git::mutation::RunOpts {
+            timeout: self.git_timeout(),
+            ..ro_git::mutation::RunOpts::none()
+        }
+    }
+
+    /// Set the deadline on a git invocation and run it.
+    ///
+    /// `ro_git`'s `fetch`, `pull` and `clone` take their options structs and
+    /// run with `RunOpts::none()` internally, so a caller that needs the
+    /// deadline enforced has to reach past them. This is that seam: the same
+    /// command, the same args, the same outcome, with the caller's `RunOpts`
+    /// handed to `run_in` — and `run_in` is the only thing in `ro_git` that
+    /// knows how to kill a child *tree* rather than a child.
+    ///
+    /// Written as a free function on `SyncOptions` rather than a method on
+    /// `ro_git::mutation` because the deadline is this run's and the command
+    /// is git's. Pushing a `&SyncOptions` through `ro_git`'s API would put a
+    /// sync concept in a git crate; leaving the three `run_in` calls inline
+    /// at each site would be three copies of the same four lines.
+    pub fn git(
+        &self,
+        cwd: Option<&Path>,
+        args: &[&str],
+    ) -> Result<ro_git::mutation::GitCommandResult> {
+        ro_git::mutation::run_in(cwd, args, &self.run_opts())
+    }
+}
+
 /// Result of syncing a single repo.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncResult {
@@ -78,6 +130,27 @@ pub struct SyncResult {
     pub error: Option<String>,
     pub pre_oid: Option<String>,
     pub post_oid: Option<String>,
+    /// What the repo is relative to its upstream, as the sync would find it.
+    ///
+    /// `None` for every row that is not a measurement — a clone, a skip, an
+    /// error — because a row that carries a count it did not take is a row
+    /// that reads as a fact. Populated by the dry run, which is the only
+    /// caller that measures without acting.
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    /// Why the ahead/behind comparison could not be made, when it could not.
+    ///
+    /// The same reason `ro status` carries: a dry run that says
+    /// "ahead=unknown" with no explanation sends the user hunting through
+    /// twenty rows for the one that is unmeasured.
+    pub unmeasurable_reason: Option<String>,
+    /// What this invocation would actually *do* to the repo, in one line.
+    ///
+    /// The dry run's whole output. `would_pull` / `would_clone` was the whole
+    /// of it, which is the bug: the one question a dry run is ever asked is
+    /// "is there anything waiting for me", and a repo three commits behind
+    /// and a repo already in line both answered `would_pull`.
+    pub plan: Option<String>,
 }
 
 /// The statuses `sync_repo` can put in [`SyncResult::status`], and what each
@@ -148,6 +221,291 @@ pub(crate) fn status_fails_run(status: &str) -> bool {
     }
 }
 
+// ── The deadline ──
+//
+// `--timeout <secs>` arrived as a field on `SyncOptions` and a flag on the
+// CLI, and nothing ever read it. Every git call this module made went out
+// with `RunOpts::none()`, whose `timeout` is `None`, and `None` means
+// `Command::output()` — block until the child exits, forever. A `--timeout 5`
+// sync over a fleet ran exactly as long as its slowest git, and the slowest
+// git is the one waiting on a network that never answers. The flag was in
+// `--help` with a unit in it, so it read as enforced, and the guarantee it
+// was not enforcing is the guarantee the rest of the tool is built on: a
+// wedged git call must not wedge the fleet.
+//
+// The deadline is enforced by `ro_git::mutation::run_in`, which already
+// implements the discipline the engine uses — spawn into a fresh process
+// group, poll, and on expiry `killpg` the group and reap, so the `ssh` and
+// credential helpers git started die with it. `SyncOptions::run_opts` is the
+// seam that hands it over, and `SyncOptions::git` is the one call site that
+// uses it.
+//
+// `fetch`, `pull` and `clone` in `ro_git` take their options structs and
+// run with `RunOpts::none()` internally, so they cannot be given a deadline
+// without a signature change in a crate this one does not own. That change
+// is described under `knownGaps`; until it lands, the deadline is enforced
+// on the one git call this module makes directly (`git remote prune`) and
+// the three that go through it are unenforced, which is the honest state of
+// the flag rather than a claim that it works.
+
+/// A dry run that says a repo is fine and a real run that then refuses it.
+///
+/// The property the dry run exists for, stated as a function of the two
+/// results rather than as a hope.
+///
+/// A dry run reaches it by construction for every decision the real run
+/// makes **before** it talks to the network: the same code path reads the
+/// worktree, the same branch, the same flags, and the plan's `status` is
+/// copied into the row rather than being `dry_run` for everything. That is
+/// the bug this replaces — the old dry run emitted `status = "dry_run"` for
+/// all of them, and `dry_run` never fails a run, so a repo the real run was
+/// going to skip for being dirty read as a clean dry run and the verdict
+/// matched only by accident.
+///
+/// It **cannot** hold for a repo the real run refuses for a reason no local
+/// read can see — a remote that is down, a URL that has stopped resolving, a
+/// server that has started refusing the credential. Deciding those would mean
+/// doing the fetch, and a dry run that fetches is a fetch. What the plan says
+/// instead is which ref the numbers were measured against, so a user can see
+/// that the answer is a local one.
+///
+/// The comparison is on the **verdict**, not the status string. Two different
+/// non-failing statuses for the same repo are not a disagreement about
+/// whether the run passes, and a repo whose upstream ref simply is not
+/// resolvable locally is the case where the honest dry-run status and the
+/// real-run status differ while the answer to "does this run pass" does not.
+pub fn plans_match(dry_run: &SyncResult, real_run: &SyncResult) -> bool {
+    status_fails_run(&dry_run.status) == status_fails_run(&real_run.status)
+}
+
+/// What one repo's sync would do, decided without doing it.
+///
+/// This is the dry run's whole answer, and it is a *plan* rather than a
+/// label. `would_pull` / `would_clone` was the whole of it, which is the
+/// bug: the one question a dry run is ever asked is "is there anything
+/// waiting for me", and a repo three commits behind and a repo already in
+/// line both answered `would_pull`. A dry run that cannot tell those apart
+/// is not a preview of the sync — it is a restatement of the command line.
+///
+/// Every branch here is a branch the real run takes, in the same order, so
+/// the two cannot disagree. That is the property the dry run exists for and
+/// the reason this function is written as a mirror of `sync_repo` rather
+/// than as a second implementation of the same logic: a second implementation
+/// is a second thing to get wrong, and the disagreement it produces is
+/// invisible until someone has already run the real sync.
+fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
+    let local = Path::new(&repo.local_path);
+
+    if !local.join(".git").exists() {
+        // Not cloned. The real run clones unless `--pull-only` says
+        // otherwise, and the plan says which of the two it is.
+        if opts.pull_only {
+            return Ok(PlannedSync {
+                action: "skipped_clone".into(),
+                status: STATUS_SKIPPED.into(),
+                ahead: None,
+                behind: None,
+                unmeasurable_reason: None,
+                plan: Some(
+                    "not cloned, and --pull-only skips clones — this repo would not be touched"
+                        .into(),
+                ),
+            });
+        }
+        return Ok(PlannedSync {
+            action: "clone".into(),
+            status: STATUS_DRY_RUN.into(),
+            ahead: None,
+            behind: None,
+            unmeasurable_reason: None,
+            plan: Some(format!(
+                "clone {} into {} — there is nothing here yet",
+                repo.clone_url,
+                local.display()
+            )),
+        });
+    }
+
+    // Cloned. `--clone-only` skips pulls, and the plan says so rather than
+    // leaving a row that reads as "nothing to do".
+    if opts.clone_only {
+        return Ok(PlannedSync {
+            action: "skipped_pull".into(),
+            status: STATUS_SKIPPED.into(),
+            ahead: None,
+            behind: None,
+            unmeasurable_reason: None,
+            plan: Some(
+                "already cloned, and --clone-only skips pulls — this repo would not be touched"
+                    .into(),
+            ),
+        });
+    }
+
+    let branch = ro_git::read::current_branch(local)
+        .ok()
+        .flatten()
+        .or(repo.branch.clone())
+        .unwrap_or_else(|| "main".into());
+
+    // A checkout with no `origin` has nothing to fetch from. The real run
+    // does not fail on it — `git pull` answers "does not appear to be a git
+    // repository", which the arm below recognises as a branch that has never
+    // been pushed, and records a skip. The plan mirrors that status so the
+    // verdicts agree, while saying the more useful thing: the remote is
+    // missing, not the branch.
+    match ro_git::read::has_remote(local, "origin") {
+        Ok(false) => {
+            return Ok(PlannedSync {
+                action: "skipped_unpushed".into(),
+                status: STATUS_SKIPPED.into(),
+                ahead: None,
+                behind: None,
+                unmeasurable_reason: None,
+                plan: Some(format!(
+                    "no `origin` remote is configured, so there is nothing to fetch \
+                     from — this run would skip the pull rather than fail it"
+                )),
+            });
+        }
+        // Could not even list the remotes: a checkout git cannot read. The
+        // real run's fetch and pull both fail on it, so the plan says so
+        // rather than describing a pull that cannot happen.
+        Err(e) => {
+            return Ok(PlannedSync {
+                action: "pull".into(),
+                status: STATUS_ERROR.into(),
+                ahead: None,
+                behind: None,
+                unmeasurable_reason: Some(format!("cannot list remotes: {e:#}")),
+                plan: Some(format!(
+                    "cannot read this checkout's remotes ({e:#}) — the fetch and the pull \
+                     would both fail"
+                )),
+            });
+        }
+        Ok(true) => {}
+    }
+
+    // A dirty worktree is skipped unless `--autostash` says otherwise. The
+    // count is in the plan because the count is the whole reason the user
+    // would want to know: "skipped" is a decision, "3 uncommitted
+    // change(s)" is the information needed to make a different one.
+    let dirty_count = dirty_file_count(local)?;
+    if dirty_count > 0 && !opts.autostash {
+        return Ok(PlannedSync {
+            action: "skipped_dirty".into(),
+            status: STATUS_SKIPPED.into(),
+            ahead: None,
+            behind: None,
+            unmeasurable_reason: None,
+            plan: Some(format!(
+                "skipped: {dirty_count} uncommitted change(s) — a pull would risk them, \
+                 and --autostash is not set"
+            )),
+        });
+    }
+
+    // The ahead/behind comparison, which is the question the dry run is
+    // asked. Measured against `origin/<branch>` — the same ref the real
+    // pull's fetch updates — so the number is the number the sync would act
+    // on, not a number about some other base.
+    let upstream = format!("origin/{branch}");
+    let (ahead, behind, reason) = match ro_git::read::ahead_behind(local, &upstream) {
+        Ok(ab) => (Some(ab.ahead), Some(ab.behind), None),
+        // Unmeasurable is reported, never guessed at. A dry run that
+        // printed `behind=0` for a repo it could not measure would be the
+        // one lie a dry run must never tell.
+        Err(e) => (
+            None,
+            None,
+            Some(format!("cannot measure {upstream} against HEAD: {e:#}")),
+        ),
+    };
+
+    let (status, plan) = match (ahead, behind) {
+        (Some(a), Some(b)) if a == 0 && b == 0 => (
+            STATUS_DRY_RUN,
+            format!("nothing to do — {branch} is in line with {upstream}"),
+        ),
+        // Diverged. Under `--ff-only` this is not a pull that might be
+        // awkward, it is a pull git refuses outright — "Not possible to
+        // fast-forward, aborting" — so the plan says the run will fail
+        // rather than describing a sync that will not happen. The dry run
+        // and the real run then agree, which is the property the flag is
+        // for; the alternative is a dry run that promises a pull and a real
+        // run that exits 1.
+        (Some(a), Some(b))
+            if a > 0 && b > 0 && matches!(opts.strategy, SyncStrategy::FfOnly) =>
+        {
+            (
+                STATUS_ERROR,
+                format!(
+                    "the pull will fail — {branch} has diverged from {upstream} \
+                     ({a} ahead, {b} behind) and --ff-only refuses a non-fast-forward. \
+                     Use --strategy rebase or --strategy merge, or push the local \
+                     commits first"
+                ),
+            )
+        }
+        (Some(a), Some(b)) if a > 0 && b > 0 => (
+            STATUS_DRY_RUN,
+            format!(
+                "pull {branch} — it has diverged from {upstream} ({a} ahead, {b} behind), \
+                 so this is a {}-way sync, not a fast-forward",
+                match opts.strategy {
+                    SyncStrategy::Rebase => "rebase",
+                    SyncStrategy::Merge => "merge",
+                    SyncStrategy::FfOnly => "merge",
+                }
+            ),
+        ),
+        (Some(_), Some(b)) if b > 0 => (
+            STATUS_DRY_RUN,
+            format!("pull {branch} — {b} commit(s) behind {upstream} are waiting"),
+        ),
+        // Ahead and not behind is the case the old dry run could not see,
+        // and the one a dry run most needs to be honest about: sync does
+        // not push, so "would pull" over a repo with unpushed work was a
+        // promise the run would not keep.
+        (Some(a), Some(_)) if a > 0 => (
+            STATUS_DRY_RUN,
+            format!(
+                "nothing to pull — {branch} is {a} commit(s) ahead of {upstream}. \
+                 `ro sync` does not push, so those commits stay local until you \
+                 push them yourself"
+            ),
+        ),
+        _ => (
+            STATUS_DRY_RUN,
+            format!("nothing to do — {branch} is in line with {upstream}"),
+        ),
+    };
+
+    Ok(PlannedSync {
+        action: "pull".into(),
+        status,
+        ahead,
+        behind,
+        unmeasurable_reason: reason,
+        plan: Some(plan),
+    })
+}
+
+/// What [`plan_repo`] decided, as a row.
+///
+/// A struct rather than a tuple because the dry run has to build a
+/// [`SyncResult`] from it and a seven-field tuple is how a field gets
+/// dropped on the way.
+struct PlannedSync {
+    action: String,
+    status: &'static str,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+    unmeasurable_reason: Option<String>,
+    plan: Option<String>,
+}
+
 /// Sync a single repo.
 pub fn sync_repo(
     conn: &Connection,
@@ -180,11 +538,7 @@ pub fn sync_repo(
         // is pruned: a repo whose remote is called something else has no
         // remote-tracking refs under `origin` to prune, and pruning a
         // different name would be pruning a remote this sync never read.
-        let pruned = ro_git::mutation::run_in(
-            Some(local),
-            &["remote", "prune", "origin"],
-            &ro_git::mutation::RunOpts::none(),
-        );
+        let pruned = opts.git(Some(local), &["remote", "prune", "origin"]);
         if let Err(e) = &pruned {
             // A prune that cannot run is not a reason to fail a sync — the
             // pull is the work, and the prune is housekeeping the user asked
@@ -195,20 +549,45 @@ pub fn sync_repo(
     }
 
     if opts.dry_run {
-        let action = if local.join(".git").exists() {
-            "would_pull"
-        } else {
-            "would_clone"
-        };
+        // The plan is a *mirror* of the branches below, not a second
+        // implementation of them, and that is the whole point of it living
+        // in its own function over the same inputs. Two independent
+        // "decide what would happen" paths are two things to get wrong, and
+        // the disagreement is invisible until someone has already run the
+        // real sync — which is the one moment a dry run cannot help.
+        let planned = plan_repo(repo, opts)?;
         let duration = start.elapsed().as_millis() as u64;
+        // Recorded against the run like every other row, so a dry run has an
+        // entry in `sync_results` and an exit code on the run a script can
+        // read. A verdict that exists only on screen is a verdict nothing
+        // downstream can act on.
+        record_result(
+            conn,
+            run_id,
+            &repo.id,
+            &planned.action,
+            planned.status,
+            duration,
+            planned.plan.as_deref(),
+            &pre_oid,
+            &pre_oid,
+        )?;
         return Ok(SyncResult {
             repo_id: repo.id.clone(),
-            action: action.into(),
-            status: "dry_run".into(),
+            action: planned.action,
+            status: planned.status.into(),
             duration_ms: duration,
-            error: None,
+            // The reason is the dry run's output. It rides in `error`
+            // because that is the field the text renderer already prints
+            // for any non-success row, and a dry run whose explanation
+            // lives in a field nothing renders says nothing at all.
+            error: planned.plan,
             pre_oid: pre_oid.clone(),
             post_oid: pre_oid,
+            ahead: planned.ahead,
+            behind: planned.behind,
+            unmeasurable_reason: planned.unmeasurable_reason,
+            plan: None,
         });
     }
 
@@ -223,6 +602,10 @@ pub fn sync_repo(
                 error: None,
                 pre_oid: pre_oid.clone(),
                 post_oid: None,
+                ahead: None,
+                behind: None,
+                unmeasurable_reason: None,
+                plan: None,
             });
         }
         // Clone
@@ -256,6 +639,10 @@ pub fn sync_repo(
                         error: Some(err_msg),
                         pre_oid,
                         post_oid: None,
+                        ahead: None,
+                        behind: None,
+                        unmeasurable_reason: None,
+                        plan: None,
                     });
                 }
                 let post_oid = ro_git::read::head_oid(local).ok().flatten();
@@ -271,6 +658,10 @@ pub fn sync_repo(
                     error: None,
                     pre_oid,
                     post_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
                 })
             }
             Err(e) => {
@@ -295,6 +686,10 @@ pub fn sync_repo(
                     error: Some(err_msg),
                     pre_oid: pre_oid.clone(),
                     post_oid: None,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
                 })
             }
         }
@@ -309,11 +704,64 @@ pub fn sync_repo(
                 error: None,
                 pre_oid: pre_oid.clone(),
                 post_oid: pre_oid,
+                ahead: None,
+                behind: None,
+                unmeasurable_reason: None,
+                plan: None,
             });
         }
         // Fetch + pull
+        // The fetch is `FetchOpts::default()`, which is every field at its
+        // default, which `ro_git::mutation::fetch` renders as a bare
+        // `git fetch` — verified against the real git, not assumed, because
+        // a fetch that grew a `--prune` or a remote name would quietly make
+        // this a different command than the one the option struct describes.
+        // `FetchOpts::default()` is every field at its default, which
+        // `ro_git::mutation::fetch` renders as a bare `git fetch` — verified
+        // against the real git rather than assumed, because a fetch that
+        // grew a `--prune` or a remote name would quietly make this a
+        // different command than the option struct describes.
         let fetch_opts = ro_git::mutation::FetchOpts::default();
         if let Err(e) = ro_git::mutation::fetch(local, &fetch_opts) {
+            // A fetch that hit the deadline is a timeout, not a refusal, and
+            // the two need different responses: a refusal is a wrong flag or
+            // a bad URL, a timeout is a network that never answered and the
+            // next repo is still worth trying. `GitError::TimedOut` is the
+            // one error type in `ro_git` that says which it was, so it is
+            // matched by name rather than by the words in its message.
+            if let Some(ro_git::mutation::GitError::TimedOut { after, .. }) =
+                e.downcast_ref::<ro_git::mutation::GitError>()
+            {
+                let duration = start.elapsed().as_millis() as u64;
+                let err_msg = format!(
+                    "git fetch did not finish within {after:?} and was killed, along with \
+                     anything it had started. The next repo is unaffected."
+                );
+                record_result(
+                    conn,
+                    run_id,
+                    &repo.id,
+                    "fetch",
+                    "error",
+                    duration,
+                    Some(&err_msg),
+                    &pre_oid,
+                    &pre_oid,
+                )?;
+                return Ok(SyncResult {
+                    repo_id: repo.id.clone(),
+                    action: "fetch".into(),
+                    status: "error".into(),
+                    duration_ms: duration,
+                    error: Some(err_msg),
+                    pre_oid: pre_oid.clone(),
+                    post_oid: pre_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
+                });
+            }
             let duration = start.elapsed().as_millis() as u64;
             let err_msg = format!("{e:#}");
             record_result(
@@ -335,6 +783,10 @@ pub fn sync_repo(
                 error: Some(err_msg),
                 pre_oid: pre_oid.clone(),
                 post_oid: pre_oid,
+                ahead: None,
+                behind: None,
+                unmeasurable_reason: None,
+                plan: None,
             });
         }
 
@@ -395,6 +847,10 @@ pub fn sync_repo(
                 error: None,
                 pre_oid: pre_oid.clone(),
                 post_oid: pre_oid,
+                ahead: None,
+                behind: None,
+                unmeasurable_reason: None,
+                plan: None,
             });
         }
 
@@ -441,6 +897,10 @@ pub fn sync_repo(
                     error: Some(detail),
                     pre_oid,
                     post_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
                 })
             }
             // `pull` returns `Ok` when the command *ran*, not when it
@@ -468,6 +928,10 @@ pub fn sync_repo(
                     error: None,
                     pre_oid,
                     post_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
                 })
             }
             // The command ran and failed. Distinguish a conflict from a
@@ -501,6 +965,10 @@ pub fn sync_repo(
                     error: Some(err_msg),
                     pre_oid,
                     post_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
                 })
             }
             Ok(outcome) => {
@@ -539,6 +1007,10 @@ pub fn sync_repo(
                         error: None,
                         pre_oid,
                         post_oid,
+                        ahead: None,
+                        behind: None,
+                        unmeasurable_reason: None,
+                        plan: None,
                     });
                 }
                 let err_msg = if stderr.is_empty() {
@@ -565,6 +1037,10 @@ pub fn sync_repo(
                     error: Some(err_msg),
                     pre_oid,
                     post_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
                 })
             }
             Err(e) => {
@@ -588,6 +1064,10 @@ pub fn sync_repo(
                     error: Some(err_msg),
                     pre_oid,
                     post_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
                 })
             }
         }
@@ -1671,6 +2151,670 @@ mod unpushed_branch_tests {
     }
 }
 
+/// ── The dry run as a preview ──
+///
+/// A dry run that cannot say whether there is anything waiting is not a
+/// preview. `ro sync --dry-run` computed one bit per repo — does `.git`
+/// exist — and printed `would_pull` for every checkout on the machine, so a
+/// repo with three commits waiting and a repo already in line produced
+/// byte-identical rows. FEATURES.md sells the flag as "show what would
+/// happen"; what it showed was what command would be typed next.
+///
+/// The tests below drive the real code over real bare remotes, and the one
+/// that matters most asserts the property the flag is *for*: a dry run that
+/// says a repo is fine must not be followed by a real run that refuses it.
+#[cfg(test)]
+mod dry_run_preview {
+    use super::tests::{commit_to_remote, init_bare_remote, run_git};
+    use super::{SyncOptions, SyncResult, plans_match, run_exit_code, sync_all};
+    use rusqlite::{Connection, params};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// A fleet of three tracked repos over one bare remote, wired to real
+    /// working copies:
+    ///
+    ///  * `behind` — three commits pushed by somebody else, not fetched
+    ///  * `clean`  — exactly in line
+    ///  * `dirty`  — in line, with uncommitted work in the tree
+    ///  * `ahead`  — in line, with a commit that was never pushed
+    ///
+    /// The four are the four answers the old dry run could not give.
+    struct Fleet {
+        _tmp: TempDir,
+        conn: Connection,
+        remote: PathBuf,
+        /// repo_id -> local path
+        paths: Vec<(String, PathBuf)>,
+    }
+
+    fn fleet() -> Fleet {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let mut paths = Vec::new();
+        for name in ["behind", "clean", "dirty", "diverged"] {
+            let local = tmp.path().join("local").join(name);
+            std::fs::create_dir_all(&local).unwrap();
+            let clone = run_git(&local, &["clone", &remote.to_string_lossy(), "."]);
+            assert!(
+                clone.status.success(),
+                "the fixture clone failed:\n{}\n{}",
+                String::from_utf8_lossy(&clone.stdout),
+                String::from_utf8_lossy(&clone.stderr)
+            );
+            run_git(&local, &["config", "user.email", "test@example.com"]);
+            run_git(&local, &["config", "user.name", "Test"]);
+
+            let repo_id = uuid::Uuid::new_v4().to_string();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    repo_id,
+                    name,
+                    remote.to_string_lossy().to_string(),
+                    local.to_string_lossy().to_string(),
+                    now
+                ],
+            )
+            .unwrap();
+            paths.push((repo_id, local));
+        }
+
+        let f = Fleet {
+            _tmp: tmp,
+            conn,
+            remote,
+            paths,
+        };
+
+        // The remote moves on, three commits, that nobody has fetched.
+        for i in 0..3 {
+            commit_to_remote(
+                f._tmp.path(),
+                &f.remote,
+                &format!("b{i}.txt"),
+                &format!("remote moved {i}"),
+            );
+        }
+
+        // `behind` fetches; the others do not. The fetch is the whole point:
+        // `behind` is measured against the **local** remote-tracking ref, so
+        // a checkout that has never fetched reports `behind=0` however far
+        // the remote has moved. That is the staleness this whole change is
+        // about, and a fixture that forgot it would assert that a repo
+        // three commits behind reads as in line.
+        run_git(&f.path_of("behind"), &["fetch", "-q", "origin"]);
+        // `diverged` fetches too, and then commits — one ahead *and* three
+        // behind, which `--ff-only` refuses outright. It is the case a dry
+        // run can predict from local state alone, and predicting it is the
+        // difference between a preview and a guess.
+        run_git(&f.path_of("diverged"), &["fetch", "-q", "origin"]);
+
+        // And the local states the old dry run could not tell apart.
+        std::fs::write(
+            f.path_of("dirty").join("a.txt"),
+            "LOCAL UNCOMMITTED\n",
+        )
+        .unwrap();
+        {
+            // Fetched, then one local commit on top: one ahead **and** three
+            // behind. `--ff-only` refuses that outright, so it is the case a
+            // dry run can predict from local state alone and the real run
+            // cannot reach any other answer.
+            let diverged = f.path_of("diverged");
+            std::fs::write(diverged.join("local.txt"), "mine\n").unwrap();
+            run_git(&diverged, &["add", "."]);
+            run_git(&diverged, &["commit", "-m", "local only"]);
+        }
+        f
+    }
+
+    /// A fleet where the remote has moved on and **nobody** has fetched.
+    ///
+    /// The state `ro status` is in during the documented daily loop, and the
+    /// state a dry run is asked about: the local remote-tracking refs are
+    /// stale, so every count is measured against a base that is behind the
+    /// remote. The dry run has to say what it measured against rather than
+    /// reporting the stale numbers as if they were current.
+    fn stale_fleet() -> Fleet {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let mut paths = Vec::new();
+        for name in ["behind", "clean", "dirty", "diverged"] {
+            let local = tmp.path().join("local").join(name);
+            std::fs::create_dir_all(&local).unwrap();
+            let clone = run_git(&local, &["clone", &remote.to_string_lossy(), "."]);
+            assert!(
+                clone.status.success(),
+                "the fixture clone failed:\n{}\n{}",
+                String::from_utf8_lossy(&clone.stdout),
+                String::from_utf8_lossy(&clone.stderr)
+            );
+            run_git(&local, &["config", "user.email", "test@example.com"]);
+            run_git(&local, &["config", "user.name", "Test"]);
+
+            let repo_id = uuid::Uuid::new_v4().to_string();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    repo_id,
+                    name,
+                    remote.to_string_lossy().to_string(),
+                    local.to_string_lossy().to_string(),
+                    now
+                ],
+            )
+            .unwrap();
+            paths.push((repo_id, local));
+        }
+
+        // The remote moves on, three commits, and **no checkout fetches**.
+        // That is the whole point of this fixture: the local refs are stale,
+        // so `behind` reads as in line with a ref that is three commits
+        // behind the remote.
+        for i in 0..3 {
+            commit_to_remote(
+                tmp.path(),
+                &remote,
+                &format!("b{i}.txt"),
+                &format!("remote moved {i}"),
+            );
+        }
+
+        Fleet {
+            _tmp: tmp,
+            conn,
+            remote,
+            paths,
+        }
+    }
+
+    impl Fleet {
+        fn path_of(&self, name: &str) -> PathBuf {
+            self.paths
+                .iter()
+                .find(|(_, p)| p.file_name().unwrap() == name)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| panic!("no fixture repo called {name}"))
+        }
+
+        fn by_name(&self, results: &[SyncResult], name: &str) -> SyncResult {
+            let id = self
+                .paths
+                .iter()
+                .find(|(_, p)| p.file_name().unwrap() == name)
+                .map(|(id, _)| id.clone())
+                .unwrap();
+            results
+                .iter()
+                .find(|r| r.repo_id == id)
+                .unwrap_or_else(|| panic!("no result row for {name}"))
+                .clone()
+        }
+    }
+
+    /// The four checkouts, told apart.
+    ///
+    /// Red-first: before this, all four rows carried `action=would_pull` and
+    /// a `None` reason, and no row carried a number at all. The assertion is
+    /// on the *number*, because that is what a dry run is asked for and
+    /// because a status word alone (`would_pull`) was the bug.
+    #[test]
+    fn a_dry_run_says_how_far_behind_ahead_or_dirty_each_repo_is() {
+        let f = fleet();
+        let dry = sync_all(
+            &f.conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+        let behind = f.by_name(&dry, "behind");
+        assert_eq!(
+            behind.behind,
+            Some(3),
+            "a repo three commits behind must say three, not 'would_pull' with \
+             no number on it: {behind:?}"
+        );
+        assert_eq!(behind.ahead, Some(0));
+
+        let clean = f.by_name(&dry, "clean");
+        assert_eq!(
+            (clean.ahead, clean.behind),
+            (Some(0), Some(0)),
+            "a repo in line with the remote must say so: {clean:?}"
+        );
+
+        let dirty = f.by_name(&dry, "dirty");
+        assert_eq!(
+            dirty.action, "skipped_dirty",
+            "a dirty repo is skipped, and the dry run must say it will be: {dirty:?}"
+        );
+        let dirty_reason = dirty.error.as_deref().unwrap_or_default();
+        assert!(
+            dirty_reason.contains("1 uncommitted change"),
+            "the count is the information the user needs to decide about \
+             --autostash, and it was absent: {dirty:?}"
+        );
+
+        // Ahead *and* behind is the case the old dry run reported as a
+        // plain `would_pull`. A pull cannot fast-forward it, so the real run
+        // fails and the dry run has to say so.
+        let diverged_ahead = f.by_name(&dry, "diverged");
+        assert_eq!(diverged_ahead.ahead, Some(1), "{diverged_ahead:?}");
+        assert_eq!(diverged_ahead.behind, Some(3), "{diverged_ahead:?}");
+
+        // Diverged under `--ff-only` is a pull git refuses. The dry run has
+        // to say the run will fail, because a dry run that promises a pull
+        // and a real run that exits 1 is the one thing a dry run must never
+        // do — and the old implementation did it for every repo, since it
+        // had no notion of a repo that would fail at all.
+        let diverged = f.by_name(&dry, "diverged");
+        assert_eq!(
+            diverged.status, "error",
+            "a diverged repo under --ff-only fails the pull, and the dry run \
+             must say so: {diverged:?}"
+        );
+        let diverged_reason = diverged.error.as_deref().unwrap_or_default();
+        assert!(
+            diverged_reason.contains("will fail"),
+            "the row must say the pull will fail, not describe a sync that \
+             will not happen: {diverged:?}"
+        );
+    }
+
+    /// The promise the flag is for.
+    ///
+    /// A dry run that says everything is fine and a real run that then skips
+    /// three repos is the one thing a dry run must never do, and the old
+    /// implementation did it by construction: every row was
+    /// `status = "dry_run"`, `dry_run` never fails a run, and the dirty repos
+    /// the real run skipped never appeared in either the rows or the exit
+    /// code.
+    ///
+    /// The old code passed this test by accident — both verdicts were 0 — so
+    /// the assertion is on the **per-repo** agreement, not only the run
+    /// exit code, plus on the dirty repo's action matching the real run's.
+    #[test]
+    fn the_dry_runs_verdict_is_the_real_runs_verdict_for_every_repo() {
+        let f = fleet();
+        let opts = SyncOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let dry = sync_all(&f.conn, &opts, &[]).unwrap();
+
+        let real_opts = SyncOptions::default();
+        let real = sync_all(&f.conn, &real_opts, &[]).unwrap();
+
+        assert_eq!(
+            dry.len(),
+            real.len(),
+            "the two runs must cover the same fleet, or the comparison below \
+             is comparing different things"
+        );
+        for (d, r) in dry.iter().zip(real.iter()) {
+            assert!(
+                plans_match(d, r),
+                "the dry run and the real run disagree about {}:\n  dry  = {d:?}\n  real = {r:?}",
+                d.repo_id
+            );
+        }
+
+        // Spelled out, because `plans_match` agreeing on two skips that
+        // skipped for different reasons is still a bug.
+        let dirty_real = f.by_name(&real, "dirty");
+        assert_eq!(
+            dirty_real.action, "skipped_dirty",
+            "the real run's skip must be the one the dry run predicted"
+        );
+        assert_eq!(run_exit_code(&dry), run_exit_code(&real));
+
+        // And the dirty repo must still be visible in the dry run at all —
+        // a dry run that hides the repos it is about to skip has the same
+        // defect as one that calls them clean.
+        assert!(
+            dry.iter().any(|r| r.action == "skipped_dirty"),
+            "the dry run must name the repo the real run will skip"
+        );
+    }
+
+    /// A repo with unpushed work must be told that sync will not push it.
+    ///
+    /// The old dry run said `would_pull` for this repo, which reads as a
+    /// promise the run will not keep: `ro sync` pulls and never pushes, so
+    /// the local commit is still there afterwards. The row has to say what
+    /// the run actually does, which is nothing.
+    ///
+    /// The fixture leaves the remote-tracking ref where the clone put it,
+    /// because that is the only way to reach "ahead and not behind" against
+    /// a remote that has also moved. The assertion is on the **wording**,
+    /// not on the verdict: with a ref that old the real run's fetch would
+    /// find the repo diverged, and a dry run that cannot see the remote
+    /// cannot promise which. That limitation is what the staleness note in
+    /// the next test is for.
+    #[test]
+    fn an_ahead_repo_is_told_sync_will_not_push() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let local = tmp.path().join("local").join("ahead");
+        std::fs::create_dir_all(&local).unwrap();
+        let clone = run_git(&local, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(clone.status.success());
+        run_git(&local, &["config", "user.email", "test@example.com"]);
+        run_git(&local, &["config", "user.name", "Test"]);
+
+        // One local commit, never pushed.
+        std::fs::write(local.join("local.txt"), "mine\n").unwrap();
+        run_git(&local, &["add", "."]);
+        run_git(&local, &["commit", "-m", "local only"]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('id-ahead', 'github.com', 'fleet', 'ahead', ?1, ?2, ?3, ?3)",
+            params![
+                remote.to_string_lossy().to_string(),
+                local.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .unwrap();
+
+        let dry = sync_all(
+            &conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let row = &dry[0];
+        assert_eq!(
+            (row.ahead, row.behind),
+            (Some(1), Some(0)),
+            "one local commit, not pushed: {row:?}"
+        );
+        let reason = row.error.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("does not push"),
+            "a dry run must not read as a promise to push; sync pulls and \
+             never pushes, and the user has to know that: {row:?}"
+        );
+    }
+
+    /// A dry run that cannot see the remote says what it measured against.
+    ///
+    /// `behind` is measured against the **local** remote-tracking ref, so a
+    /// checkout that has not fetched reports `behind=0` however far the
+    /// remote has moved. That is not a bug in the count — it is what the
+    /// count means — and the row has to say so rather than let a stale zero
+    /// read as "in line". This is the same staleness `ro status` has, and
+    /// the same answer: name the ref, and the age of the ref.
+    #[test]
+    fn a_dry_run_over_a_stale_ref_names_the_ref_it_measured_against() {
+        let f = stale_fleet();
+        let dry = sync_all(
+            &f.conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+        // The remote moved three commits and this checkout never fetched, so
+        // the local ref says zero — which is true, and useless on its own.
+        let row = f.by_name(&dry, "behind");
+        assert_eq!(
+            row.behind,
+            Some(0),
+            "measured against a ref that has not moved, the repo is not \
+             behind: {row:?}"
+        );
+
+        // What makes that readable is that the row is a preview of a run
+        // that fetches first, and it names the ref the number came from.
+        let reason = row.error.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("origin/main"),
+            "the plan must name the ref the counts were measured against, or \
+             a `behind=0` over a stale ref is indistinguishable from a \
+             repo that is genuinely in line: {row:?}"
+        );
+    }
+
+    /// `--pull-only` and `--clone-only` are two different answers for a repo
+    /// that does not exist yet, and the old dry run gave both the same one
+    /// (`would_clone`).
+    #[test]
+    fn a_dry_run_honours_pull_only_and_clone_only() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "hello");
+
+        // A tracked repo with no checkout, and one with a checkout.
+        let missing = tmp.path().join("local").join("missing");
+        let present = tmp.path().join("local").join("present");
+        std::fs::create_dir_all(&present).unwrap();
+        let clone = run_git(&present, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(clone.status.success());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (name, path) in [("missing", &missing), ("present", &present)] {
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    format!("id-{name}"),
+                    name,
+                    remote.to_string_lossy().to_string(),
+                    path.to_string_lossy().to_string(),
+                    now
+                ],
+            )
+            .unwrap();
+        }
+
+        let dry = sync_all(
+            &conn,
+            &SyncOptions {
+                dry_run: true,
+                pull_only: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let skipped = dry.iter().find(|r| r.repo_id == "id-missing").unwrap();
+        assert_eq!(
+            skipped.action, "skipped_clone",
+            "--pull-only does not clone, and the dry run has to say so: {skipped:?}"
+        );
+        assert_eq!(skipped.status, "skipped");
+        // The real run must agree, or the run-level verdicts diverge.
+        let real = sync_all(
+            &conn,
+            &SyncOptions {
+                pull_only: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let real_missing = real.iter().find(|r| r.repo_id == "id-missing").unwrap();
+        assert!(
+            plans_match(skipped, real_missing),
+            "dry={skipped:?}\nreal={real_missing:?}"
+        );
+
+        let dry = sync_all(
+            &conn,
+            &SyncOptions {
+                dry_run: true,
+                clone_only: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let present_row = dry.iter().find(|r| r.repo_id == "id-present").unwrap();
+        assert_eq!(
+            present_row.action, "skipped_pull",
+            "--clone-only does not pull an existing checkout: {present_row:?}"
+        );
+    }
+
+    /// A repo the real run will refuse must not read as clean in the dry run.
+    ///
+    /// This is the "dry run says fine, real run refuses" case at its most
+    /// local: a repo with **no `origin` remote** cannot be fetched, and the
+    /// real run records an error for it. A dry run that answered
+    /// `would_pull` there was promising a fetch from a remote that does not
+    /// exist, and the run-level exit codes disagreed (0 versus 1).
+    #[test]
+    fn a_repo_the_real_run_cannot_fetch_is_not_reported_as_a_clean_pull() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let local = tmp.path().join("local").join("remoteless");
+        std::fs::create_dir_all(&local).unwrap();
+        run_git(&local, &["init", "-q", "-b", "main"]);
+        run_git(&local, &["config", "user.email", "test@example.com"]);
+        run_git(&local, &["config", "user.name", "Test"]);
+        std::fs::write(local.join("a.txt"), "hello\n").unwrap();
+        run_git(&local, &["add", "."]);
+        run_git(&local, &["commit", "-q", "-m", "one"]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('id-1', 'github.com', 'fleet', 'remoteless', ?1, ?2, ?3, ?3)",
+            params![local.to_string_lossy().to_string(), local.to_string_lossy().to_string(), now],
+        )
+        .unwrap();
+
+        let dry = sync_all(
+            &conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let row = &dry[0];
+        assert_ne!(
+            row.status, "dry_run",
+            "a repo with no origin remote cannot be pulled, so the dry run \
+             must not report the ordinary clean case: {row:?}"
+        );
+        let reason = row.error.as_deref().unwrap_or_default();
+        assert!(
+            reason.contains("origin"),
+            "the row must name what is missing, so the fix is obvious: {row:?}"
+        );
+
+        let real = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
+        let real_row = &real[0];
+        assert!(
+            plans_match(row, real_row),
+            "the dry run and the real run must agree on a repo that cannot be \
+             fetched:\n  dry  = {row:?}\n  real = {real_row:?}"
+        );
+        assert_eq!(run_exit_code(&dry), run_exit_code(&real));
+    }
+
+    /// A dry run writes rows, so its verdict is readable by a script.
+    #[test]
+    fn a_dry_run_records_its_verdict_in_the_run() {
+        let f = fleet();
+        let dry = sync_all(
+            &f.conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let recorded: i64 = f
+            .conn
+            .query_row("SELECT COUNT(*) FROM sync_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded, dry.len() as i64);
+        let runs: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE command = 'sync' AND ended_at IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1, "a dry run is still a run, and it is finalised");
+    }
+
+    /// The numbers travel in the machine formats.
+    ///
+    /// `ro sync --format json` serialises `SyncResult` whole, so a field
+    /// that is not on it is a field no script ever sees.
+    #[test]
+    fn the_preview_numbers_reach_json() {
+        let f = fleet();
+        let dry = sync_all(
+            &f.conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let behind = f.by_name(&dry, "behind");
+        let row: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&behind).unwrap()).unwrap();
+        assert_eq!(row["behind"], serde_json::Value::from(3));
+        assert_eq!(row["ahead"], serde_json::Value::from(0));
+        assert!(
+            row["error"].is_string(),
+            "the reason must reach json too: {row}"
+        );
+    }
+}
+
 /// The run-level verdict, and the audit trail it writes.
 ///
 /// `sync_all` used to count `status == "error"` and nothing else, so a run
@@ -1692,6 +2836,10 @@ mod run_exit_code_tests {
             error: None,
             pre_oid: None,
             post_oid: None,
+            ahead: None,
+            behind: None,
+            unmeasurable_reason: None,
+            plan: None,
         }
     }
 
@@ -2094,6 +3242,154 @@ mod autostash_wedge_tests {
             run_exit_code(&results),
             0,
             "and a clean sync over a clean tree is not a failure"
+        );
+    }
+}
+
+/// ── The deadline ──
+#[cfg(test)]
+mod deadline {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The one git call sync makes directly is given the run's deadline.
+    ///
+    /// `--timeout <secs>` arrived as a field on `SyncOptions` and a flag on
+    /// the CLI and **nothing read it**: every git call went out with
+    /// `RunOpts::none()`, whose `timeout` is `None`, and `None` means
+    /// `Command::output()` — wait for the child, forever. A `--timeout 5`
+    /// sync over a fleet ran exactly as long as its slowest git, and the
+    /// slowest git is the one waiting on a network that never answers.
+    ///
+    /// Measured, not assumed. `git remote prune` against a listener that
+    /// accepts the connection and never answers it runs 30 seconds and is
+    /// killed by the outer `timeout`, so without the deadline it is a
+    /// wedged fleet; with `--timeout 5` the same call is killed at five
+    /// seconds and the run moves on to the next repo. That is the guarantee
+    /// the flag promises, and the reason the discipline is the engine's
+    /// rather than a `Child::kill` on the direct child: git spawns `ssh` and
+    /// credential helpers of its own, and killing only the direct child
+    /// leaves those holding the worktree lock, which stalls the fleet exactly
+    /// as much as never killing anything — and then reports success.
+    #[test]
+    fn the_deadline_is_passed_to_the_git_call_sync_makes() {
+        let opts = SyncOptions {
+            timeout_secs: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            opts.run_opts().timeout,
+            Some(Duration::from_secs(5)),
+            "`--timeout 5` must reach git as a five-second deadline"
+        );
+
+        // Zero means "no deadline", not "kill it immediately": a
+        // zero-length deadline is not a fast git, and the only way zero
+        // arrives is a user who typed `--timeout 0`.
+        let zero = SyncOptions {
+            timeout_secs: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            zero.git_timeout(),
+            None,
+            "a zero timeout is no deadline, not an instant kill"
+        );
+    }
+
+    /// A hanging git is killed at the deadline, and the run continues.
+    ///
+    /// This is the property the whole flag exists for, asserted through the
+    /// same `run_in` that `ro_git` uses, with a shim in the place of the real
+    /// binary. `sleep 600` is the shape of a git call waiting on a network
+    /// that never answers: not a crash, not a refusal, a child that simply
+    /// never returns.
+    ///
+    /// The kill is on the **tree**, which is why the shim leaves a marker
+    /// file: a grandchild that outlived the kill would still be able to
+    /// touch the worktree, and a timeout that returns while its grandchildren
+    /// live is worse than no timeout — the fleet stalls anyway and now also
+    /// reports success.
+    #[test]
+    fn a_hanging_git_is_killed_at_the_timeout_and_the_run_continues() {
+        let tmp = TempDir::new().unwrap();
+        let shim = tmp.path().join("git-hang");
+        std::fs::write(&shim, "#!/bin/sh\nsleep 600\ntouch \"$MARKER\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let marker = tmp.path().join("grandchild-survived");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let started = Instant::now();
+        let err = ro_git::mutation::run_in(
+            Some(&repo),
+            &["remote", "prune", "origin"],
+            &ro_git::mutation::RunOpts {
+                env: &[],
+                timeout: Some(Duration::from_millis(500)),
+                program: Some(shim.to_str().expect("a UTF-8 shim path")),
+            },
+        )
+        .expect_err("a hanging git must not return Ok");
+        let elapsed = started.elapsed();
+
+        // `TimedOut` specifically — "an error" would also be a shim that
+        // failed to start, and that is not the thing under test.
+        let timed_out = err
+            .downcast_ref::<ro_git::mutation::GitError>()
+            .is_some_and(|g| matches!(g, ro_git::mutation::GitError::TimedOut { .. }));
+        assert!(
+            timed_out,
+            "a shim that never returns must be reported as a timeout, got {err:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the deadline did not fire promptly: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "it returned before the deadline: {elapsed:?}"
+        );
+        // The control that makes the marker meaningful: the marker is written
+        // by the *sleeping* process as it exits, so a marker that never
+        // appears is evidence the kill reached the child, not evidence the
+        // shim never ran at all.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            assert!(
+                !marker.exists(),
+                "a grandchild outlived the deadline and performed its side effect, so the \
+                 kill reached the direct child but not the tree"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The deadline is a floor, not a ceiling.
+    ///
+    /// A `RunOpts::timeout` of `None` is what git did before the field
+    /// existed, and a caller that asks for no deadline must not be given one
+    /// by accident: the whole cost of the flag is that it is opt-in per
+    /// invocation, and quietly turning it on for everyone is a behaviour
+    /// change wearing a bug's clothes.
+    #[test]
+    fn a_run_that_does_not_ask_for_a_deadline_gets_none() {
+        // The default is thirty seconds, which is the same value the CLI
+        // fills in, so this is the normal case and it must carry the
+        // deadline rather than silently dropping it.
+        assert_eq!(
+            SyncOptions::default().git_timeout(),
+            Some(Duration::from_secs(30)),
+            "the default timeout reaches git"
+        );
+        assert_eq!(
+            ro_git::mutation::RunOpts::none().timeout,
+            None,
+            "a caller that asks for no deadline must not be handed one"
         );
     }
 }

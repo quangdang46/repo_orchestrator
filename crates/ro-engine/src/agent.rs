@@ -17,9 +17,12 @@
 //! instinct is the opposite.
 //!
 //! "Do not modify git config" is a **request, not a control**. The control
-//! is elsewhere: ro re-asserts the identity on every commit it performs,
-//! and hashes `.git/config` before and after so a change is *reported*.
-//! Nothing here can prevent an agent from writing to it.
+//! is elsewhere: ro re-asserts the identity on every commit it performs
+//! ([`ConfigWatch`]), and reads `.git/config` before and after so a change
+//! the agent made to it is *reported* rather than silently persisted for
+//! every future commit in that repo. Nothing here can prevent an agent from
+//! writing to it — which is why the report is the whole of the control and
+//! is worth having.
 //!
 //! # `{prompt}` is one argv element, never a shell string
 //!
@@ -33,6 +36,7 @@ use std::time::{Duration, Instant};
 use ro_core::FailureClass;
 
 use crate::env::ChildEnv;
+use crate::git_engine::changed_files;
 use crate::{Availability, CommitRecord, Engine, EngineContext, EngineKind, EngineOutcome};
 
 /// The built-in instruction. A constant, and asserted on literally.
@@ -281,6 +285,137 @@ impl AgentEngine {
             status: out.status.code().unwrap_or(-1),
         })
     }
+
+    fn report_agent_made_commits(
+        &self,
+        ctx: &EngineContext<'_>,
+        before: Option<&str>,
+        after: Option<&str>,
+    ) -> EngineOutcome {
+        let commits: Vec<CommitRecord> = ro_git::read::commits_between(
+            ctx.repo_root,
+            before,
+            after,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|oid| {
+            Some(CommitRecord {
+                message: ro_git::read::commit_subject(ctx.repo_root, &oid)?,
+                oid,
+                files: Vec::new(),
+            })
+        })
+        .collect();
+
+        // HEAD moved and ro found nothing to name. That is not "committed
+        // nothing" — `render` turns an empty `Committed` into exactly that
+        // string, and it would be false. The agent reset the branch, or
+        // amended, or moved the ref somewhere ro cannot enumerate commits
+        // from, and the user is told nothing happened while the ref they
+        // were working on has changed underneath them.
+        if commits.is_empty() {
+            return EngineOutcome::Failed {
+                error: format!(
+                    "the agent moved HEAD on its own ({} -> {}) and ro could \
+                     not enumerate the commits between them, so there is \
+                     nothing to report as committed. The ref has been changed \
+                     in the worktree; look at `git log` and `git reflog` \
+                     before pushing.",
+                    before.unwrap_or("(no HEAD)"),
+                    after.unwrap_or("(no HEAD)")
+                ),
+                class: FailureClass::DirtyWorktree,
+            };
+        }
+
+        // The identity ro resolved, if any. `None` means ro was not given
+        // one, and then there is nothing to compare against — the commit is
+        // reported as the agent's own on the strength of the prompt alone.
+        let resolved = ctx.identity;
+
+        // Every commit the agent made, with the author each one carries.
+        // Read here rather than assumed, because the whole question is
+        // "whose name is on this", and a report that asserted an author it
+        // had not read would be the same blank-message shape this crate
+        // keeps fixing elsewhere.
+        let mut lines: Vec<String> = Vec::new();
+        let mut foreign: Vec<(String, String)> = Vec::new();
+        for c in &commits {
+            let author = commit_author(ctx.repo_root, &c.oid);
+            let who = author
+                .as_ref()
+                .map(|(name, email)| format!("{name} <{email}>"))
+                .unwrap_or_else(|| "(no author)".to_string());
+            let is_ours = match (&author, resolved) {
+                (Some((name, email)), Some(id)) => name == &id.name && email == &id.email,
+                // No resolved identity: nothing to compare against, and the
+                // prompt is the only authority. Treated as foreign, because
+                // the safe reading of "ro was not told who it is" is "do
+                // not publish this".
+                _ => false,
+            };
+            if !is_ours {
+                foreign.push((c.oid.clone(), who.clone()));
+            }
+            lines.push(format!(
+                "  {}  {}  {}",
+                &c.oid[..c.oid.len().min(12)],
+                who,
+                c.message
+            ));
+        }
+
+        if foreign.is_empty() {
+            // Every commit on the branch carries the resolved identity, so
+            // these are ro's own commits — the `-c` guard did its job, and
+            // the work is publishable. This is the case a repo whose
+            // `.git/config` disagrees with the resolved identity would
+            // otherwise fail.
+            return EngineOutcome::Committed { commits };
+        }
+
+        let resolved_desc = match resolved {
+            Some(id) => format!("{} <{}>", id.name, id.email),
+            None => "no identity was resolved for this run".to_string(),
+        };
+        let mut error = format!(
+            "the agent committed the work itself, under an identity that is \
+             not the one ro resolved ({}). {} commit(s) are sitting local and \
+             unreachable from any remote:\n{}\n\
+             The work is on disk and has not been deleted. Re-commit it under \
+             the resolved identity, or set the identity the agent should use \
+             and re-run.",
+            resolved_desc,
+            foreign.len(),
+            lines.join("\n")
+        );
+
+        // Whether the work is stranded is a fact the user needs, and it is
+        // not the same as "the agent committed". A commit that is already
+        // reachable from a remote is published; one that is not is stranded,
+        // and the two need different responses.
+        match stranded(ctx.repo_root, after) {
+            Stranded::Published => {
+                error.push_str(
+                    "\nAt least one of these commits is already reachable from \
+                     a remote, so it has been published under that identity.",
+                );
+            }
+            Stranded::Stranded => {
+                error.push_str(
+                    "\nNone of these commits is reachable from a remote, so the \
+                     work is stranded locally.",
+                );
+            }
+            Stranded::Unknown => {}
+        }
+
+        EngineOutcome::Failed {
+            error,
+            class: FailureClass::AuthError,
+        }
+    }
 }
 
 struct AgentOutput {
@@ -289,6 +424,12 @@ struct AgentOutput {
     status: i32,
 }
 
+/// Why a spawn produced no output at all.
+///
+/// `Debug` because a test asserting on this has to be able to print it: a
+/// failure that says "the run did not return" and not *why* is the same
+/// blank-message shape this crate keeps fixing elsewhere.
+#[derive(Debug)]
 enum RunError {
     Spawned(std::io::Error),
     TimedOut,
@@ -333,21 +474,74 @@ impl Engine for AgentEngine {
             };
         }
 
+        // HEAD **before** the agent runs. This has to be read here, not
+        // after the spawn, because it is the only record of what HEAD was
+        // when ro handed over the worktree — and it is what tells "the
+        // agent changed nothing" apart from "the agent committed it
+        // itself". Read after the spawn it is the agent's own commit, the
+        // two ends are equal, and the branch below is dead code that can
+        // never fire.
+        let before = ro_git::read::head_oid(ctx.repo_root).unwrap_or(None);
+
+        // `.git/config` as it is right now, so a change the agent makes to
+        // it is reported rather than left in place. See `ConfigWatch`.
+        let config = ConfigWatch::capture(ctx.repo_root);
+
+        // Every exit below the spawn passes through `report_config_drift`,
+        // so "the agent rewrote your config" is reported on the paths where
+        // the run failed as well as where it succeeded. A report that only
+        // appears on success is a report about the runs that did not matter.
         let output = match self.run(ctx) {
             Ok(o) => o,
             Err(RunError::TimedOut) => {
                 // A kill is not a refusal. Distinct from `Failed` so the
                 // caller can offer a retry.
-                return EngineOutcome::TimedOut { after: ctx.timeout };
+                return report_config_drift(
+                    &config,
+                    ctx.repo_root,
+                    EngineOutcome::TimedOut { after: ctx.timeout },
+                );
             }
             Err(RunError::Spawned(e)) => {
-                return EngineOutcome::Failed {
-                    error: format!("could not start {}: {e}", self.bin),
-                    class: FailureClass::MissingProvider,
-                };
+                return report_config_drift(
+                    &config,
+                    ctx.repo_root,
+                    EngineOutcome::Failed {
+                        error: format!("could not start {}: {e}", self.bin),
+                        class: FailureClass::MissingProvider,
+                    },
+                );
             }
         };
 
+        report_config_drift(
+            &config,
+            ctx.repo_root,
+            self.assess(ctx, &output, before.as_deref()),
+        )
+    }
+}
+
+/// The rest of the engine's own behaviour.
+///
+/// A second inherent `impl` block rather than one, so `checkpoint` stays in
+/// the `Engine` impl — where the trait's method belongs — while the helpers
+/// it calls sit with the rest of the engine.
+
+impl AgentEngine {
+    /// What the run's output and the worktree together mean.
+    ///
+    /// Split out of `checkpoint` for one reason: the `.git/config` watch has
+    /// to be reported from exactly one place, whatever the run turned out to
+    /// be. Every branch below — a non-zero exit, a clean tree, a commit
+    /// failure, a success — returns from here, so the report is a single call
+    /// in the caller rather than one per return.
+    fn assess(
+        &self,
+        ctx: &EngineContext<'_>,
+        output: &AgentOutput,
+        before: Option<&str>,
+    ) -> EngineOutcome {
         if output.status != 0 {
             return EngineOutcome::Failed {
                 // The whole stream, not its first line: an agent that
@@ -364,7 +558,6 @@ impl Engine for AgentEngine {
         // Whatever the agent wrote is now in the worktree. ro commits it
         // itself, with its own identity and its own credential handling —
         // the agent never touches the push.
-        let before = ro_git::read::head_oid(ctx.repo_root).unwrap_or(None);
         if !ro_git::read::is_dirty(ctx.repo_root).unwrap_or(false) {
             // A clean tree has two causes, and they are not the same news:
             // the agent changed nothing, or the agent **committed it
@@ -380,27 +573,28 @@ impl Engine for AgentEngine {
             // push, so the work sits local with nothing saying it is
             // stranded.
             let after = ro_git::read::head_oid(ctx.repo_root).unwrap_or(None);
-            if before != after {
-                let commits: Vec<CommitRecord> = ro_git::read::commits_between(
-                    ctx.repo_root,
-                    before.as_deref(),
-                    after.as_deref(),
-                )
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|oid| {
-                    Some(CommitRecord {
-                        message: ro_git::read::commit_subject(ctx.repo_root, &oid)?,
-                        oid,
-                        files: Vec::new(),
-                    })
-                })
-                .collect();
-                if !commits.is_empty() {
-                    return EngineOutcome::Committed { commits };
-                }
+            if before != after.as_deref() {
+                return self.report_agent_made_commits(ctx, before, after.as_deref());
             }
             return EngineOutcome::NothingToCommit;
+        }
+
+        // The engine set the author on the *child's* environment. ro commits
+        // some of this work itself, and a per-invocation `-c` has to be
+        // re-asserted here: the agent may have run `git config user.email
+        // something-else` in between, and that write persists in
+        // `.git/config` for every commit after it.
+        let author = ctx
+            .identity
+            .as_ref()
+            .map(|i| (i.name.as_str(), i.email.as_str()));
+
+        // `--message` is the user saying *one commit, this subject*. The
+        // agent's plan is not consulted at all, because the whole point of
+        // the flag is that the agent's own grouping is what the user is
+        // overriding.
+        if let Some(subject) = subject_override(ctx) {
+            return self.commit_whole_worktree(ctx, subject, author, before);
         }
 
         let subjects = parse_commits(&output.stdout, self.stream);
@@ -411,15 +605,6 @@ impl Engine for AgentEngine {
         }
 
         let mut commits = Vec::new();
-        // The engine set the author on the *child's* environment. ro commits
-        // some of this work itself, and a per-invocation `-c` has to be
-        // re-asserted here: the agent may have run `git config user.email
-        // something-else` in between, and that write persists in
-        // `.git/config` for every commit after it.
-        let author = ctx
-            .identity
-            .as_ref()
-            .map(|i| (i.name.as_str(), i.email.as_str()));
         for group in subjects {
             // Each group is staged on its own, so the split the agent
             // reasoned about is the split that lands. Committing the whole
@@ -444,7 +629,7 @@ impl Engine for AgentEngine {
                 Ok(oid) => oid,
                 Err(e) => {
                     return EngineOutcome::Failed {
-                        error: format!("committing the agent's work failed: {e:#}"),
+                        error: commit_failure_detail(ctx.repo_root, &format!("{e:#}"), &group),
                         class: classify_agent_output(&output.stderr, &output.stdout),
                     };
                 }
@@ -459,6 +644,518 @@ impl Engine for AgentEngine {
 
         EngineOutcome::Committed { commits }
     }
+
+    /// One commit of the whole worktree, under the subject the user gave.
+    ///
+    /// # Why the plan is discarded rather than merged
+    ///
+    /// `--message` is documented as "One commit per repo, with this subject",
+    /// and the design says supplying the subject *is* that request — it is
+    /// the only way to stop an agent from splitting the work. An agent that
+    /// proposed three groups is not a source of truth ro is entitled to
+    /// override the user on; the user has already said what they want. So
+    /// the plan is not read at all, and the commit carries every changed
+    /// file rather than the union of the agent's groups.
+    ///
+    /// The union would sound more careful and is worse. A file the agent
+    /// forgot to name would be left behind, so `ro commit --message` would
+    /// report success with work still uncommitted — and a single-commit
+    /// request that silently drops files is the one outcome the flag exists
+    /// to prevent. `git_engine.rs` already does exactly this, which is why
+    /// the two engines now agree about what the flag means.
+    fn commit_whole_worktree(
+        &self,
+        ctx: &EngineContext<'_>,
+        subject: &str,
+        author: Option<(&str, &str)>,
+        before: Option<&str>,
+    ) -> EngineOutcome {
+        if let Err(e) = ro_git::primitives::stage_all(ctx.repo_root) {
+            return EngineOutcome::Failed {
+                error: format!("staging the worktree for {subject:?} failed: {e:#}"),
+                class: FailureClass::DirtyWorktree,
+            };
+        }
+        let oid = match ro_git::primitives::commit_all_as(ctx.repo_root, subject, author) {
+            Ok(oid) => oid,
+            Err(e) => {
+                return EngineOutcome::Failed {
+                    error: commit_failure_detail(
+                        ctx.repo_root,
+                        &format!("{e:#}"),
+                        &CommitGroup {
+                            subject: subject.to_string(),
+                            files: Vec::new(),
+                        },
+                    ),
+                    class: FailureClass::DirtyWorktree,
+                };
+            }
+        };
+        EngineOutcome::Committed {
+            commits: vec![CommitRecord {
+                message: subject.to_string(),
+                oid,
+                files: changed_files(ctx.repo_root, before),
+            }],
+        }
+    }
+}
+/// The author of one commit, as `(name, email)`.
+///
+/// Read from the object rather than assumed. The question this answers is
+/// "whose name is on this commit", and a report that asserted an author it
+/// had not read would be the same blank-message shape this crate keeps
+/// fixing elsewhere.
+fn commit_author(repo_root: &std::path::Path, oid: &str) -> Option<(String, String)> {
+    let out = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%an%n%ae", oid])
+        .current_dir(repo_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let name = lines.next()?.trim().to_string();
+    let email = lines.next()?.trim().to_string();
+    if name.is_empty() && email.is_empty() {
+        return None;
+    }
+    Some((name, email))
+}
+
+/// Whether the work an agent committed on its own has got anywhere.
+///
+/// # Why this is asked at all
+///
+/// "The agent committed it" and "the agent committed it and it is stranded"
+/// are not the same news. A commit already reachable from a remote has been
+/// published under whatever identity it carries, and the user's response is
+/// to look at what went out. A commit that is not reachable is sitting
+/// local, and the user's response is to re-commit it. Reporting the first
+/// as the second would have the user hunting for a push that happened;
+/// reporting the second as the first would leave work stranded with
+/// nothing saying so.
+///
+/// # Why the question is asked about the agent's commits, not the base
+///
+/// The obvious ref to ask about is the base — "was what ro started from
+/// already on a remote?" — and it is the wrong one. A repo whose remote has
+/// the base and nothing the agent added is the *ordinary* shape of a normal
+/// `ro ship`: the user ran the fleet, the base was pushed last time, and
+/// this run's work has not gone anywhere. Answering that "published" tells
+/// the user their stranded work went out.
+enum Stranded {
+    /// At least one of the agent's commits is reachable from a remote.
+    Published,
+    /// None of them is.
+    Stranded,
+    /// Could not be determined. Reported as nothing rather than guessed at:
+    /// an invented "stranded" over a published commit is the worse error.
+    Unknown,
+}
+
+/// Is the tip the agent left behind on a remote?
+///
+/// `after` is HEAD as the agent left it. A commit is published if some
+/// remote ref contains it, and the tip is the one that settles it: a push
+/// that carried any of the agent's commits necessarily carried the tip,
+/// because the tip is the newest of them.
+fn stranded(repo_root: &std::path::Path, after: Option<&str>) -> Stranded {
+    let Some(tip) = after else {
+        // No `after` means ro could not read HEAD, so there is nothing to
+        // ask about.
+        return Stranded::Unknown;
+    };
+    let out = std::process::Command::new("git")
+        .args(["branch", "-r", "--contains", tip])
+        .current_dir(repo_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let reachable = text.lines().any(|l| {
+                let l = l.trim();
+                !l.is_empty() && !l.starts_with("HEAD")
+            });
+            if reachable {
+                Stranded::Published
+            } else {
+                Stranded::Stranded
+            }
+        }
+        _ => Stranded::Unknown,
+    }
+}
+
+/// The subject `--message` asked for, if it is one.
+///
+/// Blank is not a subject. `git_engine.rs` reads the field the same way,
+/// and a `--message ""` that silently committed under a generated subject
+/// would be the flag doing the opposite of what it says.
+fn subject_override<'a>(ctx: &'a EngineContext<'_>) -> Option<&'a str> {
+    ctx.subject_override
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// `.git/config` as it was before one agent run.
+///
+/// # Why this exists
+///
+/// The module doc promises that a change to `.git/config` is reported, and
+/// for a long time nothing did it: there was no hash, no read, no report,
+/// just a sentence in a doc comment describing a control that did not exist.
+/// An agent that runs `git config user.email something-else` therefore left
+/// that write in place for every commit after it — ro's own commits are
+/// safe, because they carry `-c user.email`, but the user's own `git commit`
+/// in that repo is not, and ro had already reported success.
+///
+/// ro cannot prevent the write. It can notice it, and "your config changed
+/// while an agent was in your worktree" is the difference between a repo
+/// that was tampered with and one that was told about it.
+struct ConfigWatch {
+    before: Vec<u8>,
+}
+
+impl ConfigWatch {
+    fn capture(repo_root: &std::path::Path) -> Self {
+        Self {
+            before: config_bytes(repo_root),
+        }
+    }
+}
+
+/// The bytes of this repository's `.git/config`, or none.
+///
+/// # Why `--git-common-dir` and not `--git-dir`
+///
+/// A **linked worktree's `.git` is a file**, not a directory, so
+/// `<root>/.git/config` does not exist and the report never fires. The
+/// obvious repair — `git rev-parse --git-dir` — is also wrong, and wrong in
+/// the one direction that matters: for a linked worktree it returns
+/// `.git/worktrees/<id>`, and **there is no `config` file there**. Every key
+/// this report is about — `user.name`, `user.email`, `remote.*.url`,
+/// `http.*.extraheader` — lives in the main repository's config, and that is
+/// where a `git config` run from inside the linked worktree writes. So the
+/// read has to follow the same resolution git's own write does, which is
+/// `--git-common-dir`.
+///
+/// This is not a rare setup. `ro` is a fleet tool, and a fleet is exactly
+/// where linked worktrees are used to run many repos at once — so the one
+/// arrangement in which the control would have been silently dead is the one
+/// it exists for.
+///
+/// A missing config is not an error: `unwrap_or_default` turns "no file"
+/// into "unchanged", and a report that failed to build because there was
+/// nothing to report would be the wrong kind of loud.
+fn config_bytes(repo_root: &std::path::Path) -> Vec<u8> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(repo_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output();
+    let dir = match out {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if raw.is_empty() {
+                return Vec::new();
+            }
+            let p = std::path::PathBuf::from(&raw);
+            if p.is_absolute() {
+                p
+            } else {
+                repo_root.join(p)
+            }
+        }
+        _ => return Vec::new(),
+    };
+    std::fs::read(dir.join("config")).unwrap_or_default()
+}
+
+/// What changed in `.git/config`, or `None` if nothing did.
+///
+/// A pure function over the two byte strings so the report can be tested
+/// without a repository, which is the only way to test the parts that
+/// matter — that a *removed* key is reported, and that a secret is not.
+fn config_drift_report(before: &[u8], after: &[u8]) -> Option<String> {
+    if before == after {
+        return None;
+    }
+    let old = parse_config(&String::from_utf8_lossy(before));
+    let now = parse_config(&String::from_utf8_lossy(after));
+
+    let mut keys: Vec<&String> = old.keys().chain(now.keys()).collect();
+    keys.sort();
+    keys.dedup();
+
+    let mut changes: Vec<String> = Vec::new();
+    for key in keys {
+        let from = old.get(key);
+        let to = now.get(key);
+        if from == to {
+            continue;
+        }
+        changes.push(format!(
+            "{key}: {} -> {}",
+            show_value(key, from),
+            show_value(key, to)
+        ));
+    }
+    if changes.is_empty() {
+        // The bytes differ but no key does: a comment, a blank line, or the
+        // file being reformatted. Reporting "the agent changed your config"
+        // for a reformat trains the user to ignore the report, which is how
+        // a real one stops being noticed.
+        return None;
+    }
+    Some(format!(
+        "the agent changed this repository's .git config ({} change(s)): {}",
+        changes.len(),
+        changes.join("; ")
+    ))
+}
+
+/// One config value, ready to print — or not.
+///
+/// The key is always safe to print and is most of what makes the report
+/// actionable: "user.email" says what to look at. The *value* is not
+/// always safe, and `.git/config` is full of places a credential lives —
+/// `http.extraheader` holds an `Authorization:`, and any `*.url` can hold
+/// `https://user:token@host`. A report that printed those would move a
+/// secret from a file into a terminal, a log, and possibly a bug report, so
+/// a secret-bearing key reports the key and nothing else.
+fn show_value(key: &str, value: Option<&String>) -> String {
+    match value {
+        None => "(unset)".to_string(),
+        Some(v) if is_secret_bearing(key) || crate::env::is_token_shaped(v) => {
+            "(a value that is not printed)".to_string()
+        }
+        Some(v) => v.clone(),
+    }
+}
+
+/// Does this config key's value carry something that must not be printed?
+///
+/// Deliberately a **substring** test rather than a list of exact keys. A
+/// list is a decision someone made about keys that exist today, and the
+/// first new place a credential goes — `http.<url>.extraheader`, a remote
+/// URL with a token in it, a `[credential]` helper — is a key the list did
+/// not have. The cost of a false positive is one redacted value in a
+/// warning; the cost of a false negative is a token in a transcript.
+fn is_secret_bearing(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    [
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "extraheader",
+        "authorization",
+        "cookie",
+        "apikey",
+        "api_key",
+        ".url",
+    ]
+    .iter()
+    .any(|needle| k.contains(needle))
+}
+
+/// `.git/config` as a flat `section.key -> value` map.
+///
+/// A parser rather than `git config --list` because the report is about
+/// *what the file now says*, and a report produced by running git in a
+/// repository an agent has just been running commands in inherits whatever
+/// that agent did to the environment. Reading the file cannot.
+fn parse_config(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut section = String::new();
+    let mut last: Option<String> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            // `[section]`, `[section "sub"]` and `[a.b]` all name a prefix.
+            let name = rest.split(']').next().unwrap_or("").trim().replace('"', "");
+            section = name
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(".");
+            // `[a.b.c]` is a dotted subsection, not a nesting; the dots are
+            // already the separator this map uses.
+            last = None;
+            continue;
+        }
+        // A continuation is a line that starts with whitespace — git's own
+        // rule — and belongs to the value above it.
+        let (key, value) = match trimmed.split_once('=') {
+            Some((k, v)) => (
+                format!("{section}.{}", k.trim()),
+                v.trim().to_string(),
+            ),
+            None => match &last {
+                Some(k) => (k.clone(), String::new()),
+                None => continue,
+            },
+        };
+        if trimmed.contains('=') {
+            last = Some(key.clone());
+        }
+        out.insert(key, value);
+    }
+    out
+}
+
+/// Report a change to `.git/config`, and carry it into a failure.
+///
+/// # Why stderr, and why also here
+///
+/// `EngineOutcome` has no warning arm, and adding one means a change in
+/// every caller in `ro` — a cross-crate edit this crate does not get to
+/// make for a warning. So the report goes where a warning already goes on
+/// this codebase (`orchestrator.rs` does the same for `--onto`), and it is
+/// *additionally* appended to a failure that is already being reported, so
+/// the machine-readable row carries it too and a user reading JSON is not
+/// the one person who never hears about it.
+///
+/// # Why the run is not failed
+///
+/// Because ro's own commits carry `-c user.email`/`-c user.name`, so the
+/// identity the agent wrote did **not** leak into anything this run
+/// committed. Turning a good commit into a failure would also be the one
+/// thing that teaches users to ignore the report. What was actually
+/// damaged is the user's own future `git commit`, and that is a warning,
+/// not a lost commit.
+fn report_config_drift(
+    watch: &ConfigWatch,
+    repo_root: &std::path::Path,
+    outcome: EngineOutcome,
+) -> EngineOutcome {
+    let Some(report) = config_drift_report(&watch.before, &config_bytes(repo_root)) else {
+        return outcome;
+    };
+    eprintln!(
+        "warning: {report}. ro's own commits are unaffected — they carry the \
+         identity it resolved — but your own `git commit` in this repository \
+         will use the new value until you undo it."
+    );
+    match outcome {
+        EngineOutcome::Failed { error, class } => EngineOutcome::Failed {
+            error: format!("{error}\n\n{report}"),
+            class,
+        },
+        other => other,
+    }
+}
+
+/// Why a commit came back with no reason of its own.
+///
+/// # The blank message this exists for
+///
+/// `git commit` writes "nothing to commit, working tree clean" to
+/// **stdout**. `ro_git::primitives::commit_all_as` builds its error from
+/// stderr alone, so that one failure — the only one where the cause is a
+/// fact about the index rather than a git error — arrives as
+/// `git commit failed: ` and nothing else. It is reachable by an ordinary
+/// agent: a plan that names a file which does not differ from HEAD commits
+/// nothing, and the run reports a failure with a blank cause after the
+/// earlier groups have already landed.
+///
+/// ro cannot fix the helper from here, so it goes and looks itself. What
+/// the status says about the group's own paths says exactly why the index
+/// was empty, and it is one cheap git call away. The one-line change that
+/// fixes this at the source is in `primitives.rs`.
+fn commit_failure_detail(
+    repo_root: &std::path::Path,
+    err: &str,
+    group: &CommitGroup,
+) -> String {
+    let mut message = format!("committing {:?} failed: {err}", group.subject);
+    if has_reason(err) {
+        return message;
+    }
+    message.push_str(
+        "\ngit reported no reason of its own. (It writes 'nothing to commit, \
+         working tree clean' to stdout, and the commit helper reads stderr \
+         only, so the cause is lost before it gets here.)",
+    );
+    if !group.files.is_empty() {
+        let status = status_porcelain(repo_root, &group.files);
+        message.push_str(&describe_empty_index(&status, &group.files));
+    }
+    message
+}
+
+/// Does an error string carry anything after its last colon?
+///
+/// The shape is `git commit failed: <stderr>`, so a blank tail is a
+/// missing cause. A colon inside the cause itself is harmless: only the
+/// text after the **last** one is examined, and a cause that exists is
+/// reported whatever else it contains.
+fn has_reason(err: &str) -> bool {
+    match err.rsplit_once(':') {
+        Some((_, tail)) => !tail.trim().is_empty(),
+        None => !err.trim().is_empty(),
+    }
+}
+
+/// `git status --porcelain` restricted to some paths.
+fn status_porcelain(repo_root: &std::path::Path, files: &[String]) -> String {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["status", "--porcelain", "--"])
+        .args(files)
+        .current_dir(repo_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C");
+    match cmd.output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        // Could not be read. The caller reports the failure without this
+        // rather than inventing a reason for it.
+        _ => String::new(),
+    }
+}
+
+/// Say why the index was empty, in terms of the paths the group named.
+///
+/// Pure over its input, so the shape of the explanation is testable without
+/// a repository — which is the only way to test that the "nothing was ever
+/// different" case and the "staged after all" case are told apart.
+fn describe_empty_index(porcelain: &str, files: &[String]) -> String {
+    let named: Vec<&String> = files
+        .iter()
+        .filter(|f| {
+            porcelain
+                .lines()
+                .any(|l| l.len() > 3 && l[3..].trim() == f.as_str())
+        })
+        .collect();
+    if named.is_empty() {
+        return format!(
+            "\nNone of the paths this group named differ from HEAD ({}), so \
+             staging them left the index empty and git had nothing to commit.",
+            files.join(", ")
+        );
+    }
+    format!(
+        "\ngit status reports these paths as still changed ({}), so the index \
+         was not empty when the commit ran: {}",
+        named
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        porcelain.trim()
+    )
 }
 
 /// One proposed commit: a subject, and the files that belong in it.
@@ -785,6 +1482,24 @@ fn comspec() -> std::path::PathBuf {
 /// that blocked reading a pipe nobody fed would sit here until the
 /// deadline killed it, and the run would be reported as a timeout rather
 /// than as the success it was.
+///
+/// # The pipes are drained while the child runs, not after it exits
+///
+/// An OS pipe buffer is 64 KiB. A child that writes more than that before
+/// exiting blocks in `write` and never exits — so a poll loop that only
+/// reads the pipes *after* `try_wait` returns `Some` never gets there, and
+/// the run is reported as a timeout for an agent that had already done all
+/// its work. The real `claude` on this machine emits 73–86 KB of
+/// stream-json from one `commands_changed` event listing every skill, so
+/// `ro commit` with the default engine sits right at that edge.
+///
+/// So stdout and stderr are each read on their own thread into a buffer,
+/// `try_wait` is polled on this thread, and the readers are joined once the
+/// child has exited. The join is **after** the exit and never before it:
+/// joining a reader that is still blocked on a full pipe is the same
+/// deadlock wearing the other hat. A killed child closes its pipes, so the
+/// readers return on their own — which is why `kill_tree` cannot deadlock
+/// against them.
 fn run_with_deadline(
     cmd: &mut std::process::Command,
     limit: Duration,
@@ -823,10 +1538,19 @@ fn run_with_deadline(
             });
         }
     }
+
+    // Both readers are taken **before** the poll loop starts, so there is no
+    // window in which the child can fill a buffer nobody is draining. The
+    // handles are moved into the threads and the threads are joined after
+    // the child exits; the buffers are plain `Vec<u8>` because a child can
+    // write more than a pipe buffer and the whole stream has to survive.
+    let stdout_reader = drain(child.stdout.take());
+    let stderr_reader = drain(child.stderr.take());
+
     let started = Instant::now();
     const POLL: Duration = Duration::from_millis(25);
 
-    loop {
+    let status = loop {
         // `try_wait` here is a **poll only**. It reaps the child on exit,
         // so it must never be the call that collects the output: after it
         // returns `Some`, the pipes are still readable but `wait_with_output`
@@ -835,38 +1559,53 @@ fn run_with_deadline(
         // non-zero agent exit arrive with a blank stderr, which is exactly
         // the message the classification below needs.
         match child.try_wait() {
-            Ok(Some(_)) => {
-                // Collect first, reap second: the pipes close when the
-                // child is dropped, so read them explicitly.
-                return collect(&mut child);
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => return Err(RunError::Spawned(e)),
         }
         if started.elapsed() >= limit {
+            // The kill is what makes the readers return. A killed child
+            // closes its write ends, so a reader blocked on a full buffer
+            // gets `Ok(0)` and ends; the join below therefore cannot wait
+            // on a pipe nobody is going to drain. The output is dropped
+            // rather than collected — a timed-out run has no stream to
+            // classify, and the deadline is the fact the caller needs.
             kill_tree(&mut child);
             return Err(RunError::TimedOut);
         }
         std::thread::sleep(POLL);
-    }
-}
+    };
 
-/// Read the child's pipes after it has exited.
-fn collect(child: &mut std::process::Child) -> std::result::Result<std::process::Output, RunError> {
-    use std::io::Read;
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut o) = child.stdout.take() {
-        let _ = o.read_to_end(&mut stdout);
-    }
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_end(&mut stderr);
-    }
-    let status = child.wait().map_err(RunError::Spawned)?;
+    // Join the readers only now that the child is gone. A killed child
+    // closes its pipes, so a reader that was blocked on a full buffer
+    // returns rather than holding the join open; and a reader that already
+    // finished returns immediately. Joining before the exit would be the
+    // same deadlock this function exists to remove.
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+
     Ok(std::process::Output {
         status,
         stdout,
         stderr,
+    })
+}
+
+/// Read one pipe to the end on its own thread, and hand back what it got.
+///
+/// A thread rather than a `read_to_end` on the calling thread because the
+/// two pipes have to be drained **concurrently**: reading stdout to the end
+/// first would leave stderr to fill its own 64 KiB buffer and wedge the
+/// child, which is the same deadlock one pipe over.
+fn drain<P: std::io::Read + Send + 'static>(
+    pipe: Option<P>,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
     })
 }
 
@@ -1101,6 +1840,68 @@ mod tests {
         assert_eq!(msg, "one\ntwo");
     }
 
+    /// A child that writes more than a pipe buffer before exiting must be
+    /// drained while it runs, and the whole stream must come back.
+    ///
+    /// The integration test in `tests/agent_engines.rs` proves this through
+    /// the engine, with a 5 MB stream. This one proves the property of
+    /// `run_with_deadline` directly, on a child that is not an agent at all:
+    /// a shell that writes a known number of bytes and exits 0. It is the
+    /// same claim with the engine's parsing taken out of the way, so a
+    /// regression in the drain is not masked by a change in the parser.
+    ///
+    /// The byte count is asserted exactly. A reader that stopped at the
+    /// first buffer boundary would return promptly and be short by
+    /// everything after 64 KiB, which is the failure this exists to catch.
+    ///
+    /// Unix-only, and the *portable* proof of the same property is the
+    /// integration test in `tests/agent_engines.rs`, whose shim is built
+    /// for both platforms by `ro-testkit`. This one exists to pin the
+    /// behaviour of `run_with_deadline` itself with the engine's parsing
+    /// out of the way, and `sh`/`true` are the cheapest way to say that.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_writing_past_the_pipe_buffer_is_drained_whole() {
+        let dir = tempfile::TempDir::new().expect("the fixture dir is creatable");
+        let payload = dir.path().join("payload.bin");
+        // 1 MiB, comfortably past the 64 KiB pipe buffer on every platform
+        // ro runs on, and small enough that the test stays fast.
+        let bytes = 1024 * 1024;
+        std::fs::write(&payload, vec![b'z'; bytes]).expect("the payload is writable");
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("cat '{}'", payload.display()))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let out = run_with_deadline(&mut cmd, Duration::from_secs(30), None)
+            .expect("a child that exits must not be reported as a timeout");
+
+        assert_eq!(
+            out.stdout.len(),
+            bytes,
+            "every byte the child wrote must come back; a reader that stopped \
+             at the pipe buffer boundary would be short by the rest"
+        );
+        assert_eq!(out.status.code(), Some(0));
+    }
+
+    /// The negative control for the test above: a child that writes nothing
+    /// must not be reported as a timeout either, and must come back empty.
+    /// Without it, the test above would also pass on a run that never
+    /// started the child at all.
+    #[test]
+    fn a_child_writing_nothing_is_not_a_timeout() {
+        let mut cmd = std::process::Command::new("true");
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let out = run_with_deadline(&mut cmd, Duration::from_secs(30), None)
+            .expect("a child that exits immediately must not time out");
+        assert!(out.stdout.is_empty());
+        assert_eq!(out.status.code(), Some(0));
+    }
+
     /// `PATH` order beats extension order — the loop nesting, pinned.
     ///
     /// This is the fix for the four engine tests that only fail on a
@@ -1177,5 +1978,367 @@ mod tests {
         .unwrap();
         let found = find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD").unwrap();
         assert_eq!(found, dir.path().join("claude.exe"));
+    }
+
+    // ---- `.git/config` is read before and after, and a change is reported ----
+
+    /// The module doc promises that a change to `.git/config` is reported.
+    /// For a long time nothing did it — no hash, no read, no report, just a
+    /// sentence describing a control that did not exist. An agent that ran
+    /// `git config user.email something-else` left that write in place for
+    /// every commit after it, and ro had already reported success.
+    ///
+    /// The report is a pure function over the two files, so it is tested
+    /// here rather than only through a repository: the parts that matter are
+    /// that a *removed* key is reported, and that a secret is not printed.
+    #[test]
+    fn a_change_to_git_config_is_reported_with_the_key_and_both_values() {
+        let before = "[user]\n\tname = Ro User\n\temail = ro@example.com\n";
+        let after = "[user]\n\tname = Ro User\n\temail = agent@elsewhere.invalid\n";
+        let report = config_drift_report(before.as_bytes(), after.as_bytes())
+            .expect("a changed value must be reported");
+        assert!(
+            report.contains("user.email"),
+            "the key is what makes the report actionable, got: {report}"
+        );
+        assert!(
+            report.contains("ro@example.com") && report.contains("agent@elsewhere.invalid"),
+            "and both ends of the change, so the user can see what it became: \
+             {report}"
+        );
+    }
+
+    /// A key that was *removed* is a change too, and it is the one a user is
+    /// least likely to notice on their own. Reporting only additions would
+    /// leave "the agent deleted your user.name" silent.
+    #[test]
+    fn a_removed_config_key_is_reported() {
+        let before = "[user]\n\tname = Ro User\n\temail = ro@example.com\n";
+        let after = "[user]\n\temail = ro@example.com\n";
+        let report =
+            config_drift_report(before.as_bytes(), after.as_bytes()).expect("a removed key must be reported");
+        assert!(
+            report.contains("user.name"),
+            "the removed key must be named, got: {report}"
+        );
+        assert!(
+            report.contains("(unset)"),
+            "and its new state must be stated rather than omitted: {report}"
+        );
+    }
+
+    /// A key that was *added* is reported the same way.
+    #[test]
+    fn an_added_config_key_is_reported() {
+        let before = "[user]\n\temail = ro@example.com\n";
+        let after = "[user]\n\temail = ro@example.com\n\tname = Agent\n";
+        let report =
+            config_drift_report(before.as_bytes(), after.as_bytes()).expect("an added key must be reported");
+        assert!(report.contains("user.name"), "got: {report}");
+        assert!(report.contains("Agent"), "got: {report}");
+    }
+
+    /// The negative control. Without it, the tests above would also pass on
+    /// a report that fired on every run — and a report that fires on every
+    /// run is a report nobody reads, which is how the original silence
+    /// happened.
+    #[test]
+    fn an_unchanged_config_is_not_reported() {
+        let config = "[user]\n\tname = Ro User\n\temail = ro@example.com\n";
+        assert_eq!(config_drift_report(config.as_bytes(), config.as_bytes()), None);
+    }
+
+    /// A reformat is not a change. Reporting "the agent changed your config"
+    /// for a comment or a blank line trains the user to ignore the report,
+    /// and the next real one is the one that gets missed.
+    #[test]
+    fn a_reformatted_config_is_not_reported() {
+        let before = "[user]\n\tname = Ro User\n";
+        let after = "# a comment\n[user]\n\n\tname = Ro User\n";
+        assert_eq!(
+            config_drift_report(before.as_bytes(), after.as_bytes()),
+            None,
+            "no key changed, so nothing was changed"
+        );
+    }
+
+    /// # The one assertion that matters most
+    ///
+    /// `.git/config` is full of places a credential lives:
+    /// `http.extraheader` holds an `Authorization:` header, and any `*.url`
+    /// can hold `https://user:token@host`. A report that printed those would
+    /// move a secret out of a file and into a terminal, a log, and quite
+    /// possibly a bug report — the exact leak `env.rs` exists to prevent,
+    /// arriving through the one door nobody thought to check.
+    ///
+    /// The key is still printed. "http.extraheader" says what to look at,
+    /// and that is most of what makes the report actionable.
+    #[test]
+    fn a_secret_in_git_config_is_never_printed() {
+        let before = "[user]\n\temail = ro@example.com\n";
+        let after = concat!(
+            "[user]\n\temail = ro@example.com\n",
+            "[http \"https://github.com\"]\n",
+            "\textraheader = Authorization: Bearer ghp_16C7e42F292c6912E7710c838347Ae178B4a\n",
+        );
+        let report = config_drift_report(before.as_bytes(), after.as_bytes())
+            .expect("a changed config must be reported");
+        assert!(
+            report.contains("extraheader"),
+            "the key is safe to print and is what makes this actionable: {report}"
+        );
+        assert!(
+            !report.contains("ghp_16C7e42F292c6912E7710c838347Ae178B4a"),
+            "the value must not appear anywhere in the report, got: {report}"
+        );
+        assert!(
+            !report.contains("Authorization"),
+            "nor the header name with its value: {report}"
+        );
+    }
+
+    /// A token in a *remote URL* is the other place this bites, and it is
+    /// the one an agent is most plausibly going to write.
+    #[test]
+    fn a_token_in_a_remote_url_is_not_printed() {
+        let before = "[remote \"origin\"]\n\turl = https://github.com/a/b\n";
+        let after =
+            "[remote \"origin\"]\n\turl = https://x-access-token:ghp_16C7e42F292c6912E7710c838347Ae178B4a@github.com/a/b\n";
+        let report =
+            config_drift_report(before.as_bytes(), after.as_bytes()).expect("a changed URL must be reported");
+        assert!(!report.contains("ghp_"), "got: {report}");
+        assert!(report.contains("url"), "the key is still named: {report}");
+    }
+
+    /// A value that merely *looks* like a token is redacted too. The cost of
+    /// a false positive is one redacted value in a warning; the cost of a
+    /// false negative is a credential in a transcript.
+    #[test]
+    fn a_token_shaped_value_is_redacted_even_in_an_innocent_key() {
+        let before = "[core]\n\trepositoryformatversion = 0\n";
+        let after =
+            "[core]\n\trepositoryformatversion = 0\n\teditor = ghp_16C7e42F292c6912E7710c838347Ae178B4a\n";
+        let report = config_drift_report(before.as_bytes(), after.as_bytes())
+            .expect("a changed value must be reported");
+        assert!(!report.contains("ghp_"), "got: {report}");
+    }
+
+    /// A linked worktree's config is the **main repository's** config.
+    ///
+    /// # The bug this caught
+    ///
+    /// The first version of this read used `git rev-parse --git-dir`, which
+    /// is the obvious repair for "a linked worktree's `.git` is a file". It
+    /// is wrong: for a linked worktree `--git-dir` returns
+    /// `.git/worktrees/<id>`, and **there is no `config` file there**. Every
+    /// key the report is about lives in the main repository's config, and
+    /// that is where a `git config` run from inside the linked worktree
+    /// writes. So the read followed the same resolution git's own write
+    /// does — `--git-common-dir` — and this test is what proved the
+    /// difference: it failed against the first version, on a machine with
+    /// nothing unusual installed.
+    ///
+    /// A fleet is exactly where linked worktrees are used, so the one
+    /// arrangement in which the control would have been silently dead is the
+    /// one it exists for.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_worktrees_config_is_read() {
+        let w = ro_testkit::Worktree::with_one_commit();
+        w.write("a.txt", "x\n");
+        w.commit("the base");
+
+        // A linked worktree: `.git` here is a *file* pointing at the main
+        // worktree's `.git/worktrees/<id>`.
+        let linked = tempfile::TempDir::new().expect("the worktree dir is creatable");
+        let out = std::process::Command::new(ro_testkit::git_path())
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.path().to_str().unwrap(),
+            ])
+            .current_dir(w.path())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The fixture: a config change made *from inside* the linked
+        // worktree. It lands in the main repository's config, which is the
+        // file the report has to read.
+        std::process::Command::new(ro_testkit::git_path())
+            .args(["config", "user.email", "agent@elsewhere.invalid"])
+            .current_dir(linked.path())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git runs");
+
+        let bytes = config_bytes(linked.path());
+        assert!(
+            !bytes.is_empty(),
+            "a linked worktree's config must be readable, or the report \
+             never fires for the setup that needs it most"
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("agent@elsewhere.invalid"),
+            "and it must be the shared config the write landed in, got: {text}"
+        );
+    }
+
+    /// A repo whose config cannot be read is not an error.
+    ///
+    /// `unwrap_or_default` turns "no file" into "unchanged", and a report
+    /// that failed to build because there was nothing to report would be the
+    /// wrong kind of loud. The directory here is not a repository at all,
+    /// which is the cheapest way to make the read fail without depending on
+    /// what the machine happens to have.
+    #[test]
+    fn an_unreadable_config_is_not_an_error() {
+        let dir = tempfile::TempDir::new().expect("the dir is creatable");
+        assert!(
+            config_bytes(dir.path()).is_empty(),
+            "a repo with no config to read is a fact, not a failure"
+        );
+    }
+
+    // ---- a commit failure carries a reason ----
+
+    /// `git commit` writes "nothing to commit, working tree clean" to
+    /// **stdout**, and `ro_git::primitives::commit_all_as` builds its error
+    /// from stderr alone — so that one failure arrives as
+    /// `git commit failed: ` with nothing after it. It is reachable by an
+    /// ordinary agent: a plan naming a file that does not differ from HEAD
+    /// commits nothing, and the run reports a failure with a blank cause
+    /// after the earlier groups have already landed.
+    #[test]
+    fn a_blank_commit_failure_is_given_a_reason() {
+        let group = CommitGroup {
+            subject: "the group".into(),
+            files: vec!["a.txt".into()],
+        };
+        let detail = commit_failure_detail(
+            std::path::Path::new("/nonexistent"),
+            "git commit failed: ",
+            &group,
+        );
+        assert!(
+            detail.contains("committing \"the group\" failed"),
+            "the failure itself is still the headline: {detail}"
+        );
+        assert!(
+            detail.contains("nothing to commit"),
+            "the cause git actually gave must be named, not left blank: {detail}"
+        );
+        assert!(
+            detail.contains("a.txt"),
+            "and the paths the group named, so the user can check them: {detail}"
+        );
+    }
+
+    /// A failure that *does* carry a reason is left alone. Padding a real
+    /// git error with an explanation of a different failure is how a report
+    /// stops being believed.
+    #[test]
+    fn a_failure_with_a_reason_is_left_alone() {
+        let group = CommitGroup {
+            subject: "the group".into(),
+            files: vec!["a.txt".into()],
+        };
+        let detail = commit_failure_detail(
+            std::path::Path::new("/nonexistent"),
+            "git commit failed: pathspec 'a.txt' did not match any file(s) known to git",
+            &group,
+        );
+        assert!(
+            !detail.contains("nothing to commit"),
+            "a real reason must not be replaced by an invented one: {detail}"
+        );
+        assert!(
+            detail.contains("pathspec"),
+            "and the real one survives: {detail}"
+        );
+    }
+
+    /// The explanation distinguishes the two ways the index can be empty.
+    /// "None of these paths differ from HEAD" and "git says they are still
+    /// changed" are different news with different fixes, and a report that
+    /// merged them would send the user to look at the wrong thing.
+    #[test]
+    fn an_empty_index_explanation_names_the_paths_that_differ() {
+        let porcelain = " M a.txt\n?? b.txt\n";
+        let files = ["a.txt".to_string(), "b.txt".to_string()];
+        let detail = describe_empty_index(porcelain, &files);
+        assert!(
+            detail.contains("a.txt") && detail.contains("b.txt"),
+            "both paths are named: {detail}"
+        );
+        assert!(
+            detail.contains("still changed"),
+            "this is the case where the index was NOT empty: {detail}"
+        );
+    }
+
+    #[test]
+    fn an_empty_index_explanation_says_when_nothing_differs() {
+        let porcelain = "";
+        let files = ["a.txt".to_string()];
+        let detail = describe_empty_index(porcelain, &files);
+        assert!(
+            detail.contains("differ from HEAD"),
+            "this is the case where the group named nothing that changed: {detail}"
+        );
+        assert!(
+            !detail.contains("still changed"),
+            "and it must not claim the opposite: {detail}"
+        );
+    }
+
+    // ---- a moved HEAD with nothing enumerable is not "committed nothing" ----
+
+    /// `EngineOutcome::render` turns an empty `Committed` into "committed
+    /// nothing". HEAD moving while ro enumerates nothing would therefore be
+    /// reported as a success that did not happen — the same false report
+    /// this module keeps fixing, one layer down.
+    #[test]
+    fn an_empty_commit_list_is_not_rendered_as_committed_nothing() {
+        let outcome = EngineOutcome::Failed {
+            error: "the agent moved HEAD".to_string(),
+            class: FailureClass::DirtyWorktree,
+        };
+        assert!(
+            !outcome.render().contains("committed nothing"),
+            "a failure must never render as a success: {}",
+            outcome.render()
+        );
+    }
+
+    // ---- `--message` ----
+
+    /// A blank `--message` is not a subject. `git_engine.rs` reads the field
+    /// the same way, and a `--message ""` that silently committed under a
+    /// generated subject would be the flag doing the opposite of what it
+    /// says.
+    #[test]
+    fn a_blank_message_is_not_a_subject() {
+        let ctx = EngineContext::new(std::path::Path::new("/nonexistent"), "main")
+            .with_subject(Some("   "));
+        assert_eq!(subject_override(&ctx), None);
+    }
+
+    #[test]
+    fn a_real_message_is_a_subject() {
+        let ctx = EngineContext::new(std::path::Path::new("/nonexistent"), "main")
+            .with_subject(Some("  the user's own words  "));
+        assert_eq!(subject_override(&ctx), Some("the user's own words"));
     }
 }

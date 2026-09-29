@@ -265,6 +265,106 @@ pub struct AgentConfig {
     pub prompt: Option<String>,
 }
 
+// ── The key table `ro config set` validates against ──────────────────────
+//
+// `AppConfig` deliberately has no `deny_unknown_fields`: a table from a newer
+// ro must load cleanly, and a config the loader refuses is a config the user
+// cannot escape without hand-editing. The cost of that decision is that a
+// *typo* loads cleanly too, and nothing anywhere distinguishes the two.
+//
+// This table is where the distinction is made. It is a declaration, and a
+// declaration can drift from the struct it describes — so it is not trusted on
+// its own. `is_modelled_field` below proves each entry against the real
+// `Deserialize` impl, and a test asserts the table and the impl agree. A key
+// added to a struct without adding it here fails the build's test run rather
+// than becoming a silently-rejected setting.
+
+/// Every table `AppConfig` reads, and the keys inside it that mean something.
+///
+/// The authority for what `ro config set` will write. Kept in step with the
+/// structs by `every_declared_key_is_a_real_field`; see the note above.
+pub const CONFIG_KEYS: &[(&str, &[&str])] = &[
+    (
+        "core",
+        &["layout", "parallel", "projects_dir", "timeout_secs"],
+    ),
+    // `[identity]` is the odd one: `default` is a real key, and everything
+    // else under it is a *user-named* profile, so the leaf keys are checked
+    // against `IDENTITY_PROFILE_KEYS` rather than listed here.
+    ("identity", &["default"]),
+    ("auth", &["expected_login", "https", "ssh"]),
+    ("github", &["auth", "host"]),
+    ("agent", &["command", "engine", "prompt"]),
+];
+
+/// The keys of one `[identity.<profile>]` table.
+pub const IDENTITY_PROFILE_KEYS: &[&str] = &["email", "name"];
+
+/// The keys `T`'s `Deserialize` impl accepts at depth one, proven rather than
+/// restated.
+///
+/// The trick is what is fed, not what is read. A key `T` has never heard of is
+/// ignored in silence — that is the whole reason this function exists — so
+/// probing with a *valid* value cannot tell "accepted" from "ignored". Probing
+/// with a `true` reverses it: every field in this schema is a string, an
+/// integer, a list or an optional of those, and a boolean is accepted by none
+/// of them, so a real field rejects the value while a name ro does not know
+/// parses cleanly.
+///
+/// That is an assumption about the schema, and it is enforced rather than
+/// merely noted: adding a `bool` field makes a real key probe as *unknown*,
+/// which fails `every_declared_key_is_a_real_field`. The alternative — a
+/// derived-key listing — needs `serde_ignored` or a hand-written mirror, and a
+/// hand-written mirror is the drift this is trying to remove.
+pub fn is_modelled_field<T: serde::de::DeserializeOwned>(key: &str) -> bool {
+    // Bare-key syntax only. `engine-args` is a serde `rename`, not a TOML
+    // bare key, and a document that fails to *parse* would be indistinguishable
+    // from a field that rejected its value.
+    let probe = format!("{key} = true\n");
+    toml::from_str::<toml::Table>(&probe).expect("a bare key and a bool always parse") ;
+    toml::from_str::<T>(&probe).is_err()
+}
+
+/// The keys of `table`, or `None` if no such table is read.
+pub fn known_keys_for(table: &str) -> Option<&'static [&'static str]> {
+    CONFIG_KEYS.iter().find(|(t, _)| *t == table).map(|(_, k)| *k)
+}
+
+/// The closest key to `typo`, when one is close enough to have been meant.
+///
+/// A rejection that only says "unknown key" sends the user to the source to
+/// find the schema. This is the difference between `core.paralel` being a typo
+/// the message can see and one it cannot.
+pub fn nearest_key<'a>(typo: &str, candidates: &'a [&'a str]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .map(|c| (*c, edit_distance(typo, c)))
+        .filter(|(_, d)| *d <= 3)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
+}
+
+/// Levenshtein, capped — a distance past 3 is not a typo, it is a different
+/// word, and pretending otherwise produces nonsense suggestions.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = sub.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
 fn default_projects_dir() -> String {
     "~/projects".into()
 }
@@ -354,5 +454,78 @@ engine = "codex"
         assert_eq!(cfg.core.layout, "flat");
         assert_eq!(cfg.github.host, "github.com");
         assert_eq!(cfg.github.auth, "auto");
+    }
+
+    /// The key table and the structs must agree, in both directions.
+    ///
+    /// This is the test that would have caught the whole class of bug this
+    /// wave is about. `CONFIG_KEYS` is a declaration, and a declaration is
+    /// exactly the kind of thing that drifts: a field added to a struct and
+    /// not to the table is a setting `ro config set` refuses to write, and a
+    /// key in the table that no struct has is a setting it writes and nothing
+    /// reads. Both are silent, and both are caught here rather than by a user
+    /// who typed a sensible value and watched nothing happen.
+    #[test]
+    fn every_declared_key_is_a_real_field() {
+        for (table, keys) in CONFIG_KEYS {
+            for key in *keys {
+                assert!(
+                    is_modelled_field::<AppConfig>(&format!("{table}.{key}")),
+                    "CONFIG_KEYS declares {table}.{key}, but AppConfig has no such field"
+                );
+            }
+        }
+        // And the profile table, which is keyed by user-chosen names.
+        for key in IDENTITY_PROFILE_KEYS {
+            assert!(
+                is_modelled_field::<CommitIdentityConfig>(key),
+                "IDENTITY_PROFILE_KEYS declares {key}, but CommitIdentityConfig has no such field"
+            );
+        }
+    }
+
+    /// The mirror image: a key the structs accept and the table omits is a
+    /// setting `ro config set` will refuse to write.
+    ///
+    /// Probed with a `true` for the reason given on `is_modelled_field`: a
+    /// valid value is accepted by a real field and *ignored* by a name ro does
+    /// not know, so only a value nothing accepts separates the two.
+    #[test]
+    fn no_modelled_key_is_missing_from_the_table() {
+        let mut missing = Vec::new();
+        for (table, keys) in CONFIG_KEYS {
+            for key in *keys {
+                if !is_modelled_field::<AppConfig>(&format!("{table}.{key}")) {
+                    missing.push(format!("{table}.{key}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these keys are in the table but not in the structs: {missing:?}"
+        );
+    }
+
+    /// A typo is a typo, and the message should be able to see it.
+    #[test]
+    fn a_typo_is_recognised_as_a_typo() {
+        assert_eq!(
+            nearest_key("paralel", &["layout", "parallel", "projects_dir", "timeout_secs"]),
+            Some("parallel")
+        );
+        assert_eq!(nearest_key("layot", &["layout", "parallel"]), Some("layout"));
+        // A different word, not a typo: no suggestion, rather than a wrong one.
+        assert_eq!(nearest_key("banana", &["layout", "parallel"]), None);
+    }
+
+    /// The table a user is most likely to reach for, and the one the docs
+    /// name, must be in the table — `checkpoint.secret_scan` is the setting
+    /// FEATURES.md tells people to write.
+    #[test]
+    fn the_documented_secret_scan_key_is_not_a_live_key() {
+        assert!(
+            known_keys_for("checkpoint").is_none(),
+            "checkpoint is not read; the docs must not point at it"
+        );
     }
 }
