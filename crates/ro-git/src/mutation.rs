@@ -382,6 +382,38 @@ fn spawn_with_timeout(
         cmd.process_group(0);
     }
 
+    // **The pipes have to be set here, or the deadline silently destroys the
+    // command's output.** `Command::output()` wires stdout and stderr to
+    // pipes as part of what it does, so the no-deadline path below captured
+    // them for free. This path calls `spawn()` directly, and a plain `spawn()`
+    // *inherits* the parent's stdout and stderr — so `wait_with_output()`,
+    // which reads the child's pipes, finds two empty ones and returns an
+    // `Output` with `stdout == ""` and `stderr == ""`.
+    //
+    // The child still ran, and its output still went somewhere: to ro's own
+    // terminal, interleaved into whatever the process was printing. So the
+    // result was not "a failed command" but a *successful* command that
+    // reported nothing, which is the worst of the two.
+    //
+    // What that cost, concretely, and why nothing caught it: this function
+    // was reachable only from a `RunOpts` that asked for a deadline, and
+    // until the sync was wired to pass one, **no production caller ever did**.
+    // The only tests that reached it asserted on `TimedOut` and on elapsed
+    // time — neither of which reads a byte of git's output. So the deadline
+    // path was correct about *when* it killed a child and completely wrong
+    // about *what the child said*, and the day a real caller handed it one,
+    // `git pull`'s "Already up to date." stopped being seen, `git stash
+    // list` read as empty, and `git status` reported a tree with no
+    // conflicts — a run that reported a clean sync over a tree holding
+    // conflict markers and a stash full of somebody's work.
+    //
+    // `Stdio::piped()` is set unconditionally so that both arms of the
+    // `timeout` match in [`run_in`] capture identically. Whatever a caller
+    // configured on the builder before calling is overridden here, which is
+    // the same contract `output()` has always had.
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
     let program = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd.spawn().map_err(|e| GitError::NotSpawned {
         program: program.clone(),
@@ -423,6 +455,28 @@ fn spawn_with_timeout(
 
 /// Fetch refs from a remote.
 pub fn fetch(repo: &Path, opts: &FetchOpts) -> Result<GitCommandResult> {
+    fetch_in(repo, opts, &RunOpts::none())
+}
+
+/// [`fetch`], handed the caller's per-invocation settings.
+///
+/// A split rather than a parameter added to [`fetch`] because **a deadline
+/// that only reaches some of a run's git calls is not a deadline**. `fetch`
+/// and `pull` and `clone` were each the one place in a sync run where a
+/// network call went out with `RunOpts::none()`, so `--timeout 3` was
+/// enforced on `git remote prune` — a command that touches nothing but local
+/// bookkeeping — while the fetch that actually talks to the remote had no
+/// deadline at all. Against a server that accepts the connection and never
+/// answers, the run sat there until somebody killed it from outside.
+///
+/// The two-spell shape is deliberate: the ~20 existing callers across the
+/// workspace keep calling `fetch`/`pull`/`clone` and keep getting
+/// `RunOpts::none()`, and the one caller that has a deadline to enforce — a
+/// fleet sync — asks for it by name. Changing the existing signature would
+/// have meant a mechanical edit to every call site to pass an argument none of
+/// them have any use for, which is how a deadline requirement decays into a
+/// default nobody notices.
+pub fn fetch_in(repo: &Path, opts: &FetchOpts, run: &RunOpts<'_>) -> Result<GitCommandResult> {
     let mut args: Vec<String> = vec!["fetch".to_string()];
     if opts.prune {
         args.push("--prune".to_string());
@@ -437,7 +491,7 @@ pub fn fetch(repo: &Path, opts: &FetchOpts) -> Result<GitCommandResult> {
         args.push(remote.clone());
     }
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_in(Some(repo), &argv, &RunOpts::none())
+    run_in(Some(repo), &argv, run)
 }
 
 /// Pull from a remote.
@@ -463,6 +517,25 @@ pub fn fetch(repo: &Path, opts: &FetchOpts) -> Result<GitCommandResult> {
 /// Without `--autostash` the exit code is the whole story, because git
 /// refuses the merge outright and nothing is stashed.
 pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
+    pull_in(repo, opts, &RunOpts::none())
+}
+
+/// [`pull`], handed the caller's per-invocation settings.
+///
+/// The deadline has to cover **every** git this call makes, and it makes
+/// three: the stash snapshot taken before the pull, the pull itself, and the
+/// two tree reads that decide whether the pop actually applied. The pre-pull
+/// snapshot is the one that is easy to miss and the reason this is a
+/// separate function at all — it is a `git stash list` inside the same call,
+/// and a call that had a deadline on its headline command but not on its
+/// helper is a run that still hangs.
+///
+/// A timed-out tree read is treated as **unreadable**, not as clean, for the
+/// reason [`unmerged_paths`] documents: not knowing where the work went is
+/// not the same as knowing it came back, and the one thing this path must
+/// never do is report a clean pop on the strength of a command that was
+/// killed.
+pub fn pull_in(repo: &Path, opts: &PullOpts, run: &RunOpts<'_>) -> Result<PullOutcome> {
     let mut args: Vec<String> = vec!["pull".to_string()];
     match opts.strategy {
         PullStrategy::FastForwardOnly => args.push("--ff-only".to_string()),
@@ -501,11 +574,11 @@ pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
     // Skipped entirely when no autostash was asked for — that path is judged
     // by the exit code alone, and it must not pay for a tree read.
     let stashes_before = if opts.autostash {
-        stash_snapshot(repo)
+        stash_snapshot(repo, run)
     } else {
         None
     };
-    let result = run_in(Some(repo), &argv, &RunOpts::none())?;
+    let result = run_in(Some(repo), &argv, run)?;
     let conflict = result.stderr.contains("conflict") || result.stdout.contains("CONFLICT");
     let already_up_to_date = result.stdout.contains("Already up to date");
 
@@ -513,8 +586,8 @@ pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
     // succeeded or git refused before stashing anything, so the exit code
     // and the stream already say the whole truth.
     if opts.autostash && result.ok() {
-        let unmerged = unmerged_paths(repo);
-        let stash = autostash_state(repo, stashes_before.as_deref());
+        let unmerged = unmerged_paths(repo, run);
+        let stash = autostash_state(repo, stashes_before.as_deref(), run);
         let stash_held = !matches!(stash, AutostashState::Popped);
         if !unmerged.is_empty() || stash_held {
             // The pull landed and the pop did not. Both facts are stated,
@@ -569,24 +642,28 @@ pub fn pull(repo: &Path, opts: &PullOpts) -> Result<PullOutcome> {
 /// --autostash` returns 0 either way. A `UU` entry is a file holding
 /// conflict markers; an `AU`/`UA` is a file one side added and the other
 /// changed. Both are a pop that did not finish.
-fn unmerged_paths(repo: &Path) -> Vec<String> {
-    let out = match std::process::Command::new("git")
-        .args(["status", "--porcelain", "-z", "-uall"])
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .output()
-    {
+fn unmerged_paths(repo: &Path, run: &RunOpts<'_>) -> Vec<String> {
+    // `run_in` rather than a bare `Command`, so this read carries the caller's
+    // deadline: a tree read that cannot answer must not be the thing that
+    // keeps a fleet run from finishing. It also means the read goes out with
+    // the same hardening block as every other git here.
+    let out = match run_in(
+        Some(repo),
+        &["status", "--porcelain", "-z", "-uall"],
+        run,
+    ) {
         Ok(o) => o,
         // A worktree that cannot be read is not evidence of a clean pop.
         // An empty answer here would report success on a tree we never
         // looked at, which is the exact lie this function exists to stop.
+        // A read that ran out of time is unreadable for exactly the same
+        // reason a read that failed is.
         Err(_) => return vec!["<unreadable worktree>".to_string()],
     };
-    if !out.status.success() {
+    if out.status != 0 {
         return vec!["<git status failed>".to_string()];
     }
-    crate::primitives::parse_porcelain(&String::from_utf8_lossy(&out.stdout))
+    crate::primitives::parse_porcelain(&out.stdout)
         .into_iter()
         .filter(|e| {
             let c = e.code.as_str();
@@ -611,19 +688,13 @@ fn unmerged_paths(repo: &Path) -> Vec<String> {
 /// happens to a tracked repo whose checkout was replaced, and a caller that
 /// read it as "no stashes" would be reporting a clean pop on the strength of
 /// a command that never ran.
-fn stash_snapshot(repo: &Path) -> Option<Vec<String>> {
-    let out = std::process::Command::new("git")
-        .args(["stash", "list", "--format=%H"])
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .output()
-        .ok()?;
-    if !out.status.success() {
+fn stash_snapshot(repo: &Path, run: &RunOpts<'_>) -> Option<Vec<String>> {
+    let out = run_in(Some(repo), &["stash", "list", "--format=%H"], run).ok()?;
+    if out.status != 0 {
         return None;
     }
     Some(
-        String::from_utf8_lossy(&out.stdout)
+        out.stdout
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
@@ -660,8 +731,8 @@ enum AutostashState {
 ///
 /// `before` is the snapshot taken before git ran, or `None` when the pull
 /// was not asked to autostash at all.
-fn autostash_state(repo: &Path, before: Option<&[String]>) -> AutostashState {
-    let Some(after) = stash_snapshot(repo) else {
+fn autostash_state(repo: &Path, before: Option<&[String]>, run: &RunOpts<'_>) -> AutostashState {
+    let Some(after) = stash_snapshot(repo, run) else {
         return AutostashState::Unreadable;
     };
     let Some(before) = before else {
@@ -688,6 +759,17 @@ fn autostash_state(repo: &Path, before: Option<&[String]>) -> AutostashState {
 
 /// Clone a repository to `dest`.
 pub fn clone(url: &str, dest: &Path, opts: &CloneOpts) -> Result<CloneOutcome> {
+    clone_in(url, dest, opts, &RunOpts::none())
+}
+
+/// [`clone`], handed the caller's per-invocation settings.
+///
+/// A clone is the run's most expensive git call and the only one that can
+/// legitimately take minutes — which is exactly why the caller's deadline
+/// has to be the one enforced rather than a default. With no deadline the
+/// flag still applies; with one, a clone against a remote that never answers
+/// ends at the deadline instead of taking the fleet with it.
+pub fn clone_in(url: &str, dest: &Path, opts: &CloneOpts, run: &RunOpts<'_>) -> Result<CloneOutcome> {
     let mut args: Vec<String> = vec!["clone".to_string()];
     if let Some(d) = opts.depth {
         args.push(format!("--depth={d}"));
@@ -706,7 +788,35 @@ pub fn clone(url: &str, dest: &Path, opts: &CloneOpts) -> Result<CloneOutcome> {
         .to_string();
     args.push(dest_str);
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = run_in(None, &argv, &RunOpts::none())?;
+    // `None` for the working directory is load-bearing: git has to run
+    // *outside* the destination, which does not exist yet. See `run_in`.
+    //
+    // A clone that is **killed at the deadline** leaves the destination
+    // behind in a state that poisons every later run, and removing it is the
+    // only thing that does not. `git clone` creates `.git/` early, so a
+    // clone killed mid-flight leaves a directory with a `.git`, zero
+    // objects, and `HEAD=refs/heads/.invalid` — and every check ro makes
+    // for "is this repo cloned?" (`.git` exists) accepts it. From then on
+    // the row is treated as cloned forever, the fetch fails on every
+    // subsequent sync, and `git log` answers "your current branch appears to
+    // be broken" — even after the remote is healthy again, because the
+    // partial `.git/config` still holds the URL the failed run was given.
+    // There is no re-clone and no message; the user's only way out is to
+    // find the directory and delete it by hand.
+    //
+    // So the timeout handler cleans up what it created. The child is
+    // already dead — `run_in` killed the whole process group before
+    // returning the error — so nothing can be writing to the destination
+    // while this runs.
+    let result = match run_in(None, &argv, run) {
+        Ok(r) => r,
+        Err(e) => {
+            if dest.exists() {
+                let _ = std::fs::remove_dir_all(dest);
+            }
+            return Err(e);
+        }
+    };
     Ok(CloneOutcome {
         dest: dest.to_path_buf(),
         result,
@@ -1129,6 +1239,110 @@ echo PROBE_ARGS=%*
         assert!(
             elapsed >= Duration::from_millis(300),
             "it returned before the timeout: {elapsed:?}"
+        );
+    }
+
+    /// A git run **with a deadline** still returns what the child printed.
+    ///
+    /// This is the bug that made the deadline path unusable, and it is why the
+    /// sync could not simply be handed one. `Command::output()` wires the
+    /// child's stdout and stderr to pipes as part of what it does, so the
+    /// no-deadline arm captured them for free. The deadline arm called
+    /// `spawn()` directly, and a plain `spawn()` **inherits** the parent's
+    /// handles — so `wait_with_output()` read two empty pipes and returned
+    /// `stdout == ""`, `stderr == ""`, `status == 0`.
+    ///
+    /// The child had run, and its output had gone to ro's own terminal,
+    /// interleaved into whatever the process was printing. So the result was
+    /// not a failed command but a *successful* command that reported nothing.
+    ///
+    /// What that cost, and why nothing caught it: this path was reachable only
+    /// from a `RunOpts` that asked for a deadline, and until the sync was wired
+    /// to pass one, **no production caller ever did**. The tests that reached
+    /// it asserted on `TimedOut` and on elapsed time — neither reads a byte of
+    /// git's output. The day a real caller handed it one, `git pull`'s
+    /// "Already up to date." stopped being seen, `git stash list` read as
+    /// empty, and `git status` reported a tree with no conflicts: a run that
+    /// reported a clean sync over a tree holding conflict markers and a stash
+    /// full of somebody's work.
+    ///
+    /// Asserted through a shim that prints, because the failure is invisible
+    /// against the real git — a real `git status` over a clean tree prints
+    /// nothing, which is exactly the wrong answer this bug produced.
+    #[test]
+    fn a_git_run_with_a_deadline_still_returns_the_childs_output() {
+        let tmp = TempDir::new().unwrap();
+        let shim = write_shim(
+            &tmp.path().join("bin"),
+            "git-echoes",
+            "#!/bin/sh\necho \"STDOUT-MARKER\"\necho \"STDERR-MARKER\" >&2\nexit 0\n",
+            "@echo off\r\necho STDOUT-MARKER\r\necho STDERR-MARKER 1>&2\r\n",
+        );
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let result = run_in(
+            Some(&repo),
+            &["status"],
+            &RunOpts {
+                env: &[],
+                timeout: Some(Duration::from_secs(30)),
+                program: Some(shim.to_str().expect("a UTF-8 shim path")),
+            },
+        )
+        .expect("the shim runs");
+
+        assert_eq!(result.status, 0, "the shim exits 0: {result:?}");
+        assert!(
+            result.stdout.contains("STDOUT-MARKER"),
+            "stdout was lost on the deadline path — the child inherited ro's \
+             stdout instead of a pipe, so `wait_with_output` read nothing. \
+             Got: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stderr.contains("STDERR-MARKER"),
+            "stderr was lost the same way. Got: {:?}",
+            result.stderr
+        );
+    }
+
+    /// The same defect on the failure side, and the one that would have been
+    /// worse: a git that **fails** under a deadline must still say why.
+    ///
+    /// A refusal whose message is lost is indistinguishable from a timeout,
+    /// and the two need different responses — "try again" versus "this will
+    /// never work". That distinction is the whole reason `GitError::TimedOut`
+    /// exists as its own type.
+    #[test]
+    fn a_failing_git_run_with_a_deadline_keeps_its_stderr() {
+        let tmp = TempDir::new().unwrap();
+        let shim = write_shim(
+            &tmp.path().join("bin"),
+            "git-fails",
+            "#!/bin/sh\necho \"THE-REASON\" >&2\nexit 129\n",
+            "@echo off\r\necho THE-REASON 1>&2\r\nexit /b 129\r\n",
+        );
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let result = run_in(
+            Some(&repo),
+            &["remote", "prune", "origin"],
+            &RunOpts {
+                env: &[],
+                timeout: Some(Duration::from_secs(30)),
+                program: Some(shim.to_str().expect("a UTF-8 shim path")),
+            },
+        )
+        .expect("a non-zero exit is still a result, not an error");
+
+        assert_eq!(result.status, 129, "the shim exits 129: {result:?}");
+        assert!(
+            result.stderr.contains("THE-REASON"),
+            "a refusal under a deadline must keep its message, or a wrong flag \
+             and a wedged network become the same answer. Got: {:?}",
+            result.stderr
         );
     }
 
@@ -1757,6 +1971,70 @@ echo PROBE_ARGS=%*
         r
     }
 
+    /// A clone killed at the deadline must not leave a checkout behind.
+    ///
+    /// `git clone` creates `.git/` early, so a clone killed mid-flight
+    /// leaves a directory with a `.git`, zero objects and
+    /// `HEAD=refs/heads/.invalid` — and every check ro makes for "is this
+    /// repo cloned?" accepts it. From then on the row is treated as cloned
+    /// forever, the fetch fails on every subsequent sync, and even a
+    /// perfectly healthy remote does not help, because the partial
+    /// `.git/config` still holds the URL the failed run was given. There was
+    /// no re-clone and no message; the user's only way out was to find the
+    /// directory and delete it by hand.
+    ///
+    /// The child is already dead when the handler runs — `run_in` killed the
+    /// whole process group before returning the error — so removing the
+    /// destination races nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_clone_killed_at_the_deadline_leaves_no_checkout_behind() {
+        let tmp = TempDir::new().unwrap();
+        // A stand-in for git that does what `git clone` does early — creates
+        // the destination and its `.git` — and then hangs, which is the
+        // shape of a clone killed mid-flight. A stand-in that only hangs
+        // would leave nothing behind and would pass against the unfixed
+        // code, which is a test that proves nothing.
+        let hang = tmp.path().join("hang-git");
+        std::fs::write(
+            &hang,
+            "#!/bin/sh\nfor a in \"$@\"; do last=\"$a\"; done\n\
+             mkdir -p \"$last/.git\"\nexit 0 &\nsleep 600\n",
+        )
+        .expect("the stand-in is writable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&hang).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&hang, p).unwrap();
+        }
+
+        let dest = tmp.path().join("work").join("app");
+        let hang_str = hang.to_string_lossy().into_owned();
+        let run = RunOpts {
+            env: &[],
+            timeout: Some(Duration::from_millis(300)),
+            program: Some(&hang_str),
+        };
+        let err = clone_in(
+            "whatever",
+            &dest,
+            &CloneOpts::default(),
+            &run,
+        )
+        .expect_err("the clone must be killed at the deadline");
+        assert!(
+            format!("{err}").contains("did not finish within"),
+            "the deadline is what stopped it, got: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "a killed clone left {} behind; every later run will treat it as \
+             cloned and fail against a checkout with no objects",
+            dest.display()
+        );
+    }
+
     #[test]
     fn run_in_returns_command_result() {
         let (_tmp, path) = temp_repo();
@@ -2324,12 +2602,12 @@ mod pull_arg_tests {
         run_git(&work, &["stash", "push", "-m", "the user's own work"]);
 
         assert!(
-            matches!(autostash_state(&work, None), AutostashState::Unreadable),
+            matches!(autostash_state(&work, None, &RunOpts::none()), AutostashState::Unreadable),
             "with no before-snapshot and an entry in the list, nothing can be \
              shown to be older than this pull, so the pop cannot be called clean"
         );
         assert!(
-            matches!(autostash_state(&work, None), AutostashState::Unreadable),
+            matches!(autostash_state(&work, None, &RunOpts::none()), AutostashState::Unreadable),
             "and it is not a hold either: the message has to say which"
         );
 
@@ -2337,7 +2615,7 @@ mod pull_arg_tests {
         // no work in a stash, so there is nothing to have failed to pop.
         run_git(&work, &["stash", "drop"]);
         assert!(
-            matches!(autostash_state(&work, None), AutostashState::Popped),
+            matches!(autostash_state(&work, None, &RunOpts::none()), AutostashState::Popped),
             "an empty list after the pull is evidence, not an absence of it"
         );
     }
@@ -2372,7 +2650,7 @@ mod pull_arg_tests {
         );
 
         assert!(
-            stash_snapshot(&not_a_repo).is_none(),
+            stash_snapshot(&not_a_repo, &RunOpts::none()).is_none(),
             "an unreadable stash list must be reported as unknown, not as an \
              empty one — an empty one says 'nothing is stashed', which is a \
              claim about the user's work that was never checked"
@@ -2382,7 +2660,7 @@ mod pull_arg_tests {
         let (_tmp, repo) = temp_repo();
         run_git(&repo, &["commit", "-q", "--allow-empty", "-m", "first"]);
         assert_eq!(
-            stash_snapshot(&repo),
+            stash_snapshot(&repo, &RunOpts::none()),
             Some(Vec::new()),
             "a real repository with no stashes is 'known to be empty', which \
              is not the same answer as 'could not be read'"

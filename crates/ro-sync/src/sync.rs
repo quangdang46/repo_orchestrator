@@ -150,7 +150,38 @@ pub struct SyncResult {
     /// of it, which is the bug: the one question a dry run is ever asked is
     /// "is there anything waiting for me", and a repo three commits behind
     /// and a repo already in line both answered `would_pull`.
+    ///
+    /// This is the field a consumer reads for the plan, and it used to be
+    /// `None` on every row the module produces while the text went into
+    /// `error` — so a reader of the documented field got nothing, and a
+    /// reader of `error` got a sentence that is not an error. Both carry it
+    /// now; see [`SyncResult::plan_mismatch`] for why `error` cannot simply
+    /// be emptied.
     pub plan: Option<String>,
+    /// The prediction this run made about itself, and where the outcome
+    /// contradicted it.
+    ///
+    /// Every **real** run predicts its own result first, from local state
+    /// only, and then compares that prediction with what actually happened
+    /// ([`plans_match`]). `None` for a dry run, whose plan *is* the result,
+    /// and for every real run whose prediction held. `Some(reason)` is a
+    /// prediction that was wrong, which is the defect a dry run exists to
+    /// prevent — reported on the row because a `tracing::warn!` is invisible
+    /// to every consumer of this struct, and a disagreement nobody can read
+    /// is a disagreement nobody acts on.
+    ///
+    /// **It does not fail the run, and the reason is not leniency.** The two
+    /// cases are not symmetric. A run that refused a repo the plan called
+    /// clean has already recorded `error` / `conflict` /
+    /// `autostash_conflict`, so the exit code already says the repo is not in
+    /// the state the user asked for; the mismatch adds information, not a
+    /// verdict. A run that *succeeded* where the plan predicted failure —
+    /// the plan measured a ref the fetch was about to move — is a perfectly
+    /// good run over a healthy repo, and failing it would turn the tool's own
+    /// staleness into a false alarm on the fleet. The exit code answers "is
+    /// every repo where the user asked for it"; this field answers "did the
+    /// preview tell the truth", and they are different questions.
+    pub plan_mismatch: Option<String>,
 }
 
 /// The statuses `sync_repo` can put in [`SyncResult::status`], and what each
@@ -241,12 +272,20 @@ pub(crate) fn status_fails_run(status: &str) -> bool {
 // uses it.
 //
 // `fetch`, `pull` and `clone` in `ro_git` take their options structs and
-// run with `RunOpts::none()` internally, so they cannot be given a deadline
-// without a signature change in a crate this one does not own. That change
-// is described under `knownGaps`; until it lands, the deadline is enforced
-// on the one git call this module makes directly (`git remote prune`) and
-// the three that go through it are unenforced, which is the honest state of
-// the flag rather than a claim that it works.
+// run with `RunOpts::none()` internally, so they could not be given a
+// deadline without a signature change in a crate this one does not own.
+// That change landed as `fetch_in` / `pull_in` / `clone_in`: the same
+// command, the same args, the same outcome, with the caller's `RunOpts`
+// handed to `run_in`. The deadline now reaches every git call a sync makes
+// — fetch, pull, clone, prune, and the autostash tree reads inside `pull`
+// — which is the guarantee the flag was written for.
+//
+// The two-spell shape is deliberate. The ~20 existing callers across the
+// workspace keep calling `fetch`/`pull`/`clone` and keep getting
+// `RunOpts::none()`; the one caller that has a deadline to enforce asks for
+// it by name. Changing the existing signature would have meant a mechanical
+// edit to every call site to pass an argument none of them has any use for,
+// which is how a deadline requirement decays into a default nobody notices.
 
 /// A dry run that says a repo is fine and a real run that then refuses it.
 ///
@@ -276,6 +315,83 @@ pub(crate) fn status_fails_run(status: &str) -> bool {
 /// real-run status differ while the answer to "does this run pass" does not.
 pub fn plans_match(dry_run: &SyncResult, real_run: &SyncResult) -> bool {
     status_fails_run(&dry_run.status) == status_fails_run(&real_run.status)
+}
+
+/// How long ago the local `upstream` ref was last updated, if we can tell.
+///
+/// "Last updated" is read from git's own reflog for the ref
+/// (`git reflog show <ref> --date=unix --format=%ct`), which records the
+/// moment the ref moved — i.e. the moment of the fetch that last brought it
+/// level with the remote. That is exactly the freshness of the number a
+/// dry run is about to report, so it is the right clock. `None` means we
+/// could not read it (no reflog, unreadable ref, the reflog git call
+/// failed), and the caller must then say so rather than imply the number is
+/// current.
+///
+/// This is the seam the whole dry-run-honesty fix turns on: a dry run cannot
+/// fetch (that would make it a real run), so the only honest thing it can do
+/// is report *how old* the ref it measured against is.
+fn tracking_ref_age(opts: &SyncOptions, local: &Path, upstream: &str) -> Option<Duration> {
+    let out = opts
+        .git(
+            Some(local),
+            &["reflog", "show", upstream, "--date=unix", "--format=%ct"],
+        )
+        .ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let ts: i64 = out.stdout.trim().lines().next()?.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    // A timestamp in the future means a skewed clock or a reflog we cannot
+    // interpret; either way, do not report a negative age.
+    if now < ts {
+        return None;
+    }
+    Some(Duration::from_secs((now - ts) as u64))
+}
+
+/// A duration in the coarse, human units a plan sentence can carry.
+fn human_age(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{secs} second(s) ago")
+    } else if secs < 3_600 {
+        format!("{} minute(s) ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{} hour(s) ago", secs / 3600)
+    } else {
+        format!("{} day(s) ago", secs / 86_400)
+    }
+}
+
+/// The caveat every "looks fine" plan carries, because a dry run's numbers
+/// come from a local ref that may be arbitrarily old.
+///
+/// "in line with origin/main" reads as a claim about the remote. It is not
+/// one: it is a claim about the **local** `origin/main` ref, which is only as
+/// fresh as the last fetch — possibly weeks. Saying so is the difference
+/// between a preview and a lie. When the age is known we name it ("as last
+/// fetched 3 days ago"); when it is not, we still say that a dry run cannot
+/// see past the local ref, because the honest answer to "is this in line?" is
+/// "in line with a ref of unknown freshness", never a bare "yes".
+fn staleness_note(opts: &SyncOptions, local: &Path, upstream: &str) -> String {
+    match tracking_ref_age(opts, local, upstream) {
+        Some(age) => format!(
+            " (that ref was last fetched {}. A dry run does not fetch, so commits \
+             pushed to the remote since then are not visible here — run `ro sync` \
+             for a live answer)",
+            human_age(age)
+        ),
+        None => format!(
+            " (the local {upstream} ref's last-fetch time could not be read. A dry \
+             run does not fetch, so this may be stale — run `ro sync` for a live \
+             answer)"
+        ),
+    }
 }
 
 /// What one repo's sync would do, decided without doing it.
@@ -423,10 +539,17 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
         ),
     };
 
+    // Every branch below that reports a number measured against `upstream`
+    // carries this caveat. Without it, "in line with origin/main" and "3
+    // commits behind origin/main" are both claims about the **remote** that
+    // are really claims about a local ref that may be weeks old, and the
+    // first of those is the one a user acts on.
+    let stale = staleness_note(opts, local, &upstream);
+
     let (status, plan) = match (ahead, behind) {
         (Some(a), Some(b)) if a == 0 && b == 0 => (
             STATUS_DRY_RUN,
-            format!("nothing to do — {branch} is in line with {upstream}"),
+            format!("nothing to do — {branch} is in line with {upstream}{stale}"),
         ),
         // Diverged. Under `--ff-only` this is not a pull that might be
         // awkward, it is a pull git refuses outright — "Not possible to
@@ -444,7 +567,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
                     "the pull will fail — {branch} has diverged from {upstream} \
                      ({a} ahead, {b} behind) and --ff-only refuses a non-fast-forward. \
                      Use --strategy rebase or --strategy merge, or push the local \
-                     commits first"
+                     commits first{stale}"
                 ),
             )
         }
@@ -452,7 +575,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
             STATUS_DRY_RUN,
             format!(
                 "pull {branch} — it has diverged from {upstream} ({a} ahead, {b} behind), \
-                 so this is a {}-way sync, not a fast-forward",
+                 so this is a {}-way sync, not a fast-forward{stale}",
                 match opts.strategy {
                     SyncStrategy::Rebase => "rebase",
                     SyncStrategy::Merge => "merge",
@@ -462,7 +585,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
         ),
         (Some(_), Some(b)) if b > 0 => (
             STATUS_DRY_RUN,
-            format!("pull {branch} — {b} commit(s) behind {upstream} are waiting"),
+            format!("pull {branch} — {b} commit(s) behind {upstream} are waiting{stale}"),
         ),
         // Ahead and not behind is the case the old dry run could not see,
         // and the one a dry run most needs to be honest about: sync does
@@ -473,12 +596,35 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
             format!(
                 "nothing to pull — {branch} is {a} commit(s) ahead of {upstream}. \
                  `ro sync` does not push, so those commits stay local until you \
-                 push them yourself"
+                 push them yourself{stale}"
+            ),
+        ),
+        // **Unmeasurable is not in line.** `ahead_behind` failed above, so
+        // `(None, None)` arrives here and used to fall into the same `_`
+        // arm as a genuinely measured `(0, 0)` — printing "nothing to do —
+        // main is in line with origin/main" for a checkout that git cannot
+        // compare against anything. The truth was carried only in
+        // `unmeasurable_reason` and a staleness parenthetical while the
+        // headline sentence still claimed a measurement nobody made.
+        //
+        // This is the one lie a dry run must never tell, and it is
+        // reachable without anything exotic: a clone killed by `--timeout`
+        // leaves a `.git` with zero objects and `HEAD=refs/heads/.invalid`,
+        // which `.git exists()` accepts, and which measures `(None, None)`
+        // on every subsequent run — even after the remote is healthy again.
+        (None, None) => (
+            STATUS_ERROR,
+            format!(
+                "cannot tell whether {branch} is in line with {upstream} — {} \
+                 A dry run that reports a repo as in sync when it could not \
+                 measure it is worse than reporting nothing, so this run is \
+                 marked failed: fix the checkout, or re-clone it.",
+                reason.as_deref().unwrap_or("the comparison failed")
             ),
         ),
         _ => (
             STATUS_DRY_RUN,
-            format!("nothing to do — {branch} is in line with {upstream}"),
+            format!("nothing to do — {branch} is in line with {upstream}{stale}"),
         ),
     };
 
@@ -507,7 +653,112 @@ struct PlannedSync {
 }
 
 /// Sync a single repo.
+///
+/// A **predict-then-verify** run. Before anything is touched, the outcome is
+/// predicted from local state alone — the same [`plan_repo`] the dry run
+/// uses, over the same inputs, so the prediction is by construction the
+/// answer a dry run would have given. After the work is done, the prediction
+/// is compared with the outcome by [`plans_match`], and any disagreement is
+/// recorded on the row as [`SyncResult::plan_mismatch`].
+///
+/// This is the property the dry run exists for, checked by the tool against
+/// itself on every real sync instead of only by a test. `plans_match` was
+/// `pub` and documented as *the* invariant, and it was called from
+/// `#[cfg(test)]` and nowhere else — a function that encodes the invariant
+/// and cannot be reached from the binary is a comment with a test attached,
+/// and a comment does not stop the next divergence.
+///
+/// **A disagreement warns; it does not fail the run.** The two directions
+/// are not symmetric, and treating them the same would be a bug in either:
+///
+///  * The run **refused** a repo the plan called clean. The row already
+///    says `error` / `conflict` / `autostash_conflict`, and the exit code
+///    already says this repo is not where the user asked for it. The
+///    mismatch adds the fact that the *preview* was wrong, which is a
+///    different and useful thing to know.
+///  * The run **succeeded** where the plan predicted failure — the plan
+///    measured a local ref that the fetch was about to move, saw a
+///    divergence that was not there, and said "this will fail". The repo is
+///    healthy and fully synced. Failing the run here would mean the
+///    tool's own staleness produces a red fleet board, which is how an
+///    exit code stops meaning anything.
+///
+/// So the exit code keeps answering "is every repo where the user asked for
+/// it", and `plan_mismatch` answers "did the preview tell the truth". Making
+/// the second question change the first would have been the easier wiring
+/// and the wrong one.
 pub fn sync_repo(
+    conn: &Connection,
+    repo: &TrackedRepo,
+    opts: &SyncOptions,
+    run_id: &str,
+) -> Result<SyncResult> {
+    // A dry run's plan *is* its result; there is no second outcome to
+    // compare it against, so prediction is for the real run only.
+    if opts.dry_run {
+        return sync_repo_inner(conn, repo, opts, run_id);
+    }
+
+    // Taken **before** `sync_repo_inner` runs, deliberately. The prediction
+    // has to be the one a dry run would give, and a dry run sees the repo
+    // exactly as it is now — before this run's own fetch has quietly moved
+    // the ref the prediction is measured against. Predicting afterwards
+    // would compare the outcome with itself and could never disagree.
+    let predicted = plan_repo(repo, opts).ok();
+
+    let mut result = sync_repo_inner(conn, repo, opts, run_id)?;
+
+    if let Some(plan) = &predicted {
+        let predicted_row = planned_row(&repo.id, plan);
+        if !plans_match(&predicted_row, &result) {
+            // The plan's own sentence goes in the message, not just its
+            // action and status. `pull (dry_run)` says nothing about *what*
+            // was claimed; "nothing to do — main is in line with origin/main"
+            // is the sentence a user would have read and believed, and it is
+            // the one that has to be shown to them as the thing that turned
+            // out to be wrong.
+            let claimed = plan.plan.as_deref().unwrap_or("(no detail)");
+            let reason = format!(
+                "the preview said `{}` ({}) — {claimed} — and the run turned out to be \
+                 `{}` ({}). A dry run measures a local ref that the real run's fetch then \
+                 updates, so the two can disagree; a preview that misleads is worth knowing \
+                 about.",
+                predicted_row.action, predicted_row.status, result.action, result.status
+            );
+            tracing::warn!(repo = %repo.id, "{reason}");
+            result.plan_mismatch = Some(reason);
+        }
+    }
+
+    Ok(result)
+}
+
+/// A [`PlannedSync`] as the row a comparison can be made against.
+///
+/// Only the verdict is read by [`plans_match`], but the row is built whole
+/// so that a mismatch message can name what was predicted and not just
+/// "one of them failed". Durations and oids are absent because nothing has
+/// happened yet: a plan that carried a post-oid would be a plan that had
+/// already run.
+fn planned_row(repo_id: &str, plan: &PlannedSync) -> SyncResult {
+    SyncResult {
+        repo_id: repo_id.to_string(),
+        action: plan.action.clone(),
+        status: plan.status.to_string(),
+        duration_ms: 0,
+        error: plan.plan.clone(),
+        pre_oid: None,
+        post_oid: None,
+        ahead: plan.ahead,
+        behind: plan.behind,
+        unmeasurable_reason: plan.unmeasurable_reason.clone(),
+        plan: plan.plan.clone(),
+        plan_mismatch: None,
+    }
+}
+
+/// The sync itself. [`sync_repo`] wraps this; nothing else should call it.
+fn sync_repo_inner(
     conn: &Connection,
     repo: &TrackedRepo,
     opts: &SyncOptions,
@@ -581,13 +832,19 @@ pub fn sync_repo(
             // because that is the field the text renderer already prints
             // for any non-success row, and a dry run whose explanation
             // lives in a field nothing renders says nothing at all.
-            error: planned.plan,
+            error: planned.plan.clone(),
             pre_oid: pre_oid.clone(),
             post_oid: pre_oid,
             ahead: planned.ahead,
             behind: planned.behind,
             unmeasurable_reason: planned.unmeasurable_reason,
-            plan: None,
+            // The plan is the dry run's whole answer, and it is the field a
+            // consumer reads for it. It used to be `None` here while the
+            // text went into `error`, so a reader of the documented field
+            // got nothing and a reader of `error` got a sentence that is
+            // not an error. Both carry it now.
+            plan: planned.plan,
+            plan_mismatch: None,
         });
     }
 
@@ -606,6 +863,7 @@ pub fn sync_repo(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
+            plan_mismatch: None,
             });
         }
         // Clone
@@ -615,7 +873,7 @@ pub fn sync_repo(
             branch: repo.branch.clone(),
             ..Default::default()
         };
-        match ro_git::mutation::clone(&repo.clone_url, local, &clone_opts) {
+        match ro_git::mutation::clone_in(&repo.clone_url, local, &clone_opts, &opts.run_opts()) {
             Ok(outcome) => {
                 if !outcome.result.ok() {
                     let duration = start.elapsed().as_millis() as u64;
@@ -643,6 +901,7 @@ pub fn sync_repo(
                         behind: None,
                         unmeasurable_reason: None,
                         plan: None,
+            plan_mismatch: None,
                     });
                 }
                 let post_oid = ro_git::read::head_oid(local).ok().flatten();
@@ -662,6 +921,7 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 })
             }
             Err(e) => {
@@ -690,6 +950,7 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 })
             }
         }
@@ -708,6 +969,7 @@ pub fn sync_repo(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
+            plan_mismatch: None,
             });
         }
         // Fetch + pull
@@ -722,7 +984,7 @@ pub fn sync_repo(
         // grew a `--prune` or a remote name would quietly make this a
         // different command than the option struct describes.
         let fetch_opts = ro_git::mutation::FetchOpts::default();
-        if let Err(e) = ro_git::mutation::fetch(local, &fetch_opts) {
+        if let Err(e) = ro_git::mutation::fetch_in(local, &fetch_opts, &opts.run_opts()) {
             // A fetch that hit the deadline is a timeout, not a refusal, and
             // the two need different responses: a refusal is a wrong flag or
             // a bad URL, a timeout is a network that never answered and the
@@ -760,6 +1022,7 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 });
             }
             let duration = start.elapsed().as_millis() as u64;
@@ -787,6 +1050,7 @@ pub fn sync_repo(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
+            plan_mismatch: None,
             });
         }
 
@@ -851,10 +1115,11 @@ pub fn sync_repo(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
+            plan_mismatch: None,
             });
         }
 
-        let pull_result = ro_git::mutation::pull(local, &pull_opts);
+        let pull_result = ro_git::mutation::pull_in(local, &pull_opts, &opts.run_opts());
         let post_oid = ro_git::read::head_oid(local).ok().flatten();
 
         let duration = start.elapsed().as_millis() as u64;
@@ -901,6 +1166,7 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 })
             }
             // `pull` returns `Ok` when the command *ran*, not when it
@@ -932,6 +1198,7 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 })
             }
             // The command ran and failed. Distinguish a conflict from a
@@ -969,6 +1236,7 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 })
             }
             Ok(outcome) => {
@@ -1011,6 +1279,7 @@ pub fn sync_repo(
                         behind: None,
                         unmeasurable_reason: None,
                         plan: None,
+            plan_mismatch: None,
                     });
                 }
                 let err_msg = if stderr.is_empty() {
@@ -1041,6 +1310,7 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 })
             }
             Err(e) => {
@@ -1068,10 +1338,42 @@ pub fn sync_repo(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
+            plan_mismatch: None,
                 })
             }
         }
     }
+}
+
+/// The flags a sync run was invoked with, for the `runs` audit row.
+///
+/// A dry run and a real run differ in the per-repo rows but not in the run
+/// row, so the run row has to say which it was — and the deadline in force
+/// is the other fact a reader cannot recover afterwards.
+fn run_args(opts: &SyncOptions, selected: &[String]) -> Vec<String> {
+    let mut args = vec![
+        format!("strategy={}", opts.strategy),
+        format!("timeout_secs={}", opts.timeout_secs),
+    ];
+    if opts.dry_run {
+        args.push("dry_run".to_string());
+    }
+    if opts.autostash {
+        args.push("autostash".to_string());
+    }
+    if opts.clone_only {
+        args.push("clone_only".to_string());
+    }
+    if opts.pull_only {
+        args.push("pull_only".to_string());
+    }
+    if opts.prune {
+        args.push("prune".to_string());
+    }
+    if !selected.is_empty() {
+        args.push(format!("repos={}", selected.join(",")));
+    }
+    args
 }
 
 /// Sync all tracked repos.
@@ -1109,7 +1411,14 @@ pub fn sync_all(
         .filter(|r| !r.archived && !r.disabled)
         .filter(|r| selected.is_empty() || selected.contains(&r.id))
         .collect();
-    let run = ro_jobs::open_run(conn, "sync", &[]).context("opening the sync run record")?;
+    // The run row records what the run *was*. It used to be opened with an
+    // empty args slice, so every sync — dry or real, any `--timeout`, any
+    // strategy — wrote `args_json = '[]'` and the two were byte-identical
+    // in the audit trail. A reader could tell a dry run from a real one by
+    // looking at the per-repo rows, but could not tell what flags were in
+    // force, which is the question the run-level record exists to answer.
+    let run = ro_jobs::open_run(conn, "sync", &run_args(opts, selected))
+        .context("opening the sync run record")?;
     let run_id = run.id.clone();
 
     let mut results = Vec::new();
@@ -2611,6 +2920,87 @@ mod dry_run_preview {
         );
     }
 
+    /// The headline, as a test: a dry run that says "in line" over a ref
+    /// that has not been fetched is a dry run that is **wrong**, and the real
+    /// run then pulls three commits anyway.
+    ///
+    /// This is the case the brief reproduces across `behind=1` and `behind=3`,
+    /// clean and dirty, with `--autostash` and plain: the remote moved, the
+    /// checkout's `origin/main` never did, so the ahead/behind comparison —
+    /// which is correct about the ref and silent about its age — reads zero
+    /// and the plan declares victory. The real run fetches, sees three
+    /// commits, and pulls. The user trusted the dry run precisely because it
+    /// was wrong.
+    ///
+    /// A dry run cannot fix this by fetching, because fetching is a real run.
+    /// The only honest move is to qualify the claim with the age of the ref
+    /// it was measured against, which is what the plan now does. The
+    /// assertions:
+    ///
+    ///  1. the dry run's plan **carries the staleness caveat** — it says
+    ///     "in line with a ref last fetched N ago", not a bare "in line";
+    ///  2. the real run then **actually updates** the repo, proving the dry
+    ///     run was looking at a stale ref and the two views genuinely differ;
+    ///  3. the two still **agree on the verdict** (`plans_match`), because a
+    ///     repo that is merely behind is not a failure either way — the dry
+    ///     run's job is to stop the *lie*, not to invent a red.
+    #[test]
+    fn a_dry_run_never_bares_an_in_line_verdict_over_a_stale_ref() {
+        let f = stale_fleet();
+        let dry = sync_all(
+            &f.conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+
+        let plan = f
+            .by_name(&dry, "behind")
+            .plan
+            .as_deref()
+            .expect("a dry-run row must carry its plan")
+            .to_string();
+
+        // The honesty marker. Without the caveat, this reads as a fact about
+        // the remote; with it, it reads as a fact about a local ref of known
+        // (or unknown) age. This is the assertion that fails on the old
+        // implementation.
+        assert!(
+            plan.contains("A dry run does not fetch"),
+            "a dry run that measured a local ref must say the measurement is \
+             only as fresh as that ref. Got: {plan}"
+        );
+        // And it must not be the bare, unqualified claim the bug produced.
+        assert!(
+            !plan.ends_with("is in line with origin/main"),
+            "the plan must not end on a bare 'in line' — it is a claim about \
+             a ref that may be weeks old, and needs qualifying: {plan}"
+        );
+
+        // The real run genuinely disagrees about the *content* — it fetches,
+        // finds the three commits, and updates. This is the fact the dry run
+        // was measuring against a stale base for.
+        let real = sync_all(&f.conn, &SyncOptions::default(), &[]).unwrap();
+        let real_row = f.by_name(&real, "behind");
+        assert!(
+            matches!(real_row.action.as_str(), "updated" | "already_up_to_date"),
+            "the real run must actually see the three commits the dry run \
+             could not: {real_row:?}"
+        );
+
+        // ...but they agree on whether the run passes, which is the property
+        // the dry run exists to protect.
+        let dry_row = f.by_name(&dry, "behind");
+        assert!(
+            plans_match(&dry_row, &real_row),
+            "the two must agree on the verdict even as they differ on the \
+             stale-ref detail:\n  dry  = {dry_row:?}\n  real = {real_row:?}"
+        );
+    }
+
     /// `--pull-only` and `--clone-only` are two different answers for a repo
     /// that does not exist yet, and the old dry run gave both the same one
     /// (`would_clone`).
@@ -2696,6 +3086,7 @@ mod dry_run_preview {
         );
     }
 
+    #[test]
     /// A repo the real run will refuse must not read as clean in the dry run.
     ///
     /// This is the "dry run says fine, real run refuses" case at its most
@@ -2703,7 +3094,203 @@ mod dry_run_preview {
     /// real run records an error for it. A dry run that answered
     /// `would_pull` there was promising a fetch from a remote that does not
     /// exist, and the run-level exit codes disagreed (0 versus 1).
+    /// A repo whose ahead/behind **cannot be measured** must not be
+    /// reported as "in line".
+    ///
+    /// `ahead_behind` failed, so `(None, None)` arrived at the match and
+    /// fell into the same `_` arm as a genuinely measured `(0, 0)` —
+    /// printing "nothing to do — main is in line with origin/main" for a
+    /// checkout git cannot compare against anything. The truth was carried
+    /// only in `unmeasurable_reason` and a staleness parenthetical while the
+    /// headline sentence still claimed a measurement nobody made.
+    ///
+    /// This is the one lie a dry run must never tell, and it is reachable
+    /// without anything exotic: a clone killed by `--timeout` leaves a
+    /// `.git` with zero objects and `HEAD=refs/heads/.invalid`, which
+    /// `.git exists()` accepts, and which measures `(None, None)` on every
+    /// subsequent run — even after the remote is healthy again.
     #[test]
+    fn an_unmeasurable_repo_is_not_reported_as_in_line() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        // A checkout git can **read the config of** and cannot measure:
+        // `origin` is configured, so `has_remote` answers yes and the plan
+        // gets as far as the comparison — but there are no objects and
+        // `HEAD` names a ref that does not exist, so `rev-list` cannot run.
+        // This is the shape a clone killed by `--timeout` leaves behind: a
+        // `.git` directory, zero objects, `HEAD=refs/heads/.invalid`, and
+        // every "is this cloned?" check satisfied by the directory's
+        // existence.
+        // A checkout git **can** read the config of and **cannot** measure:
+        // `origin` is configured, so `has_remote` answers yes and the plan
+        // gets as far as the comparison — but the object store is empty and
+        // `HEAD` names a ref that does not exist, so `rev-list` cannot run.
+        //
+        // This is the shape a clone killed by `--timeout` leaves behind: a
+        // `.git` directory, zero objects, `HEAD=refs/heads/.invalid`, and
+        // every "is this cloned?" check satisfied by the directory being
+        // there. It is built with real git and then damaged, because a
+        // hand-written `.git` that git refuses to recognise is refused
+        // earlier, at the remotes read, and proves nothing about the arm
+        // this is here for.
+        let local = tmp.path().join("local").join("broken");
+        std::fs::create_dir_all(&local).unwrap();
+        run_git(&local, &["init", "-q", "-b", "main"]);
+        run_git(&local, &["config", "user.email", "test@example.com"]);
+        run_git(&local, &["config", "user.name", "Test"]);
+        run_git(
+            &local,
+            &["remote", "add", "origin", "https://example.com/x.git"],
+        );
+        // The damage, and the order matters. Empty the object store and
+        // point HEAD at a ref that does not exist, **before** anything is
+        // committed: with a tracked file in the index the broken object
+        // store reports it as changed, and the `skipped_dirty` guard fires
+        // before the comparison is ever reached. An empty worktree has
+        // nothing to report as changed, so the plan gets to the one
+        // question this test is about.
+        //
+        // This is the shape a clone killed by `--timeout` leaves behind: a
+        // `.git` directory, zero objects, `HEAD=refs/heads/.invalid`, and
+        // every "is this cloned?" check satisfied by the directory being
+        // there. `git remote` still answers — the config is readable — and
+        // `git rev-list` cannot run.
+        std::fs::remove_dir_all(local.join(".git").join("objects")).unwrap();
+        std::fs::create_dir_all(local.join(".git").join("objects")).unwrap();
+        std::fs::write(
+            local.join(".git").join("HEAD"),
+            "ref: refs/heads/.invalid\n",
+        )
+        .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('id-1', 'github.com', 'fleet', 'broken', 'https://example.com/x.git', ?1, ?2, ?2)",
+            params![local.to_string_lossy().to_string(), now],
+        )
+        .unwrap();
+
+        let dry = sync_all(
+            &conn,
+            &SyncOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            &[],
+        )
+        .expect("a dry run over an unmeasurable repo is a report, not a failure");
+        assert_eq!(dry.len(), 1, "the row is still reported");
+        let row = &dry[0];
+        // The verdict itself is the thing under test: "nothing to do" is
+        // what the plan said for a repo it could not measure, and it is the
+        // word a user reads and acts on. The rest of the sentence is allowed
+        // to name the ref, because the honest form has to say which
+        // comparison failed.
+        assert!(
+            !row.plan.as_deref().unwrap_or("").contains("nothing to do"),
+            "the plan must not report a repo it could not measure as one with \
+             nothing to do, got: {:?}",
+            row.plan
+        );
+        assert_eq!(
+            row.status, "error",
+            "and the run must be marked as something the user has to look at"
+        );
+        assert!(
+            row.unmeasurable_reason.is_some(),
+            "with the reason carried on the row, not folded into a headline"
+        );
+    }
+
+    /// The run row records what the run *was*.
+    ///
+    /// `sync_all` opened its `runs` row with an empty args slice, so every
+    /// sync — dry or real, any `--timeout`, any strategy — wrote
+    /// `args_json = '[]'` and a dry run and a real run were byte-identical in
+    /// the audit trail. The per-repo rows still differ, but the run-level
+    /// record could not say which kind of run it was, or what deadline was
+    /// in force.
+    #[test]
+    fn the_run_row_records_the_flags_the_run_used() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let local = tmp.path().join("local").join("clean");
+        std::fs::create_dir_all(&local).unwrap();
+        run_git(&local, &["init", "-q", "-b", "main"]);
+        run_git(&local, &["config", "user.email", "test@example.com"]);
+        run_git(&local, &["config", "user.name", "Test"]);
+        std::fs::write(local.join("a.txt"), "hello\n").unwrap();
+        run_git(&local, &["add", "."]);
+        run_git(&local, &["commit", "-q", "-m", "one"]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('id-1', 'github.com', 'fleet', 'clean', 'https://example.com/x.git', ?1, ?2, ?2)",
+            params![local.to_string_lossy().to_string(), now],
+        )
+        .unwrap();
+
+        let real = sync_all(
+            &conn,
+            &SyncOptions {
+                dry_run: false,
+                timeout_secs: 7,
+                ..Default::default()
+            },
+            &[],
+        )
+        .expect("the real run records");
+
+        // The most recent run for the fleet verb, in start order.
+        let latest_args = || -> String {
+            conn.query_row(
+                "SELECT args_json FROM runs WHERE command = 'sync' \
+                 ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
+        };
+        let real_args = latest_args();
+        assert_ne!(real.len(), 0, "the real run recorded rows");
+        assert!(
+            !real_args.contains("dry_run"),
+            "a real run must not be recorded as a dry one, got: {real_args}"
+        );
+        let dry = sync_all(
+            &conn,
+            &SyncOptions {
+                dry_run: true,
+                timeout_secs: 7,
+                ..Default::default()
+            },
+            &[],
+        )
+        .expect("the dry run records");
+        let dry_args = latest_args();
+        assert!(
+            dry_args.contains("dry_run"),
+            "the run row must say this was a dry run, got: {dry_args}"
+        );
+        assert!(
+            dry_args.contains("timeout_secs=7"),
+            "the deadline in force is part of what a run was, got: {dry_args}"
+        );
+        assert_ne!(
+            dry_args, real_args,
+            "a dry run and a real run are different runs and must not be \
+             indistinguishable in the audit trail"
+        );
+    }
+
     fn a_repo_the_real_run_cannot_fetch_is_not_reported_as_a_clean_pull() {
         let tmp = TempDir::new().unwrap();
         let conn = ro_state::open_memory().unwrap();
@@ -2812,6 +3399,66 @@ mod dry_run_preview {
             row["error"].is_string(),
             "the reason must reach json too: {row}"
         );
+        // And the documented field for it is populated, not left `None`
+        // while the text rides in `error`. A consumer reading `plan` — the
+        // field whose doc comment says it *is* the dry run's whole output —
+        // used to get null on every row.
+        assert!(
+            row["plan"].is_string(),
+            "`plan` is the documented field for the dry run's answer and it \
+             was null on every row: {row}"
+        );
+        assert_eq!(
+            row["plan"], row["error"],
+            "the plan and the reason must be the same sentence, so a reader \
+             of either field gets the whole answer: {row}"
+        );
+    }
+
+    /// `plans_match` is reachable from the binary, not only from a test.
+    ///
+    /// Pinned by reading the source rather than by behaviour, and deliberately
+    /// so. The behavioural pin is in `wedged_remote` — it observes a
+    /// `plan_mismatch` actually being recorded, which only happens if
+    /// production code called the function. This one is the belt to that
+    /// braces: if a future refactor moves the prediction behind a flag, or
+    /// deletes the call and leaves the function, the behavioural test still
+    /// catches it, and if a rename breaks the wiring this catches it before
+    /// the behavioural one has to.
+    ///
+    /// Checked against the **production** text only, because the whole bug was
+    /// that this function's only call sites were below the test boundary. The
+    /// boundary is the first `#[cfg(test)]` that starts an actual `mod`
+    /// (indented, followed by a `mod` line) — a bare `#[cfg(test)]` inside a
+    /// doc comment is prose about the very thing this test is checking, and
+    /// using it as the split would have put the whole production half on the
+    /// wrong side of the line.
+    #[test]
+    fn plans_match_is_called_from_production_code_and_not_only_from_tests() {
+        let source = include_str!("sync.rs");
+        // A test module opens as `#[cfg(test)]\nmod ...`; find the first such
+        // pair and treat everything before it as production.
+        let split = source
+            .find("#[cfg(test)]\nmod ")
+            .or_else(|| source.find("#[cfg(test)]\r\nmod "))
+            .expect("this file has test modules; the split point must exist");
+        let (production, _tests) = source.split_at(split);
+
+        // The definition does not count as a call. Counting `plans_match(` in
+        // the production half and subtracting the `pub fn` definition leaves
+        // only real call sites, and the invariant is that at least one
+        // survives above the boundary.
+        let mentions = production.matches("plans_match(").count();
+        let definition = production.matches("pub fn plans_match(").count();
+        let calls = mentions - definition;
+        assert!(
+            calls > 0,
+            "`plans_match` must be CALLED from production code, not just \
+             defined there. It is defined at line ~308 but the only call is \
+             below the `#[cfg(test)]` boundary — a comment with a test \
+             attached, which a comment cannot enforce. (found {mentions} \
+             mentions, {definition} of them the definition)"
+        );
     }
 }
 
@@ -2840,6 +3487,7 @@ mod run_exit_code_tests {
             behind: None,
             unmeasurable_reason: None,
             plan: None,
+            plan_mismatch: None,
         }
     }
 
@@ -3390,6 +4038,314 @@ mod deadline {
             ro_git::mutation::RunOpts::none().timeout,
             None,
             "a caller that asks for no deadline must not be handed one"
+        );
+    }
+}
+
+/// ── A remote that never answers ──
+#[cfg(test)]
+mod wedged_remote {
+    use super::*;
+    use tempfile::TempDir;
+
+/// A TCP listener     that completes the handshake and then never answers.
+    ///
+    /// This is the shape of the failure `--timeout` exists for: a server that
+    /// accepts the connection and says nothing, so the client waits for bytes
+    /// that never come. Measured against a real one of these, `git fetch` runs
+    /// until something **outside** the process kills it — 50 seconds and exit
+    /// 124 in the original report — which is the entire bug: a flag documented
+    /// as a deadline that did not fire.
+    ///
+    /// The socket is deliberately **not** closed on accept. A closed socket is a
+    /// connection reset, which git reports promptly and which ro already handles
+    /// correctly; the hang is the thing under test, so the connection stays open
+    /// and silent for [`BLACK_HOLE_SECS`].
+    ///
+    /// The hold is bounded rather than infinite so that a build where the
+    /// deadline is *not* working still terminates this test: the socket then
+    /// closes of its own accord, git errors out, and the elapsed-time assertion
+    /// below fails on a real number instead of hanging the suite forever.
+    const BLACK_HOLE_SECS: u64 = 15;
+
+    struct BlackHoleServer {
+        port: u16,
+    }
+
+    impl BlackHoleServer {
+        fn start() -> Self {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener is bindable");
+            let port = listener
+                .local_addr()
+                .expect("a bound listener has an address")
+                .port();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    // One holder thread per accepted connection. `_held` keeps
+                    // the socket alive for the length of the sleep; dropping it
+                    // would be the reset this fixture is built to avoid.
+                    std::thread::spawn(move || {
+                        let _held = stream;
+                        std::thread::sleep(Duration::from_secs(BLACK_HOLE_SECS));
+                    });
+                }
+            });
+            Self { port }
+        }
+
+        /// A `git://` URL pointing at this listener. `git://` rather than
+        /// `https://` because the fixture must not depend on a TLS stack, and
+        /// because git's protocol handshake is exactly where it waits.
+        fn url(&self) -> String {
+            format!("git://127.0.0.1:{}/wedged.git", self.port)
+        }
+    }
+
+    /// A real fetch against a remote that never answers is cut off at the
+    /// deadline — and the repo after it still syncs.
+    ///
+    /// Red-first, and red the way the bug was: `--timeout 3` was enforced on
+    /// exactly one git call in a whole sync, and that one was `git remote prune`
+    /// — a command that touches nothing but local bookkeeping. The three calls
+    /// that actually talk to a network (`fetch`, `pull`, `clone`) went out with
+    /// `RunOpts::none()`, so the flag was a no-op for the failure it was written
+    /// for, and a wedged remote wedged the fleet.
+    ///
+    /// Asserted end to end through [`sync_all`], over a real bare remote and a
+    /// real TCP listener, because the bug was never in `run_in` — that has killed
+    /// hung children correctly all along. The bug was that the sync's fetch never
+    /// handed it a deadline to enforce. A test of `run_in` alone, the way the
+    /// suite already had one, passes on a build where the flag does nothing.
+    ///
+    /// The three assertions are the three halves of the guarantee:
+    ///
+    ///  1. it returns in about the timeout, not in about forever;
+    ///  2. the wedged repo is an **error** — a timeout is not a success and not
+    ///     a silent skip;
+    ///  3. **the next repo in the fleet still runs.** A deadline that kills the
+    ///     wedged git and then takes the run down with it is not a deadline, it
+    ///     is a fleet-wide hang with a tidier error message.
+    #[test]
+    fn a_wedged_remote_is_cut_off_at_the_deadline_and_the_next_repo_still_runs() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let black_hole = BlackHoleServer::start();
+
+        let remote = super::tests::init_bare_remote(tmp.path());
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        // The wedged repo: an ordinary checkout, with `origin` repointed at a
+        // server that accepts and never answers. Everything before the fetch —
+        // the prediction, the dirty check, the ahead/behind read — succeeds
+        // locally, so the fetch is the first thing to touch the network and the
+        // first thing to have to be killed.
+        let wedged = tmp.path().join("local").join("wedged");
+        std::fs::create_dir_all(&wedged).unwrap();
+        let clone = super::tests::run_git(&wedged, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(
+            clone.status.success(),
+            "the wedged fixture must be a real checkout: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+        let repoint = super::tests::run_git(
+            &wedged,
+            &["remote", "set-url", "origin", &black_hole.url()],
+        );
+        assert!(
+            repoint.status.success(),
+            "the origin repoint failed: {}",
+            String::from_utf8_lossy(&repoint.stderr)
+        );
+
+        // The healthy repo: the same real remote, left alone. This is the one
+        // that proves the run moved on rather than aborting.
+        let healthy = tmp.path().join("local").join("healthy");
+        std::fs::create_dir_all(&healthy).unwrap();
+        let clone = super::tests::run_git(&healthy, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(
+            clone.status.success(),
+            "the healthy fixture must be a real checkout: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for (id, name, path) in [
+            ("id-wedged", "wedged", &wedged),
+            ("id-healthy", "healthy", &healthy),
+        ] {
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    id,
+                    name,
+                    remote.to_string_lossy().to_string(),
+                    path.to_string_lossy().to_string(),
+                    now
+                ],
+            )
+            .unwrap();
+        }
+
+        let started = Instant::now();
+        let results = sync_all(
+            &conn,
+            &SyncOptions {
+                timeout_secs: 3,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+
+        let wedged_row = results
+            .iter()
+            .find(|r| r.repo_id == "id-wedged")
+            .expect("the wedged repo has a row");
+        let healthy_row = results
+            .iter()
+            .find(|r| r.repo_id == "id-healthy")
+            .expect("the healthy repo has a row");
+
+        // 1. About the deadline, and nowhere near the hold the fixture keeps the
+        //    silent connection open for. On a build where the deadline is not
+        //    reaching the fetch, this run cannot finish before the socket is
+        //    closed for it, so this number is the bug and not a flake.
+        assert!(
+            elapsed < Duration::from_secs(9),
+            "the run took {elapsed:?} against a remote that never answers. The \
+             deadline is not reaching the fetch: without it this call blocks until \
+             something outside ro kills it."
+        );
+
+        // 2. A timeout is an error, and says what happened. Not a skip — a
+        //    "skipped" row here would be indistinguishable from a healthy repo.
+        assert_eq!(
+            wedged_row.status, "error",
+            "a fetch that ran out of time is an error, got {wedged_row:?}"
+        );
+        let why = wedged_row.error.as_deref().unwrap_or_default();
+        assert!(
+            why.contains("did not finish within") || why.contains("killed"),
+            "the row must say the git was killed at the deadline, so the user can \
+             tell a wedged network from a bad URL. Got: {why}"
+        );
+
+        // 3. The fleet moved on. This is the assertion that makes the other two
+        //    worth having: `--timeout` exists so one bad repo cannot stop the
+        //    other nineteen.
+        assert_eq!(
+            healthy_row.status, "success",
+            "the repo after the wedged one must still sync; a timeout that takes \
+             the run down with it is not a timeout. Got {healthy_row:?}"
+        );
+
+        // And the run-level verdict agrees: a repo we could not reach is not a
+        // good run, and a script driving ro has to be able to see that.
+        assert_eq!(
+            run_exit_code(&results),
+            1,
+            "a fleet containing a repo the deadline cut off must not exit 0"
+        );
+    }
+
+    /// The prediction mismatch this run recorded, and that it did not fail on.
+    ///
+    /// Two properties in one, because they are the same decision seen from both
+    /// sides.
+    ///
+    /// **It is recorded.** The prediction for the wedged repo was made from
+    /// local state, before the fetch: its `origin/main` had not moved, so the
+    /// plan said the repo was in line and the run would pass. The run then failed
+    /// it. `plans_match` is the function that encodes exactly this invariant, and
+    /// until this change it was `pub`, documented as *the* property, and called
+    /// from `#[cfg(test)]` and nowhere else — a function that cannot be reached
+    /// from the binary is a comment with a test attached, and a comment does not
+    /// stop the next divergence. A `Some` here is that call being reached from
+    /// production code, observed as behaviour rather than by reading the source.
+    ///
+    /// **It does not fail the run**, and the asymmetry is the point. This repo
+    /// *was* an error, so the exit code is already 1 and the user already knows.
+    /// The reverse case is the one that would make a naive wiring actively
+    /// harmful: a repo the plan wrongly predicted would fail but that synced
+    /// perfectly is a healthy repo, and failing the run for it would turn the
+    /// tool's own staleness into a red fleet board — which is how an exit code
+    /// stops meaning anything and starts being ignored.
+    #[test]
+    fn a_prediction_that_did_not_hold_is_reported_without_failing_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let black_hole = BlackHoleServer::start();
+
+        let remote = super::tests::init_bare_remote(tmp.path());
+        super::tests::commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let wedged = tmp.path().join("local").join("wedged");
+        std::fs::create_dir_all(&wedged).unwrap();
+        let clone = super::tests::run_git(&wedged, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(clone.status.success());
+        let repoint = super::tests::run_git(
+            &wedged,
+            &["remote", "set-url", "origin", &black_hole.url()],
+        );
+        assert!(repoint.status.success());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('id-wedged', 'github.com', 'fleet', 'wedged', ?1, ?2, ?3, ?3)",
+            params![
+                remote.to_string_lossy().to_string(),
+                wedged.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .unwrap();
+
+        let results = sync_all(
+            &conn,
+            &SyncOptions {
+                timeout_secs: 3,
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        let row = &results[0];
+
+        assert!(
+            row.plan_mismatch.is_some(),
+            "the plan said this repo was in line and the run could not reach it, so \
+             the prediction was wrong. `plans_match` must be reached from \
+             production code for that to be noticed at all — it used to be called \
+             only from tests. Got {row:?}"
+        );
+        let why = row.plan_mismatch.as_deref().unwrap_or_default();
+        assert!(
+            why.contains("in line") && why.contains("error"),
+            "the mismatch must name what was predicted and what happened, so it is \
+             actionable. Got: {why}"
+        );
+        // And the decision that makes this safe to leave on by default: the run
+        // is not failed *because of the mismatch*. It fails on the error, which
+        // is a real fact about the repo.
+        assert_eq!(
+            row.status, "error",
+            "the mismatch must not rewrite what actually happened to the repo"
+        );
+        assert_eq!(
+            run_exit_code(&results),
+            1,
+            "the run fails because the repo could not be synced, not because the \
+             preview was wrong"
         );
     }
 }

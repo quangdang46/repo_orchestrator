@@ -63,6 +63,27 @@ pub fn resolve_targets(
     let tracked = crate::manage::list(conn, None)?;
     let mut targets = Vec::new();
 
+    // Every token was asked for by name; report the ones that resolved to
+    // nothing, even when a sibling token hit.
+    //
+    // A token list is a **union**, so `ro status alpha beta` selects both —
+    // `tokens.iter().any(...)` is the right per-repo test and stays. What
+    // was missing is the answer to a different question: did every name I
+    // typed name something? Without it, `ro status alpha nosuchrepo`
+    // printed `work/alpha` and said nothing about `nosuchrepo` — exit 0,
+    // no warning — while `ro status nosuchrepo` alone exited 64 naming it.
+    // The same typo had two different answers depending on whether a
+    // sibling name happened to hit, and the all-miss message proved the tool
+    // knew both names were asked for and resolved neither. A typo in a
+    // fleet command's repo list is invisible, and on the verbs that act
+    // (`sync`, `commit`, `push`, `ship`) it is a run that quietly does less
+    // than the user asked for and reports success.
+    //
+    // Recorded during the loop rather than re-derived afterwards, so an
+    // alias or a row id counts as a hit on exactly the same terms the
+    // selection itself used.
+    let mut token_hit = vec![false; tokens.len()];
+
     for repo in &tracked {
         // `archived = 0 AND disabled = 0` is the default, not a filter
         // somebody remembered to apply at the call site. A row the user
@@ -71,7 +92,18 @@ pub fn resolve_targets(
         // a fleet run that reached it would be doing something the user
         // said not to do. `--include-archived` is the way back, which is
         // what makes excluding it safe to do by default.
-        if !include_archived && (repo.archived || repo.disabled) {
+        //
+        // The two `has:` selectors that *name* the retired state are the
+        // exception, and they have to be: the skip ran first, so
+        // `has:archived` and `has:disabled` could never reach the arm that
+        // answers them, and both returned an empty run with exit 0. Two of
+        // the three selectors the tool's own error message names by name
+        // were structurally unreachable — a user asking "which of my repos
+        // did I retire?" was told there were none.
+        let asks_for_retired = filter
+            .map(|f| f == "has:archived" || f == "has:disabled")
+            .unwrap_or(false);
+        if !include_archived && !asks_for_retired && (repo.archived || repo.disabled) {
             continue;
         }
         let label = format!("{}/{}", repo.owner, repo.name);
@@ -99,12 +131,16 @@ pub fn resolve_targets(
             // one repo, and the alternative — refusing an ambiguous name —
             // would break the common single-owner fleet this is written
             // for.
-            tokens.iter().any(|(tok, m)| {
-                m.as_ref().is_some_and(|g| g.is_match(&label))
+            tokens.iter().enumerate().any(|(i, (tok, m))| {
+                let hit = m.as_ref().is_some_and(|g| g.is_match(&label))
                     || repo.alias.as_deref() == Some(tok.as_str())
                     || label == *tok
                     || repo.id == *tok
-                    || repo.name == *tok
+                    || repo.name == *tok;
+                if hit {
+                    token_hit[i] = true;
+                }
+                hit
             })
         } else if let Some(f) = filter {
             matches_filter(conn, &repo.id, &label, f)?
@@ -132,15 +168,61 @@ pub fn resolve_targets(
         });
     }
 
+    if !tokens.is_empty() {
+        let missed: Vec<&str> = tokens
+            .iter()
+            .zip(token_hit.iter())
+            .filter(|(_, hit)| !**hit)
+            .map(|((t, _), _)| t.as_str())
+            .collect();
+        if !missed.is_empty() {
+            bail!(
+                "no repo matched {}",
+                missed
+                    .iter()
+                    .map(|m| format!("`{m}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
     Ok(targets)
 }
 
 /// Read one boolean fact about a tracked repo, for `--filter has:`.
+///
+/// `cloned` is answered from the **filesystem**, not from the row. It
+/// used to run `SELECT CASE WHEN local_path = '' THEN 0 ELSE 1 END`,
+/// which asks whether a path was ever *recorded* on the row — so a repo
+/// whose working copy has been deleted still answered "yes, cloned", and
+/// `ro status --filter has:cloned` handed the user the repos that are
+/// already gone, each carrying `"unmeasurable_reason":"not cloned"` in the
+/// same run that selected it. The selector named after the fact did not
+/// check the fact, and contradicted the status row printed beside it.
+///
+/// The two other flags are row facts and are answered from the row. A
+/// repo with no recorded `local_path` has no conventional path to check
+/// against, so it is reported as not cloned — the same answer the status
+/// board gives it.
 fn matches_filter_repo(conn: &ro_state::Connection, repo_id: &str, flag: &str) -> bool {
+    if flag == "cloned" {
+        let local_path: String = conn
+            .query_row(
+                "SELECT local_path FROM repos WHERE id = ?1",
+                rusqlite::params![repo_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        if local_path.is_empty() {
+            return false;
+        }
+        return Path::new(&local_path).join(".git").exists();
+    }
     let sql = match flag {
         "archived" => "SELECT archived FROM repos WHERE id = ?1",
         "disabled" => "SELECT disabled FROM repos WHERE id = ?1",
-        _ => "SELECT CASE WHEN local_path = '' THEN 0 ELSE 1 END FROM repos WHERE id = ?1",
+        _ => "SELECT 0",
     };
     conn.query_row(sql, rusqlite::params![repo_id], |r| r.get::<_, i64>(0))
         .map(|v| v != 0)
@@ -213,17 +295,112 @@ pub(crate) fn effective_health_score(
     (stored - (failed * 5).min(30)).max(0)
 }
 
+/// The range a health score is clamped to.
+///
+/// `score_repo_health` in `ro-state` clamps with `score.clamp(0, 100)` and
+/// [`effective_health_score`] floors at zero, so these are the only two
+/// values no repository can ever leave.
+const HEALTH_FLOOR: i64 = 0;
+const HEALTH_CEILING: i64 = 100;
+
+/// Does one repo satisfy `--filter health:<threshold>`?
+///
+/// The comparison is `score <= threshold` — **inclusive**, and which end is
+/// the bug is a decision worth writing down rather than rediscovering.
+///
+/// The score is a damage scale: 100 is a repo with nothing wrong with it, 0
+/// is the worst state the scorer can express. A user asking for "the sick
+/// repos" types a small N, and under a strict `<` comparison a repo that had
+/// failed its way down to exactly 0 was reachable by *no* threshold a person
+/// types — the sickest repos in the fleet were the only ones the sick-repo
+/// filter could never return, and `health:0` was a selector that could not
+/// select anything at all. The inclusive end makes the smallest threshold
+/// mean what it reads as: only the repos at the bottom of the scale.
+///
+/// The *other* end is where a selector becomes dangerous, and it is where
+/// the fleet-wide run happened. The comparison used to be `score < N` with
+/// no bound on N, and it was never checked against the score's own range, so
+/// the comparison was simply always true: `--filter health:999`,
+/// `health:1000` and `health:1000000` each selected every repo in the fleet
+/// and `ro sync` ran a real sync against all of them, reporting success. A
+/// user who asked for the sick repos and got the whole fleet was handed a
+/// run with their credentials on every repository, and the flag's own
+/// guarantee — a selector that matches nothing selects nothing, never
+/// everything — was false for exactly one selector kind.
+///
+/// So a threshold that cannot narrow is a **usage error**, refused the way a
+/// `--tag` nobody carries is refused rather than widened. Both impossible
+/// ends are refused, and the reason each is impossible is different:
+///
+/// * `threshold >= HEALTH_CEILING` — no repo can score above 100, so every
+///   repo is `<= threshold`. It is `--all` wearing a filter's clothes.
+/// * `threshold < HEALTH_FLOOR` — no repo can score below 0, so every repo
+///   is `> threshold`. It can match nothing, and the rule for a selector
+///   that matches nothing is that it matches *nothing*; refusing it is the
+///   strictest form of that, and it turns a typo into a message instead of a
+///   silent empty run.
+///
+/// What is deliberately *not* refused is a valid threshold that happens to
+/// match no repo — `health:50` over a fleet where everything is healthy
+/// selects nothing, and says so, which is the answer the user asked for.
+fn matches_health(conn: &ro_state::Connection, repo_id: &str, threshold: i64) -> Result<bool> {
+    if threshold >= HEALTH_CEILING {
+        bail!(
+            "--filter health:{threshold} would select every repo. A health score is at most \
+             {HEALTH_CEILING}, so no repository can score above this threshold and the filter \
+             cannot narrow anything. Nothing was selected. Use a threshold below {HEALTH_CEILING} \
+             to ask for the repos that need a human, or --all to mean the whole fleet."
+        );
+    }
+    if threshold < HEALTH_FLOOR {
+        bail!(
+            "--filter health:{threshold} cannot select any repo. A health score is never below \
+             {HEALTH_FLOOR}, so this threshold is below every score a repo can have. Nothing was \
+             selected."
+        );
+    }
+    let snap = ro_state::queries::score_repo_health(conn, repo_id).ok();
+    Ok(snap.is_some_and(|s| effective_health_score(conn, repo_id, s.score) <= threshold))
+}
+
 /// Does one repo satisfy `--filter`?
 ///
 /// An **unrecognised** filter is an error, not a silent false. `has:x`
 /// used to match everything, which meant a typo quietly selected the whole
 /// fleet — the same failure as the glob fallback, in the other selector.
+///
+/// Every selector kind answers "you matched nothing" the same way, because
+/// the same typo must not produce a different answer depending on which
+/// flag the user reached for. `tag:` and `has:` already do: they return
+/// `false` for a repo that does not carry the fact, and the caller turns an
+/// all-`false` result into "nothing selected". `health:` is the one kind
+/// that could not do that — see [`matches_health`].
 fn matches_filter(
     conn: &ro_state::Connection,
     repo_id: &str,
     _label: &str,
     filter: &str,
 ) -> Result<bool> {
+
+    // A filter with a space in it is two filters, and the tool's own
+    // refusal message says so: "`--tag` is shorthand for `--filter tag:<T>`
+    // — pass the tag form, or fold it into a single `--filter` expression."
+    // Following that instruction exactly produced `--filter 'tag:work
+    // tag:infra'`, which reached here as one string, whose `strip_prefix`
+    // yielded the literal tag name "work tag:infra" — matching nothing,
+    // silently, with exit 0, in all three formats. The workaround the
+    // error message spells out was the thing that did not work.
+    //
+    // Refusing is the honest answer: a multi-token filter is a typo, and
+    // the alternative — matching nothing and reporting an empty run — is
+    // indistinguishable from "none of your repos match".
+    if filter.contains(char::is_whitespace) {
+        bail!(
+            "--filter {filter:?} contains whitespace. A single --filter takes a \
+             single expression — pass `--tag` for a tag, or fold several \
+             conditions into one expression with no spaces."
+        );
+    }
     // `health:<N>` in the docs is a *placeholder*, not a literal — the angle
     // brackets are the manual's way of writing "a number here". The prefix
     // match required them anyway, so `health:50` matched no branch, fell
@@ -238,8 +415,7 @@ fn matches_filter(
             .trim_end_matches(['>', ' '])
             .parse::<i64>()
             .with_context(|| format!("--filter health:<N> needs a number, got {rest:?}"))?;
-        let snap = ro_state::queries::score_repo_health(conn, repo_id).ok();
-        return Ok(snap.is_some_and(|s| effective_health_score(conn, repo_id, s.score) < threshold));
+        return matches_health(conn, repo_id, threshold);
     }
 
     // Tags live in `repo_tags`, not in the label. Matching on `owner/name`
@@ -270,13 +446,16 @@ fn matches_filter(
     // on every repository.
     if let Some(flag) = filter.strip_prefix("has:") {
         return match flag {
-            "archived" | "disabled" | "cloned" => Ok(matches_filter_repo(conn, repo_id, flag)),
+            "archived" | "disabled" | "cloned" => {
+                Ok(matches_filter_repo(conn, repo_id, flag))
+            }
             other => bail!(
                 "unknown --filter has:{other}. \
                  Expected has:archived, has:disabled or has:cloned."
             ),
         };
     }
+
 
     bail!("unknown --filter {filter:?}. Expected health:<N>, tag:<name>, or has:<flag>.")
 }
@@ -687,14 +866,130 @@ mod filter_contract {
             0,
             "neither fixture row is disabled"
         );
-        // Both rows carry a local_path, so both are cloned. The assertion
-        // is that the flag reads the *row* rather than answering `true`
-        // for everything, which is what it used to do for any suffix.
-        assert_eq!(selected(&conn, "has:cloned").len(), 3);
+        // `cloned` is answered from the **filesystem**, not from the row.
+        // It used to run `SELECT CASE WHEN local_path = '' THEN 0 ELSE 1`,
+        // which asks whether a path was *recorded* — so a repo whose
+        // working copy has been deleted still answered "yes, cloned", and
+        // `ro status --filter has:cloned` handed the user the repos that
+        // are already gone, each carrying `"unmeasurable_reason": "not
+        // cloned"` in the same run that selected it.
+        //
+        // The fixture's rows name `/s/<name>`, which does not exist on this
+        // machine, so the honest answer is "none of them are cloned" —
+        // and it is the opposite of what the row-recorded test asserted.
+        assert_eq!(
+            selected(&conn, "has:cloned").len(),
+            0,
+            "a recorded path is not a working copy; a repo whose directory is \
+             gone is not cloned"
+        );
+    }
+
+    /// The same selector, with the worktrees actually on disk: it must now
+    /// select them. A `has:` flag that can never match is not a selector.
+    #[test]
+    fn has_cloned_selects_repos_whose_worktree_exists() {
+        let (t, conn) = fixture();
+        for name in ["api", "oss", "svc"] {
+            std::fs::create_dir_all(t.path().join(name).join(".git")).unwrap();
+            conn.execute(
+                "UPDATE repos SET local_path = ?1 WHERE id = ?2",
+                rusqlite::params![
+                    t.path().join(name).to_string_lossy().to_string(),
+                    format!("id-{name}")
+                ],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            selected(&conn, "has:cloned").len(),
+            3,
+            "three worktrees exist; the selector named after the fact must \
+             be able to match it"
+        );
+
+        // And deleting one removes exactly one from the answer.
+        std::fs::remove_dir_all(t.path().join("api")).unwrap();
+        assert_eq!(
+            selected(&conn, "has:cloned"),
+            vec!["id-oss".to_string(), "id-svc".to_string()],
+            "a deleted working copy stops being cloned"
+        );
     }
 
     /// The failure this function's own comment warns about: an
     /// unrecognised flag that quietly selects the whole fleet.
+    /// A filter containing whitespace is two filters, and the tool's own
+    /// refusal message says so: "`--tag` is shorthand for `--filter
+    /// tag:<T>` — pass the tag form, or fold it into a single `--filter`
+    /// expression." Following that instruction exactly produced
+    /// `--filter 'tag:work tag:infra'`, which reached `matches_filter` as one
+    /// string whose `strip_prefix("tag:")` yielded the literal tag name
+    /// "work tag:infra" — matching nothing, silently, exit 0, all three
+    /// formats. The workaround the error message spells out was the thing
+    /// that did not work.
+    #[test]
+    fn a_filter_containing_whitespace_is_refused_rather_than_matching_nothing() {
+        let (_t, conn) = fixture();
+        let err = resolve_targets(
+            &conn,
+            None,
+            Some("tag:work tag:infra"),
+            false,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .expect_err("a two-token filter is a typo, not a filter that matches nothing");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("whitespace") && msg.contains("tag:work tag:infra"),
+            "the message must name the problem and the value, got: {msg}"
+        );
+    }
+
+    /// A name that matches nothing is reported **even when a sibling name
+    /// hit**.
+    ///
+    /// `tokens.iter().any(...)` is a union — `ro status alpha beta` must
+    /// select both — so a non-matching token contributed `false` and
+    /// vanished: `ro status alpha nosuchrepo` printed `work/alpha` and said
+    /// nothing about `nosuchrepo`, exit 0, no warning, while
+    /// `ro status nosuchrepo` alone exited 64 naming it. The same typo had
+    /// two different answers depending on whether a sibling happened to
+    /// hit, and on `sync`/`commit`/`push`/`ship` it is a run that quietly
+    /// does less than the user asked for and reports success.
+    #[test]
+    fn a_name_that_misses_is_reported_even_when_a_sibling_name_hits() {
+        let (_t, conn) = fixture();
+        let both = resolve_targets(
+            &conn,
+            Some("api nosuchrepo"),
+            None,
+            false,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .expect_err("one of the two names named nothing");
+        let msg = format!("{both:#}");
+        assert!(
+            msg.contains("nosuchrepo"),
+            "the miss must be named, got: {msg}"
+        );
+
+        // And the union itself still works: two names that both hit select
+        // both, and nothing is reported.
+        let union = resolve_targets(
+            &conn,
+            Some("api svc"),
+            None,
+            false,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .expect("two real names are not an error");
+        assert_eq!(union.len(), 2, "a token list is a union, not an intersection");
+    }
+
     #[test]
     fn an_unknown_has_flag_is_an_error_not_the_whole_fleet() {
         let (_t, conn) = fixture();
@@ -752,7 +1047,7 @@ mod filter_contract {
     /// score is read.
     #[test]
     fn a_repo_whose_work_is_in_an_autostash_is_not_scored_healthy() {
-        let (tmp, conn) = fixture();
+        let (_tmp, conn) = fixture();
         // `sync_results` is unique per (run, repo), and `run_id` is a
         // foreign key — which is the whole reason the table was empty for so
         // long. Two real runs are opened rather than a made-up id, so the
@@ -829,6 +1124,355 @@ mod filter_contract {
     }
 }
 
+/// The health threshold, at both ends of the range it can take.
+///
+/// The bug: `--filter health:999` over a five-repo fleet selected all five,
+/// and `ro sync` ran a real sync against every one of them and reported
+/// success. `health:1000` and `health:1000000` did the same. The comparison
+/// was `score < N` with `N` unbounded, and a `N` above the maximum score of
+/// 100 is *always* true — so the one selector that could never fail to match
+/// was also the one selector with no way to say "nothing".
+#[cfg(test)]
+mod health_threshold_boundary {
+    use super::*;
+
+    /// A fleet of five healthy repos — the shape the bad measurement was
+    /// taken against, and the shape that makes a widening selector
+    /// indistinguishable from a correct one.
+    fn five_healthy_repos() -> (tempfile::TempDir, ro_state::Connection) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for name in ["api", "web", "cli", "docs", "svc"] {
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'acme', ?2, 'https://example.com/x.git', ?3, ?4, ?4)",
+                rusqlite::params![format!("id-{name}"), name, format!("/s/{name}"), now],
+            )
+            .unwrap();
+        }
+        (tmp, conn)
+    }
+
+    fn select(conn: &ro_state::Connection, filter: &str) -> Vec<String> {
+        resolve_targets(
+            conn,
+            None,
+            Some(filter),
+            true,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .map(|t| t.into_iter().map(|x| x.repo_id).collect())
+        .unwrap_or_default()
+    }
+
+    /// The headline bug, as a test.
+    ///
+    /// A threshold above the maximum possible score cannot narrow anything,
+    /// so it is refused — a usage error the caller turns into EX_USAGE, the
+    /// same refusal a `--tag` nobody carries gets. Before the fix this
+    /// returned all five repos, and the caller saw a non-empty selection and
+    /// synced every one of them.
+    #[test]
+    fn a_health_threshold_above_the_maximum_score_is_refused_not_the_whole_fleet() {
+        for threshold in ["999", "1000", "1000000", "100", "101"] {
+            let (_t, conn) = five_healthy_repos();
+            let err = resolve_targets(
+                &conn,
+                None,
+                Some(&format!("health:{threshold}")),
+                true,
+                std::path::Path::new("/s"),
+                false,
+            )
+            .expect_err("a threshold that cannot narrow must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(threshold),
+                "the error must name the threshold the user typed \
+                 (`{threshold}`), got: {msg}"
+            );
+            assert!(
+                msg.contains("100"),
+                "the error must say what the ceiling is, got: {msg}"
+            );
+        }
+    }
+
+    /// The threshold above the maximum, the way a user actually reaches it.
+    ///
+    /// Asserted through `resolve_targets` rather than the leaf so that the
+    /// whole path is covered, and so that the fix cannot be "make the
+    /// comparison false" — which would pass the previous test and break this
+    /// one, and leave the flag able to select nothing for `health:0`.
+    #[test]
+    fn the_documented_angle_bracket_spelling_is_refused_at_the_top_too() {
+        let (_t, conn) = five_healthy_repos();
+        let err = resolve_targets(
+            &conn,
+            None,
+            Some("health:<999>"),
+            false,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .expect_err("the documented spelling gets the same refusal");
+        assert!(
+            format!("{err:#}").contains("999"),
+            "got: {err:#}"
+        );
+    }
+
+    /// The negative control, and the reason this test can mean anything.
+    ///
+    /// With the threshold gone, the very same call selects all five. So a
+    /// fix that merely made `health:999` select nothing — by breaking the
+    /// comparison rather than by refusing the threshold — is caught here,
+    /// and a fix that made *every* threshold select nothing is caught too.
+    #[test]
+    fn the_same_call_without_a_filter_still_selects_the_whole_fleet() {
+        let (_t, conn) = five_healthy_repos();
+        assert_eq!(select(&conn, "tag:work").len(), 0, "a tag nobody has");
+        let all = resolve_targets(
+            &conn,
+            None,
+            None,
+            true,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            all.len(),
+            5,
+            "the fleet is still reachable; the refusal is scoped to the \
+             impossible threshold, not to the resolver"
+        );
+    }
+
+    /// The lower end, and the boundary itself.
+    ///
+    /// `health:0` is a real request — "only the repos at the bottom of the
+    /// scale" — and the score really does go to 0 (100 − 30 archived − 50
+    /// disabled − 30 failed runs, clamped). Under the old `score < N`
+    /// comparison a repo sitting at exactly 0 was reachable by **no**
+    /// threshold a person types, so `health:0` selected nothing, always: the
+    /// sickest repos in the fleet were the only ones the sick-repo filter
+    /// could never return. The comparison is inclusive now, and both sides
+    /// of the boundary are asserted here rather than one of them assumed.
+    #[test]
+    fn health_zero_selects_the_repos_at_the_bottom_of_the_scale() {
+        let (_t, conn) = five_healthy_repos();
+        // Drive one repo to a score of exactly 0: archived (-30), disabled
+        // (-50) and failed runs (-30) is 110, clamped to 0. `run_id` is a
+        // foreign key, so the runs are opened for real rather than invented.
+        conn.execute(
+            "UPDATE repos SET archived = 1, disabled = 1 WHERE id = 'id-api'",
+            [],
+        )
+        .unwrap();
+        for _ in 0..6 {
+            let run = ro_jobs::open_run(&conn, "sync", &[]).unwrap();
+            conn.execute(
+                "INSERT INTO sync_results
+                 (run_id, repo_id, action, status, duration_ms, error, pre_oid, post_oid)
+                 VALUES (?1, 'id-api', 'pull', 'error', 1, NULL, NULL, NULL)",
+                rusqlite::params![run.id],
+            )
+            .unwrap();
+            ro_jobs::finalize_run(&conn, &run.id, 1).unwrap();
+        }
+        // Only `id-api` is archived, so it is reachable with the flag.
+        let at_zero = resolve_targets(
+            &conn,
+            None,
+            Some("health:0"),
+            true,
+            std::path::Path::new("/s"),
+            true,
+        )
+        .unwrap();
+        let ids: Vec<String> = at_zero.into_iter().map(|t| t.repo_id).collect();
+        assert_eq!(
+            ids,
+            vec!["id-api".to_string()],
+            "a repo at the bottom of the scale is selected by the smallest \
+             threshold, and nothing else in a healthy fleet is"
+        );
+
+        // The other side of the same boundary: a healthy repo scores 100 and
+        // is not at the bottom, so it must not be swept in by `health:0`.
+        assert!(
+            !ids.iter().any(|id| id == "id-svc"),
+            "a healthy repo is not a critical one"
+        );
+    }
+
+    /// A valid threshold that happens to match nothing selects nothing.
+    ///
+    /// This is the other half of the guarantee, and the half that is easy to
+    /// break while fixing the first: "refuse the impossible" must not become
+    /// "refuse everything", because `health:50` over a healthy fleet is a
+    /// perfectly good question with a perfectly good answer — none of them
+    /// need a human.
+    #[test]
+    fn a_valid_threshold_over_a_healthy_fleet_selects_nothing_and_succeeds() {
+        let (_t, conn) = five_healthy_repos();
+        assert_eq!(
+            select(&conn, "health:50"),
+            Vec::<String>::new(),
+            "no repo scores at most 50, so none is selected — and the call \
+             succeeds, because that is a real answer to a real question"
+        );
+    }
+
+    /// The lower impossible end, refused for the other reason.
+    ///
+    /// A score is never below zero, so `health:-1` cannot select anything.
+    /// The rule for a selector that matches nothing is that it matches
+    /// *nothing*; refusing it is the strictest form of that, and it means a
+    /// sign typo is a message rather than a silently empty run.
+    #[test]
+    fn a_threshold_below_the_floor_is_refused_rather_than_selecting_nothing_silently() {
+        let (_t, conn) = five_healthy_repos();
+        let err = resolve_targets(
+            &conn,
+            None,
+            Some("health:-1"),
+            false,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .expect_err("a threshold no score can reach cannot select anything");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("-1"),
+            "the error must name the threshold, got: {msg}"
+        );
+        assert!(
+            msg.contains("0"),
+            "the error must say what the floor is, got: {msg}"
+        );
+    }
+}
+
+/// Every selector kind, asked "you matched nothing", must give the same
+/// answer — and no kind of answer may be the whole fleet.
+///
+/// This is the invariant the function's own comment already claimed and
+/// which was false for exactly one selector kind. `--tag` and `has:*` both
+/// refuse to widen; `health:` was the one that could.
+#[cfg(test)]
+mod every_selector_agrees_on_matched_nothing {
+    use super::*;
+
+    fn fleet() -> (tempfile::TempDir, ro_state::Connection) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        for name in ["api", "web", "cli"] {
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'acme', ?2, 'https://example.com/x.git', ?3, ?4, ?4)",
+                rusqlite::params![format!("id-{name}"), name, format!("/s/{name}"), now],
+            )
+            .unwrap();
+        }
+        (tmp, conn)
+    }
+
+    /// The fleet is three repos. Any selector that comes back with all three
+    /// has widened into everything, whatever it was asked.
+    fn selection_for(filter: &str) -> Result<usize, String> {
+        let (_t, conn) = fleet();
+        resolve_targets(
+            &conn,
+            None,
+            Some(filter),
+            true,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .map(|t| t.len())
+        .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The one property, asserted for every spelling a user can type.
+    ///
+    /// `health:999` and `health:-1` are refused; the rest match nothing and
+    /// say so. **None** of them may return the fleet, which is the whole
+    /// point: the same typo must not produce a different answer depending on
+    /// which flag the user reached for, and no answer may be "run a sync
+    /// against everything".
+    #[test]
+    fn no_selector_widens_into_the_fleet_when_it_matches_nothing() {
+        for filter in [
+            "health:999",  // above the maximum score
+            "health:1000", // the reported case
+            "health:100",  // the ceiling itself, equally un-narrowing
+            "health:-1",   // below the floor
+            "health:50",   // valid, and matches nothing here
+            "tag:nonexistent",
+            "group:nonexistent",
+            "has:archived", // no row is archived in this fixture
+            "has:disabled",
+        ] {
+            match selection_for(filter) {
+                // Refused. The caller turns this into EX_USAGE, which is
+                // what `--tag nobody carries` already produced.
+                Err(msg) => assert!(
+                    msg.contains("health") || !filter.starts_with("health"),
+                    "{filter}: the refusal must say what was wrong, got: {msg}"
+                ),
+                // Matched nothing, which is the answer the flag asked for.
+                Ok(0) => {}
+                // The failure this whole module exists for.
+                Ok(n) => panic!(
+                    "{filter} selected {n} of 3 repos. A selector that matches \
+                     nothing must never widen into the whole fleet."
+                ),
+            }
+        }
+    }
+
+    /// The negative control for the assertion above: a filter that *does*
+    /// match returns a subset, and the same helper can tell the difference.
+    ///
+    /// Without this, a resolver that returned 0 for every filter would pass
+    /// the loop above.
+    #[test]
+    fn a_filter_that_does_match_still_selects() {
+        let (_t, conn) = fleet();
+        conn.execute(
+            "INSERT INTO repo_tags (repo_id, tag) VALUES ('id-web', 'work')",
+            [],
+        )
+        .unwrap();
+        let got = resolve_targets(
+            &conn,
+            None,
+            Some("tag:work"),
+            true,
+            std::path::Path::new("/s"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "a filter that matches returns exactly what it matched, which is \
+             what makes 'matched nothing' a meaningful answer"
+        );
+    }
+}
+
 /// `archived = 0 AND disabled = 0` is in the resolver, not at the call
 /// sites, so `ro sync`, `ro commit`, `ro push` and `ro ship` cannot
 /// disagree about what "every repo" means.
@@ -888,18 +1532,63 @@ mod archived_is_excluded_by_default {
     fn naming_a_retired_repo_still_needs_the_flag() {
         let (_t, conn) = conn_with(true, false);
         let found = |include: bool| {
-            resolve_targets(
+            // A retired row is still out of reach by name, so the token
+            // resolves to nothing and is **reported**. It used to be
+            // reported as a successful empty selection, which is the same
+            // "a name I typed named nothing, quietly" the token-miss check
+            // exists for.
+            match resolve_targets(
                 &conn,
                 Some("acme/archived"),
                 None,
                 false,
                 std::path::Path::new("/s"),
                 include,
-            )
-            .map(|t| t.len())
-            .unwrap()
+            ) {
+                Ok(t) => t.len(),
+                Err(_) => 0,
+            }
         };
         assert_eq!(found(false), 0, "quietly reaching a retired row by name");
         assert_eq!(found(true), 1);
+    }
+
+    /// The two selectors that *name* the retired state were structurally
+    /// unreachable: the skip that excludes a retired row ran before the
+    /// selector was ever consulted, so `has:archived` and `has:disabled`
+    /// returned an empty run with exit 0 over a fleet that had one. A user
+    /// asking "which of my repos did I retire?" was told there were none.
+    #[test]
+    fn the_has_selectors_that_name_a_retired_row_can_reach_it() {
+        let (_t, conn) = conn_with(true, false);
+        let ids = |filter: &str| {
+            resolve_targets(
+                &conn,
+                None,
+                Some(filter),
+                false,
+                std::path::Path::new("/s"),
+                false,
+            )
+            .map(|t| t.into_iter().map(|x| x.repo_id).collect::<Vec<_>>())
+        };
+        assert!(
+            ids("has:archived").is_ok(),
+            "has:archived must parse and answer, not silently select nothing"
+        );
+        // `conn_with(true, false)` archives one repo and disables none, so
+        // the archived one is selected and the disabled selector is empty —
+        // the asymmetry is the fact being asserted, and it is only
+        // observable now that the selector is reachable at all.
+        assert_eq!(
+            ids("has:archived").unwrap().len(),
+            1,
+            "an archived row is reachable by has:archived"
+        );
+        assert_eq!(
+            ids("has:disabled").unwrap().len(),
+            0,
+            "nothing is disabled in this fixture"
+        );
     }
 }

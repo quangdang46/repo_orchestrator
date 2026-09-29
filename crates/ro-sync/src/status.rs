@@ -96,6 +96,29 @@ pub struct RepoStatus {
     /// instead of quietly printing the same numbers it would have printed
     /// without the flag.
     pub fetch_error: Option<String>,
+    /// Does this repo have an `origin` remote at all?
+    ///
+    /// A fact, and a separate one from `ahead`/`behind`, because the two
+    /// answers a repo can give to "is it in sync" are not the same answer.
+    ///
+    /// A repo whose `origin` was deleted reports `ahead=0 behind=0` — the
+    /// arithmetic is right, there is genuinely nothing to be behind — and
+    /// that rendered as **in sync**, indistinguishable from a repo that is
+    /// genuinely in sync with a remote. `ro sync` called the same repo out
+    /// correctly and `ro status` rendered it clean: two verbs, one repo, two
+    /// answers, and the direction that hides a problem is the one that
+    /// matters. A user who deleted a remote to stop a repo being pushed and
+    /// then ran `ro status` was shown a green row.
+    ///
+    /// `false` is therefore carried on the row rather than folded into the
+    /// counts, and it is `false` for a repo with no branch too — a repo with
+    /// no branch has no upstream either, and the two facts are the same fact
+    /// seen from two sides.
+    ///
+    /// It is deliberately **not** a reason to call the repo broken. A
+    /// local-only repo is a legitimate thing to have, and this field exists
+    /// so it can be *told apart* from a synced one, not so it can be flagged.
+    pub has_upstream: bool,
 }
 
 impl RepoStatus {
@@ -107,6 +130,32 @@ impl RepoStatus {
             (Some(_), Some(_)) => Some(false),
             _ => None,
         }
+    }
+
+    /// Are these ahead/behind numbers known to reflect the remote *now*?
+    ///
+    /// `ro status` does not fetch — that is a deliberate decision, not an
+    /// oversight; see [`status_repo_with`] — so the default row's numbers are
+    /// as old as the last fetch, and `behind=0` against a ref from this
+    /// morning is not "in sync", it is "nobody has looked since this
+    /// morning". `ro status --behind` is the flag that exists to find a repo
+    /// the remote has moved past, and over a never-fetched repo it printed
+    /// nothing at all, because the number it filtered on was the wrong one.
+    ///
+    /// Three fields answer this and the renderer needs one boolean, so the
+    /// answer is computed here rather than at each call site — the
+    /// combination that matters is easy to get wrong by hand, because
+    /// `measured_after_fetch` is `true` for a fetch that **failed**
+    /// (asserted, with reason, at `a_failed_fetch_is_named_on_the_row_not_
+    /// hidden_behind_a_zero`), so "the row says it fetched" is not the same
+    /// statement as "the numbers are current".
+    ///
+    /// A row with no measurement cannot be stale about one, so this is
+    /// `false` for a repo with no `origin` and for a row that is not cloned:
+    /// there is no remote to be out of date with.
+    pub fn is_measurement_stale(&self) -> bool {
+        self.measured_against.is_some()
+            && !(self.measured_after_fetch && self.fetch_error.is_none())
     }
 }
 
@@ -191,71 +240,128 @@ pub fn status_repo_with(
         }
     }
 
-    let (branch, is_dirty, ahead, behind, unmeasurable_reason) = if path.join(".git").exists() {
-        let branch = ro_git::read::current_branch(&path)?;
-        let is_dirty = ro_git::read::is_dirty(&path)?;
-        // The cached default_branch is gone as of V4. The branch git
-        // reports is authoritative; the tracked branch is only a
-        // fallback for a detached HEAD.
-        let upstream_branch = branch.as_ref().or(tracked_branch.as_ref());
-        match upstream_branch {
-            // The measurement is kept even when it fails. `?` here
-            // would abort the *whole* `ro status` listing because one
-            // repo has a typo'd upstream — which is the same bug from
-            // the other end: one unmeasurable row takes out the other
-            // nineteen, so the user learns about nothing at all.
-            Some(b) => {
-                // A repo with no `origin` has no upstream to compare
-                // against, and that is a *fact about the repository*,
-                // not a failed measurement — so it is asked first, and
-                // answered from `has_remote` rather than by letting a
-                // guaranteed `rev-list` failure stand in for the answer.
-                // Without this check a perfectly healthy local repo
-                // reported "unknown" forever, which teaches users to
-                // ignore the unknown marker and so hides the rows that
-                // are genuinely broken.
-                match ro_git::read::has_remote(&path, "origin") {
-                    Ok(false) => (branch, is_dirty, Some(0), Some(0), None),
-                    // Could not even find out whether there is a remote —
-                    // a broken checkout. Not a clean zero.
-                    Err(e) => (
-                        branch,
-                        is_dirty,
-                        None,
-                        None,
-                        Some(format!("cannot determine remotes: {e:#}")),
-                    ),
-                    Ok(true) => {
-                        let upstream = format!("origin/{b}");
-                        match ro_git::read::ahead_behind(&path, &upstream) {
-                            Ok(ab) => (branch, is_dirty, Some(ab.ahead), Some(ab.behind), None),
-                            // The remote exists but `origin/main` does not
-                            // — a wrong branch name, a fetch that has not
-                            // run, or a typo in the tracked branch. Named
-                            // precisely so the fix is obvious.
-                            Err(e) => (
-                                branch,
-                                is_dirty,
-                                None,
-                                None,
-                                Some(format!("no upstream ref {upstream}: {e:#}")),
-                            ),
+    let (branch, is_dirty, ahead, behind, unmeasurable_reason, has_upstream) =
+        if path.join(".git").exists() {
+            // Both reads are kept fallible on purpose. `?` here would abort
+            // the *whole* `ro status` listing because one repo has a corrupt
+            // `.git` — which is the same bug from the other end: one
+            // unmeasurable row takes out the other nineteen, so the user
+            // learns about nothing at all. The reasoning was applied to the
+            // ahead/behind measurement below and not to these two, which run
+            // unconditionally on every row before any of it. A row that
+            // cannot be read is a row to *report*, not a reason to fail the
+            // board: `ro status` exists to answer "is anything wrong with
+            // my repos right now", and this is the answer for one of them.
+            let branch_read = ro_git::read::current_branch(&path);
+            let branch = branch_read
+                .as_ref()
+                .ok()
+                .and_then(|o| o.as_ref())
+                .cloned();
+            let dirty_read = ro_git::read::is_dirty(&path);
+            let is_dirty = dirty_read.as_ref().ok().copied().unwrap_or(false);
+            // A `.git` that exists but which git cannot read at all — a
+            // `HEAD` that is not a ref, a config that will not parse — is
+            // the one state where every measurement below is guaranteed to
+            // fail. It is reported as a row rather than propagated, for the
+            // same reason the ahead/behind measurement is: one unmeasurable
+            // row must not take out the other nineteen. The reason names the
+            // checkout rather than guessing a number, so the user can go and
+            // look at it.
+            if branch_read.is_err() && dirty_read.is_err() {
+                (
+                    None,
+                    false,
+                    None,
+                    None,
+                    Some("checkout is unreadable by git".to_string()),
+                    false,
+                )
+            } else {
+            // The cached default_branch is gone as of V4. The branch git
+            // reports is authoritative; the tracked branch is only a
+            // fallback for a detached HEAD.
+            let upstream_branch = branch.as_ref().or(tracked_branch.as_ref());
+            match upstream_branch {
+                // The measurement is kept even when it fails. `?` here
+                // would abort the *whole* `ro status` listing because one
+                // repo has a typo'd upstream — which is the same bug from
+                // the other end: one unmeasurable row takes out the other
+                // nineteen, so the user learns about nothing at all.
+                Some(b) => {
+                    // A repo with no `origin` has no upstream to compare
+                    // against, and that is a *fact about the repository*,
+                    // not a failed measurement — so it is asked first, and
+                    // answered from `has_remote` rather than by letting a
+                    // guaranteed `rev-list` failure stand in for the answer.
+                    // Without this check a perfectly healthy local repo
+                    // reported "unknown" forever, which teaches users to
+                    // ignore the unknown marker and so hides the rows that
+                    // are genuinely broken.
+                    match ro_git::read::has_remote(&path, "origin") {
+                        Ok(false) => (
+                            branch,
+                            is_dirty,
+                            Some(0),
+                            Some(0),
+                            None,
+                            // The counts are honest — there is nothing to be
+                            // behind — and the row still has to be able to
+                            // say so. `false` here is what keeps a repo
+                            // whose `origin` was deleted from rendering as
+                            // in sync with a remote it no longer has.
+                            false,
+                        ),
+                        // Could not even find out whether there is a remote —
+                        // a broken checkout. Not a clean zero.
+                        Err(e) => (
+                            branch,
+                            is_dirty,
+                            None,
+                            None,
+                            Some(format!("cannot determine remotes: {e:#}")),
+                            false,
+                        ),
+                        Ok(true) => {
+                            let upstream = format!("origin/{b}");
+                            match ro_git::read::ahead_behind(&path, &upstream) {
+                                Ok(ab) => (
+                                    branch,
+                                    is_dirty,
+                                    Some(ab.ahead),
+                                    Some(ab.behind),
+                                    None,
+                                    true,
+                                ),
+                                // The remote exists but `origin/main` does not
+                                // — a wrong branch name, a fetch that has not
+                                // run, or a typo in the tracked branch. Named
+                                // precisely so the fix is obvious.
+                                Err(e) => (
+                                    branch,
+                                    is_dirty,
+                                    None,
+                                    None,
+                                    Some(format!("no upstream ref {upstream}: {e:#}")),
+                                    true,
+                                ),
+                            }
                         }
                     }
                 }
+                // No branch means there is no upstream to compare against.
+                // That is a fact, not a failure: the repo has nothing to be
+                // behind. `None` on ahead/behind would render as "unknown",
+                // which would be a *less* honest answer than saying so.
+                None => (branch, is_dirty, Some(0), Some(0), None, false),
             }
-            // No branch means there is no upstream to compare against.
-            // That is a fact, not a failure: the repo has nothing to be
-            // behind. `None` on ahead/behind would render as "unknown",
-            // which would be a *less* honest answer than saying so.
-            None => (branch, is_dirty, Some(0), Some(0), None),
-        }
-    } else {
-        // Not cloned. The row exists but the worktree does not, so
-        // there is genuinely nothing to measure — reported as "not
-        // cloned" rather than as a clean zero.
-        (None, false, None, None, Some("not cloned".to_string()))
-    };
+            }
+        } else {
+            // Not cloned. The row exists but the worktree does not, so
+            // there is genuinely nothing to measure — reported as "not
+            // cloned" rather than as a clean zero.
+            (None, false, None, None, Some("not cloned".to_string()), false)
+        };
 
     let last_synced_at: Option<i64> = conn
         .query_row(
@@ -277,7 +383,18 @@ pub fn status_repo_with(
     // A repo whose reflogs are off has a perfectly good `origin/main` and no
     // timestamp for it, and collapsing that to "unknown" would throw away the
     // half of the answer that is still true.
-    let (measured_against, measured_against_updated_at) = if ahead.is_some() && behind.is_some() {
+    //
+    // Gated on `has_upstream` as well as on the counts being present, because
+    // the counts alone were not enough: a repo with no `origin` measures
+    // `0/0` perfectly well, so the guard below it used to name `origin/main`
+    // as the base for a repository that has no origin at all. The ref is not
+    // the base of a measurement that had no base, and a JSON consumer reading
+    // `measured_against: "origin/main"` was told the counts meant something
+    // they do not.
+    let (measured_against, measured_against_updated_at) = if has_upstream
+        && ahead.is_some()
+        && behind.is_some()
+    {
         match branch.as_deref().or(tracked_branch.as_deref()) {
             Some(b) => (
                 Some(format!("origin/{b}")),
@@ -330,6 +447,7 @@ pub fn status_repo_with(
         measured_against_updated_at,
         measured_after_fetch: fetch_first,
         fetch_error,
+        has_upstream,
     })
 }
 
@@ -409,7 +527,7 @@ mod tests {
     #[test]
     fn status_repo_missing_repo() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
 
         let status = status_repo(&conn, &repo.id).unwrap();
         assert_eq!(status.repo_id, repo.id);
@@ -431,7 +549,7 @@ mod tests {
     #[test]
     fn status_repo_clean_repo() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
 
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         init_repo(&local_path);
@@ -452,7 +570,7 @@ mod tests {
     #[test]
     fn status_repo_dirty_repo() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
 
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         init_repo(&local_path);
@@ -467,8 +585,8 @@ mod tests {
     #[test]
     fn status_all_returns_all_repos() {
         let (tmp, conn) = setup();
-        let repo1 = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
-        let repo2 = crate::manage::add(&conn, "bob/proj2", &projects_dir(&tmp)).unwrap();
+        let repo1 = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        let repo2 = crate::manage::add(&conn, "bob/proj2", &projects_dir(&tmp), "nested").unwrap();
 
         let statuses = status_all(&conn).unwrap();
         assert_eq!(statuses.len(), 2);
@@ -486,7 +604,7 @@ mod tests {
     #[test]
     fn an_unmeasurable_repo_is_unknown_not_in_sync() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
 
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         init_repo(&local_path);
@@ -525,7 +643,7 @@ mod tests {
     #[test]
     fn a_local_repo_with_no_remote_is_in_sync_not_unknown() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
 
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         init_repo(&local_path);
@@ -546,8 +664,8 @@ mod tests {
     #[test]
     fn one_broken_repo_does_not_hide_the_others() {
         let (tmp, conn) = setup();
-        let healthy = crate::manage::add(&conn, "alice/healthy", &projects_dir(&tmp)).unwrap();
-        let broken = crate::manage::add(&conn, "alice/broken", &projects_dir(&tmp)).unwrap();
+        let healthy = crate::manage::add(&conn, "alice/healthy", &projects_dir(&tmp), "nested").unwrap();
+        let broken = crate::manage::add(&conn, "alice/broken", &projects_dir(&tmp), "nested").unwrap();
 
         let healthy_path = projects_dir(&tmp).join("alice").join("healthy");
         init_repo(&healthy_path);
@@ -589,7 +707,7 @@ mod tests {
         seed.commit("initial");
         ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
 
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         conn.execute(
             "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
             rusqlite::params![
@@ -636,7 +754,7 @@ mod tests {
     #[test]
     fn a_conflicting_autostash_pop_reports_in_conflict() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         leave_conflicting_autostash_pop(&local_path);
 
@@ -674,7 +792,7 @@ mod tests {
     #[test]
     fn a_clean_repo_reports_no_conflict() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         init_repo(&local_path);
         commit(&local_path, "a.txt", "hello");
@@ -691,7 +809,7 @@ mod tests {
     #[test]
     fn a_dirty_repo_reports_no_conflict() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         init_repo(&local_path);
         commit(&local_path, "a.txt", "hello");
@@ -709,7 +827,7 @@ mod tests {
     #[test]
     fn unmerged_entries_from_another_source_are_also_reported() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         init_repo(&local_path);
         commit(&local_path, "f.txt", "line1\nbase\nline3\n");
@@ -734,7 +852,7 @@ mod tests {
     #[test]
     fn a_directory_that_is_not_a_repo_reports_no_conflict() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         std::fs::create_dir_all(&local_path).unwrap();
 
@@ -751,9 +869,9 @@ mod tests {
     #[test]
     fn a_conflicted_repo_does_not_hide_the_rest_of_the_fleet() {
         let (tmp, conn) = setup();
-        let conflicted = crate::manage::add(&conn, "alice/conflicted", &projects_dir(&tmp)).unwrap();
-        let clean = crate::manage::add(&conn, "bob/clean", &projects_dir(&tmp)).unwrap();
-        let missing = crate::manage::add(&conn, "carol/missing", &projects_dir(&tmp)).unwrap();
+        let conflicted = crate::manage::add(&conn, "alice/conflicted", &projects_dir(&tmp), "nested").unwrap();
+        let clean = crate::manage::add(&conn, "bob/clean", &projects_dir(&tmp), "nested").unwrap();
+        let missing = crate::manage::add(&conn, "carol/missing", &projects_dir(&tmp), "nested").unwrap();
 
         leave_conflicting_autostash_pop(&projects_dir(&tmp).join("alice").join("conflicted"));
 
@@ -802,7 +920,7 @@ mod tests {
     #[test]
     fn the_conflict_signal_reaches_the_machine_formats() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let local_path = projects_dir(&tmp).join("alice").join("proj1");
         leave_conflicting_autostash_pop(&local_path);
 
@@ -936,7 +1054,7 @@ mod tests {
         seed.commit("initial");
         ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
 
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         conn.execute(
             "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
             rusqlite::params![
@@ -1007,7 +1125,7 @@ mod tests {
         seed.commit("initial");
         ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
 
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         conn.execute(
             "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
             rusqlite::params![
@@ -1089,7 +1207,7 @@ mod tests {
         seed.commit("initial");
         ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
 
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         conn.execute(
             "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
             rusqlite::params![
@@ -1159,7 +1277,7 @@ mod tests {
         seed.write("a.txt", "hello\n");
         seed.commit("initial");
 
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         conn.execute(
             "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
             rusqlite::params![
@@ -1196,7 +1314,7 @@ mod tests {
         seed.commit("initial");
         ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
 
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         conn.execute(
             "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
             rusqlite::params![
@@ -1216,5 +1334,366 @@ mod tests {
             "the age must reach json: {row}"
         );
         assert_eq!(row["measured_after_fetch"], serde_json::Value::Bool(false));
+    }
+
+    // ── A repo with no `origin` is not in sync with one ──
+
+    /// A repo whose `origin` was deleted reports `ahead=0 behind=0`, which
+    /// is the arithmetic being right and the answer being wrong.
+    ///
+    /// There is genuinely nothing to be behind, so the counts are honest —
+    /// and that is exactly why they rendered as **in sync**, indistinguishable
+    /// from a repo that is genuinely in sync with a remote. `ro sync` called
+    /// the same repo out correctly and `ro status` rendered it clean: two
+    /// verbs, one repo, two answers, and the direction that hides a problem
+    /// is the one that matters. A user who deleted a remote to stop a repo
+    /// being pushed, and then ran `ro status`, was shown a green row.
+    ///
+    /// The fix is a fact on the row, not a verdict: `has_upstream = false`
+    /// says what the repo is, and leaves "is it broken" to the user.
+    #[test]
+    fn a_repo_with_no_origin_is_not_rendered_as_in_sync_with_a_remote() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        init_repo(&local_path);
+        commit(&local_path, "a.txt", "hello");
+        // No `remote add` at all: this is a local-only repo.
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+
+        // The counts are honest — there is nothing to be behind — and the
+        // row still has to be able to say so.
+        assert_eq!(status.ahead, Some(0), "there is nothing to be ahead of");
+        assert_eq!(status.behind, Some(0), "there is nothing to be behind");
+        assert_eq!(status.unmeasurable_reason, None, "this is not a failure");
+        assert_eq!(
+            status.has_upstream, false,
+            "the row must be able to say the repo has no origin"
+        );
+        assert_eq!(
+            status.measured_against, None,
+            "there is no ref to name as the base of a measurement that had \
+             no base"
+        );
+        assert_eq!(
+            status.is_in_sync(),
+            Some(true),
+            "the arithmetic is right and stays right: a local-only repo is in \
+             sync with nothing. What changed is that the row can now say so."
+        );
+    }
+
+    /// The same fact, in the two machine formats.
+    ///
+    /// `ro status --format json` and `--format ndjson` serialise this struct
+    /// whole, so a field that is not on it is a field no script ever sees —
+    /// and a status that only appears in one format is a status most scripts
+    /// never see. A script that greps for `has_upstream: false` to find the
+    /// repos whose remote was deleted is the whole reason the field exists.
+    #[test]
+    fn the_no_upstream_fact_reaches_the_machine_formats() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        init_repo(&local_path);
+        commit(&local_path, "a.txt", "hello");
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(
+            row["has_upstream"], serde_json::Value::Bool(false),
+            "the fact must reach json and ndjson: {row}"
+        );
+        assert_eq!(row["ahead"], 0);
+        assert_eq!(row["behind"], 0);
+    }
+
+    /// The negative control, and the reason the field is a fact rather than a
+    /// verdict.
+    ///
+    /// A repo with an `origin` is not broken for having one, and a repo with
+    /// no `origin` is not broken for lacking one. Without this assertion the
+    /// test above would also pass for a `has_upstream` that is always false,
+    /// which is the same shape of defect one layer down.
+    #[test]
+    fn a_repo_with_an_origin_says_it_has_one() {
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert_eq!(
+            status.has_upstream, true,
+            "a repo with an origin must not be told apart from one without"
+        );
+        assert_eq!(status.measured_against.as_deref(), Some("origin/main"));
+    }
+
+    /// A repo on a detached HEAD has no upstream either, and the two facts
+    /// are the same fact seen from two sides.
+    ///
+    /// Built with a real `git checkout --detach`, because the state is
+    /// "HEAD points at a commit and no branch names it" and the only honest
+    /// way to reach it is for git to put it there — a repo that was merely
+    /// `init`ed and never committed is *also* branchless, but for a
+    /// different reason, and it does not exercise the branch the row would
+    /// otherwise have used.
+    #[test]
+    fn a_repo_on_a_detached_head_says_it_has_no_upstream() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        init_repo(&local_path);
+        commit(&local_path, "a.txt", "hello");
+        run_git(&local_path, &["checkout", "-q", "--detach", "HEAD"]);
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert_eq!(status.branch, None, "a detached HEAD has no branch");
+        assert_eq!(status.has_upstream, false);
+        assert_eq!(status.ahead, Some(0));
+        assert_eq!(status.behind, Some(0));
+    }
+
+    // ── `--behind` over a repo whose remote moved ──
+
+    /// `ro status` does not fetch, so the default row's numbers are as old as
+    /// the last fetch — and `ro status --behind` is the flag that exists to
+    /// find a repo the remote has moved past. Over a never-fetched repo it
+    /// printed nothing at all, because the number it filtered on was the
+    /// wrong one: `behind=0` against a ref from this morning is not "in sync",
+    /// it is "nobody has looked since this morning".
+    ///
+    /// The renderer is in `crates/ro` and is not this crate's to change, so
+    /// what is asserted here is the **row**: that it carries everything the
+    /// renderer needs to surface the staleness, and that the answer is
+    /// computed in one place rather than at each call site.
+    #[test]
+    fn a_repo_whose_remote_moved_carries_the_staleness_on_the_row() {
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        // The remote moves on. The checkout does not fetch — which is the
+        // whole state `ro status` is in during the daily loop.
+        let other = tmp.path().join("other");
+        run_git(
+            tmp.path(),
+            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+        );
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test"]);
+        for i in 1..=3 {
+            std::fs::write(other.join("b.txt"), format!("remote moved {i}\n")).unwrap();
+            run_git(&other, &["add", "."]);
+            run_git(&other, &["commit", "-q", "-m", &format!("remote moved {i}")]);
+        }
+        run_git(&other, &["push", "-q", "origin", "HEAD:main"]);
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+
+        // The number is the stale one, and the row says so.
+        assert_eq!(
+            status.behind,
+            Some(0),
+            "the local ref is genuinely behind nothing it can see — the \
+             number is not the lie, the silence around it is"
+        );
+        assert_eq!(status.measured_against.as_deref(), Some("origin/main"));
+        assert!(
+            status.measured_against_updated_at.is_some(),
+            "a ref that was pushed to has a reflog, and the row must carry \
+             when it last moved: {status:?}"
+        );
+        assert!(
+            !status.measured_after_fetch,
+            "the default `ro status` does not fetch, and the row must not \
+             claim it did"
+        );
+        assert_eq!(status.fetch_error, None);
+        assert!(
+            status.is_measurement_stale(),
+            "the row must say the numbers are not current, so `--behind` can \
+             surface this repo instead of hiding it: {status:?}"
+        );
+    }
+
+    /// The other side of the same answer: a row that *did* fetch, and whose
+    /// fetch succeeded, is not stale.
+    ///
+    /// Without this, `is_measurement_stale` returning `true` for everything
+    /// would pass the test above — and a flag that surfaces every repo
+    /// surfaces none of them.
+    #[test]
+    fn a_row_that_fetched_successfully_is_not_stale() {
+        let (tmp, conn) = setup();
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+
+        let other = tmp.path().join("other");
+        run_git(
+            tmp.path(),
+            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+        );
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test"]);
+        std::fs::write(other.join("b.txt"), "remote moved\n").unwrap();
+        run_git(&other, &["add", "."]);
+        run_git(&other, &["commit", "-q", "-m", "remote moved"]);
+        run_git(&other, &["push", "-q", "origin", "HEAD:main"]);
+
+        let status = status_repo_with(&conn, &repo.id, true).unwrap();
+        assert!(status.measured_after_fetch);
+        assert_eq!(status.fetch_error, None);
+        assert_eq!(
+            status.behind,
+            Some(1),
+            "after the fetch the repo is one commit behind, and the row must \
+             say so: {status:?}"
+        );
+        assert!(
+            !status.is_measurement_stale(),
+            "a row that fetched and succeeded is current, and must not be \
+             flagged as stale: {status:?}"
+        );
+    }
+
+    /// A fetch that **failed** leaves the ref exactly as stale as it was.
+    ///
+    /// The trap in the combination: `measured_after_fetch` is `true` for a
+    /// fetch that did not succeed, because the flag was passed and the
+    /// attempt was made. "The row says it fetched" is therefore not the same
+    /// statement as "the numbers are current", and a staleness check that
+    /// looked only at the boolean would call a failed fetch fresh.
+    #[test]
+    fn a_failed_fetch_is_stale_even_though_the_row_says_it_fetched() {
+        let (tmp, conn) = setup();
+        // A real remote, really pushed to, so `origin/main` exists and the
+        // ahead/behind comparison is genuinely made. The remote is then
+        // replaced with a path that does not exist, so the *fetch* fails
+        // while the row is still measurable — which is the case this is
+        // about, and the case a fixture that only ever had a bogus remote
+        // cannot reach (there, the comparison fails too and the row is
+        // unmeasured rather than stale).
+        let remote = ro_testkit::BareRemote::ephemeral();
+        let seed = Worktree::empty();
+        seed.add_remote("origin", remote.path());
+        seed.write("a.txt", "hello\n");
+        seed.commit("initial");
+        ro_testkit::worktree::run(seed.path(), &["push", "origin", "main"]);
+
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        conn.execute(
+            "UPDATE repos SET clone_url = ?1, local_path = ?2 WHERE id = ?3",
+            rusqlite::params![
+                remote.path().to_string_lossy(),
+                seed.path().to_string_lossy(),
+                repo.id
+            ],
+        )
+        .unwrap();
+        run_git(
+            seed.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                &tmp.path().join("no-such-remote.git").to_string_lossy(),
+            ],
+        );
+
+        let status = status_repo_with(&conn, &repo.id, true).unwrap();
+        assert_eq!(
+            (status.ahead, status.behind),
+            (Some(0), Some(0)),
+            "the comparison is still made against the ref the last good \
+             fetch left behind: {status:?}"
+        );
+        assert_eq!(status.measured_against.as_deref(), Some("origin/main"));
+        assert!(
+            status.measured_after_fetch,
+            "the flag was passed, so the row must say a fetch was attempted"
+        );
+        assert!(
+            status.fetch_error.is_some(),
+            "a fetch that could not reach the remote must be reported"
+        );
+        assert!(
+            status.is_measurement_stale(),
+            "a failed fetch leaves the numbers exactly as stale as they were, \
+             and the row must not call them current: {status:?}"
+        );
+    }
+
+    /// A row with no measurement cannot be stale about one.
+    ///
+    /// A repo with no `origin` has no remote to be out of date with, and a
+    /// row that is not cloned has no numbers at all. Both are `false`, and
+    /// both are the honest answer — a staleness flag that fires on a
+    /// local-only repo is a flag that fires on everything.
+    #[test]
+    fn a_row_with_no_measurement_is_not_stale() {
+        let (tmp, conn) = setup();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+
+        let local_path = projects_dir(&tmp).join("alice").join("proj1");
+        init_repo(&local_path);
+        commit(&local_path, "a.txt", "hello");
+
+        let status = status_repo(&conn, &repo.id).unwrap();
+        assert_eq!(status.measured_against, None);
+        assert!(
+            !status.is_measurement_stale(),
+            "there is no remote to be out of date with: {status:?}"
+        );
     }
 }

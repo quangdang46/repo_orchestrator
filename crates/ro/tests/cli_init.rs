@@ -51,7 +51,7 @@ impl Test {
 fn listed(test: &Test) -> Vec<serde_json::Value> {
     let out = test
         .cmd()
-        .args(["list", "--format", "json"])
+        .args(["list", "--format", "ndjson"])
         .output()
         .unwrap();
     assert!(
@@ -74,7 +74,7 @@ fn listed(test: &Test) -> Vec<serde_json::Value> {
 fn status_of(test: &Test) -> serde_json::Value {
     let out = test
         .cmd()
-        .args(["status", "--format", "json"])
+        .args(["status", "--format", "ndjson"])
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();

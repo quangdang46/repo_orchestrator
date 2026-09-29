@@ -184,7 +184,30 @@ pub fn run_verb(
         std::process::exit(0);
     }
 
-    let slots = ro_engine::EngineSlots::default();
+    // `[agent] command` and `[agent] prompt` are read here, at the one
+    // production construction site. Both are documented in the shipped
+    // config — `command` "overrides the binary and its arguments entirely,
+    // which is how Gemini / Amp / Kiro / a nightly build gets used" — and
+    // both were read by nothing: a workspace grep for `agent.command`
+    // outside the schema found zero hits, and setting it had no effect
+    // because `AgentEngine::with` always used the built-in default argv.
+    //
+    // `command` is a single argv element list: it is split on whitespace
+    // and the first token is the binary, the rest its arguments. `{prompt}`
+    // is substituted as ONE argv element, never through a shell — the
+    // prompt is built from diff text and file paths, and a shell would
+    // treat every one of them as syntax.
+    let slots = {
+        let mut slots = ro_engine::EngineSlots::default();
+        if let Some(command) = config.agent.command.as_deref() {
+            let mut parts = command.split_whitespace();
+            if let Some(bin) = parts.next() {
+                slots.claude_bin = Some(bin.to_string());
+                slots.claude_args = Some(parts.map(str::to_string).collect());
+            }
+        }
+        slots
+    };
     // The global identity is the `[identity] default` profile, resolved here
     // rather than per row. It was hardcoded to `None` while the config
     // carried an `[agent]` table nobody read, so `ro config set` of an
@@ -241,7 +264,29 @@ pub fn run_verb(
         dry_run,
         message: message.clone(),
         amend,
-        prompt: prompt.clone(),
+        // `--prompt` wins over `[agent] prompt`; the config is the
+        // fallback, not an override. It was read by nothing at all, so a
+        // user who followed the shipped file's description of a
+        // "different instruction" and set it got the built-in prompt.
+        prompt: prompt
+            .clone()
+            .or_else(|| config.agent.prompt.clone()),
+        // `core.parallel` and `core.timeout_secs` are read **here**, at the
+        // one production construction site, rather than in
+        // `RunOptions::default()`. The default impl is a library default
+        // and cannot see a config file; the two values were hardcoded at
+        // `parallel: 4` and `Duration::from_secs(600)` and `opts.parallel`
+        // — which `emit.rs` genuinely consumes — never received the number
+        // the user typed. `core.parallel=1` over a four-repo fleet with a
+        // five-second engine ran all four concurrently in 5.07 s, and
+        // `core.timeout_secs = 5` did not stop an engine at 5 s. The
+        // plumbing was there; nothing ever put the value in it.
+        //
+        // The shipped default for `timeout_secs` is 30 and the code
+        // enforced 600 — the file documented a 20x smaller deadline than
+        // the program actually applied.
+        parallel: config.core.parallel.max(1) as usize,
+        timeout: std::time::Duration::from_secs(config.core.timeout_secs.max(1) as u64),
         ..Default::default()
     };
     let summary = run(&plans, &opts);

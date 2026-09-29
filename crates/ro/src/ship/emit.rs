@@ -78,6 +78,7 @@ pub fn run(plans: &[RepoPlan], opts: &RunOptions) -> Summary {
             engine: plan.engine.label().to_string(),
             account: None,
             outcome: outcome.unwrap_or(RepoOutcome::Failed {
+                class: ro_core::FailureClass::MissingProvider,
                 error: "the worker produced no result".into(),
             }),
         })

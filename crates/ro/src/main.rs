@@ -210,6 +210,11 @@ enum Commands {
         /// Only repos the remote has moved past
         #[arg(long)]
         behind: bool,
+        /// Fetch each repo's remote first, so ahead/behind is current.
+        /// Costs a network round trip per repo; without it the counts are
+        /// measured against whatever `origin/<branch>` was last.
+        #[arg(long)]
+        fetch: bool,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
         format: OutputFormat,
@@ -542,6 +547,57 @@ fn confirm(prompt: &str) -> bool {
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Are two paths the same directory?
+///
+/// Compared after canonicalisation, because the two sides arrive by different
+/// routes: one is a path the row named, the other is an answer git gave. A
+/// byte comparison would refuse a checkout reached through a symlinked parent
+/// or a relative path, which is a real checkout the user really did register.
+///
+/// A path that cannot be canonicalised is never equal to one that could —
+/// refusing is the only safe answer when the two cannot be shown to be the
+/// same directory.
+fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Where does the working tree that contains `dir` actually start?
+///
+/// `git rev-parse --show-toplevel` is the authority, and it is asked with the
+/// working directory set to `dir` so it answers for that path specifically.
+/// A directory *inside* a checkout resolves upward to the checkout root; a
+/// checkout resolves to itself; a directory belonging to no checkout at all
+/// fails, which is the answer this gate wants.
+///
+/// `ro_git::read::discover` is not a substitute: it returns the path of the
+/// `.git` directory, which is the repository, not the working tree the user
+/// registered and would have deleted.
+fn working_tree_root(dir: &std::path::Path) -> std::result::Result<std::path::PathBuf, String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("running git rev-parse: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(if stderr.trim().is_empty() {
+            "git rev-parse failed".to_string()
+        } else {
+            stderr.trim().to_string()
+        });
+    }
+    let top = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if top.is_empty() {
+        return Err("git rev-parse returned no working tree".to_string());
+    }
+    Ok(std::path::PathBuf::from(top))
+}
+
 /// Does a checkout's origin refer to the same repository as the URL on the
 /// registry row?
 ///
@@ -630,18 +686,60 @@ fn ignore_local_config(repo_root: &std::path::Path) {
     }
 }
 
+/// Resolve the config, state, and cache directories from the flags and the
+/// environment.
+///
+/// Each flag overrides exactly the directory it names, and discovery fills
+/// only the ones no flag claimed. This used to match only `(Some, Some)` and
+/// fall back to `ConfigPaths::discover()` otherwise, so `--config-dir` alone
+/// and `--state-dir` alone were each parsed and then discarded — the flag the
+/// user typed had no effect on anything. Measured against the real binary in a
+/// clean XDG environment, `ro init --state-dir /tmp/vB/state` printed
+/// "Initialized: /tmp/vA/cfg/ro", created nothing under `/tmp/vB`, and exited
+/// 0. A CI run isolating its state dir wrote to the real state database with
+/// no diagnostic, which is the most dangerous shape the bug can take: it looks
+/// like it worked.
+///
+/// The cache directory is derived from the state directory whenever the state
+/// directory is overridden, and otherwise left to discovery. The both-flags
+/// arm has always done this, and a single-flag override that pointed
+/// `cache_dir` back at the discovered state would put disposable caches beside
+/// a *different* installation's durable state — the two would disagree about
+/// which install they are talking about.
 fn resolve_paths(cli: &Cli) -> Result<ConfigPaths> {
-    match (&cli.config_dir, &cli.state_dir) {
-        (Some(config_dir), Some(state_dir)) => {
-            let cache_dir = state_dir.join("cache");
-            Ok(ConfigPaths {
-                config_dir: config_dir.clone(),
-                state_dir: state_dir.clone(),
-                cache_dir,
-            })
-        }
-        _ => ConfigPaths::discover(),
+    // Both directories given: nothing to discover. Kept as its own arm
+    // because it is the one case that must not depend on the environment at
+    // all — `discover()` fails outright when there is no resolvable home and
+    // no XDG variable, and a caller who named both directories explicitly has
+    // already said where everything goes.
+    if let (Some(config_dir), Some(state_dir)) = (&cli.config_dir, &cli.state_dir) {
+        return Ok(ConfigPaths {
+            config_dir: config_dir.clone(),
+            state_dir: state_dir.clone(),
+            cache_dir: state_dir.join("cache"),
+        });
     }
+    // At least one directory is unclaimed, so discovery fills in whatever the
+    // flags did not name — and only that.
+    let discovered = ConfigPaths::discover()?;
+    let config_dir = cli
+        .config_dir
+        .clone()
+        .unwrap_or_else(|| discovered.config_dir.clone());
+    let state_dir = cli
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| discovered.state_dir.clone());
+    let cache_dir = if cli.state_dir.is_some() {
+        state_dir.join("cache")
+    } else {
+        discovered.cache_dir.clone()
+    };
+    Ok(ConfigPaths {
+        config_dir,
+        state_dir,
+        cache_dir,
+    })
 }
 
 fn main() {
@@ -736,6 +834,23 @@ fn schema_json() -> serde_json::Value {
     if let Some(about) = root.get_about() {
         o.insert("about".into(), about.to_string().into());
     }
+    // The root's own args, in the same flat shape the subcommands get.
+    //
+    // These were absent entirely, and they are the three flags a person reads
+    // first: `--config-dir`, `--state-dir`, `--non-interactive`. They are
+    // `global = true`, so they are accepted on every subcommand — but the
+    // mirror only walked subcommands, so a consumer of `ro schema` could not
+    // see them, and a guard that asserts "every arg has help text" had nothing
+    // to check. The flags were documented in `--help` the whole time; they
+    // were simply invisible to anything reading the machine-readable tree.
+    let root_args: Vec<_> = root
+        .get_arguments()
+        .filter(|a| !a.is_hide_set())
+        .map(arg_json)
+        .collect();
+    if !root_args.is_empty() {
+        o.insert("args".into(), root_args.into());
+    }
     let subs: Vec<_> = root.get_subcommands().map(command_json).collect();
     o.insert("commands".into(), subs.into());
     serde_json::Value::Object(o)
@@ -750,10 +865,57 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = resolve_paths(&cli)?;
     let db_path = paths.state_db();
+    let config = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
+    // `core.projects_dir` and `core.layout` are read here, once, and every
+    // verb that needs a projects directory asks for it. Both used to be
+    // ignored: four call sites did `paths.state_dir.join("projects")` and
+    // both path builders did an unconditional `.join(&spec.owner)`, so
+    // setting either key changed nothing — `ro add` reported the state-dir
+    // path as the destination even when the configured directory was
+    // pre-created and empty, and `layout = "flat"` and `layout = "nested"`
+    // produced byte-identical destinations.
+    //
+    // **A key that has not been set keeps the behaviour every existing
+    // install already depends on.** The shipped defaults are
+    // `projects_dir = "~/projects"` and `layout = "flat"`, but what the code
+    // actually does is `<state_dir>/projects/<owner>/<name>`. Honouring the
+    // literal default would silently relocate every repo an existing user
+    // has on disk, on upgrade, with no migration and no message. So: a
+    // value that differs from the shipped default is the user's, and is
+    // honoured; the shipped default means "unchanged". `ro config set
+    // core.projects_dir=...` still works, which is the whole of the
+    // finding.
+    let projects_dir = if config.core.projects_dir == SHIPPED_PROJECTS_DIR {
+        paths.state_dir.join("projects")
+    } else {
+        ro_config::paths::expand_tilde(&config.core.projects_dir)
+    };
     // `--yes` on push/ship is this same instruction under the spelling a CI
     // script reaches for. One variable, two spellings, so there is a single
     // place that decides whether ro may act without asking.
     let non_interactive = cli.non_interactive;
+
+    // The shipped defaults, spelled out so the "keep the existing
+    // behaviour unless the user changed it" rule above has one place to
+    // name. See the comment on `projects_dir`.
+    const SHIPPED_PROJECTS_DIR: &str = "~/projects";
+    let layout: &str = if config.core.layout == "flat" {
+        "nested"
+    } else {
+        config.core.layout.as_str()
+    };
+
+    // Say which directories this run is actually using, whenever a flag was
+    // given. The bug this replaces did not merely compute the wrong paths — it
+    // computed the *discovered* ones and printed nothing, so an isolated CI run
+    // looked exactly like a successful one while writing to the real state
+    // database. A flag that redirects ro's attention somewhere the user may not
+    // have meant is worth one line on the way out, and it costs nothing when no
+    // flag was given.
+    if cli.config_dir.is_some() || cli.state_dir.is_some() {
+        eprintln!("ro: config dir {}", paths.config_dir.display());
+        eprintln!("ro: state dir  {}", paths.state_dir.display());
+    }
 
     match cli.command {
         // ── commit / push / ship ───────────────────────────────────────
@@ -918,7 +1080,6 @@ fn run() -> Result<()> {
         } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-            let projects_dir = paths.state_dir.join("projects");
             let opts = manage::AddOptions {
                 name,
                 clone_to,
@@ -928,7 +1089,9 @@ fn run() -> Result<()> {
                 author_ref: author,
                 tags,
             };
-            let repo = manage::add_from_input(&conn, &spec, &projects_dir, &opts).map_err(|e| {
+            let repo =
+                manage::add_from_input(&conn, &spec, &projects_dir, &opts, layout)
+                    .map_err(|e| {
                 // A bad invocation is a usage error, not a broken
                 // installation. `add_from_input` refuses three things
                 // that are all the caller's fault and none of which
@@ -998,6 +1161,43 @@ fn run() -> Result<()> {
                 eprintln!("Will delete the working copy at:");
                 eprintln!("  {}", path.display());
 
+                // (1a) The row's path must be the checkout, not a link to it.
+                //
+                // Everything below asks git about `path` with the working
+                // directory set there, and git resolves every component of
+                // that path before it reads anything. A symlink at `path`
+                // therefore means the origin, the repository, and the
+                // `remove_dir_all` target are all the *destination's* — so
+                // the origin check below happily confirms a directory the
+                // user never registered, and the deletion either follows the
+                // link into a checkout the row has nothing to do with or
+                // takes the real contents of a second clone of the same repo
+                // along with the link. Neither is "the thing I registered".
+                //
+                // `symlink_metadata` rather than `metadata`: it does not
+                // follow the link, so a symlink is still recognisable as one
+                // even when its target is gone.
+                //
+                // An error here is deliberately *not* a refusal of its own: the
+                // common cause is a path that is not there at all, and the
+                // check further down reports that with a message naming the
+                // row and the repo, which is more use than "cannot be
+                // inspected". Refusing twice would only cost the better
+                // message.
+                if let Ok(md) = std::fs::symlink_metadata(&path) {
+                    if md.file_type().is_symlink() {
+                        eprintln!(
+                            "refused: {} is a symlink, so it is not the working copy \
+                             the row registered — it points somewhere else, and \
+                             deleting through it would act on that somewhere \
+                             else. Nothing was deleted. Point the row at the \
+                             real checkout, or remove the link yourself.",
+                            path.display()
+                        );
+                        std::process::exit(exit::EX_USAGE as i32);
+                    }
+                }
+
                 // (2) Refuse if this directory is, or *contains*, a
                 // different registered repo. Two repos pointing at one path
                 // is the copy-paste accident, and deleting through it removes
@@ -1013,7 +1213,17 @@ fn run() -> Result<()> {
                 // never asked to touch. The help text promises a directory
                 // belonging to another registered repo is "refused outright";
                 // a directory *containing* one belongs to it at least as much.
-                let wanted = path.to_string_lossy().to_string();
+                // Containment is compared on **canonicalised** paths. It was
+                // a raw string prefix over the row's verbatim `local_path`,
+                // so a trailing slash turned the probe into `<path>//` and a
+                // nested row was never seen — the exact case this gate
+                // exists to catch, defeated by a spelling. `ro add`
+                // canonicalises, so this needs a hand-edited or
+                // arithmetically-derived row, which is the threat model the
+                // gate's own comment claims to cover.
+                let wanted = std::fs::canonicalize(&path)
+                    .unwrap_or_else(|_| path.clone());
+                let wanted = wanted.to_string_lossy().to_string();
                 let clash = manage::list(&conn, None)
                     .unwrap_or_default()
                     .into_iter()
@@ -1021,7 +1231,9 @@ fn run() -> Result<()> {
                         if r.id == target.id {
                             return false;
                         }
-                        let other = r.local_path.as_str();
+                        let other = std::fs::canonicalize(&r.local_path)
+                            .unwrap_or_else(|_| PathBuf::from(&r.local_path));
+                        let other = other.to_string_lossy().to_string();
                         other == wanted
                             || other.starts_with(&format!("{wanted}/"))
                             || other.starts_with(&format!("{wanted}\\"))
@@ -1112,6 +1324,91 @@ fn run() -> Result<()> {
                     std::process::exit(exit::EX_USAGE as i32);
                 }
 
+                // (3b) The path must be the checkout, not a directory that
+                // merely contains it.
+                //
+                // A parent of the real checkout passes every check above: it
+                // exists, it is a git repository, and `git remote get-url`
+                // run there answers with the nested checkout's origin — which
+                // is the row's clone URL. So the gate would wave it through
+                // and `remove_dir_all` would take the parent and everything
+                // nested in it, on the strength of a path that names a
+                // directory the checkout happens to sit inside. The row must
+                // name the checkout itself.
+                //
+                // `git rev-parse --show-toplevel` is the authority on where the
+                // checkout actually starts, and it is asked of the path the
+                // row named — so a parent, a grandparent, or a sibling that
+                // happens to be inside the same repository all refuse. A
+                // worktree's own `.git` file makes this the one check that
+                // distinguishes "the checkout" from "somewhere inside it".
+                let toplevel = match working_tree_root(&path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!(
+                            "refused: {} is not inside a git working tree ({e}), so it \
+                             is not the working copy of {}/{}; nothing was deleted.",
+                            path.display(),
+                            target.owner,
+                            target.name
+                        );
+                        std::process::exit(exit::EX_USAGE as i32);
+                    }
+                };
+                if !same_path(&toplevel, &path) {
+                    eprintln!(
+                        "refused: {} is not the working copy of {}/{} — the \
+                         checkout it contains starts at {}. Deleting here would \
+                         take that directory and everything nested in it. \
+                         Nothing was deleted.",
+                        path.display(),
+                        target.owner,
+                        target.name,
+                        toplevel.display()
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+                // `--show-toplevel` is not enough on its own. A parent
+                // directory that is **its own** git repository answers
+                // `--show-toplevel` with itself, so the check above is
+                // satisfied by the very directory it exists to exclude —
+                // and if that parent also carries an `origin` equal to the
+                // row's `clone_url`, gate 3 waves it through too. The row
+                // then deletes a directory containing a live registered
+                // checkout, which is precisely what gate 2 is for, so gate
+                // 2 is asked directly and unconditionally here.
+                //
+                // The existing test for this (`delete_refuses_a_parent_of_
+                // the_real_checkout`) did not catch it: it built the parent
+                // with `git init` and no remote, so the run was refused by
+                // gate 3's "no origin remote" branch and never reached 3b —
+                // asserting nothing about it, despite its comment claiming
+                // the parent's origin matched the row.
+                let nested = manage::list(&conn, None)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|r| {
+                        if r.id == target.id {
+                            return false;
+                        }
+                        let other = std::fs::canonicalize(&r.local_path)
+                            .unwrap_or_else(|_| PathBuf::from(&r.local_path));
+                        same_path(&other, &path) || other.starts_with(&path)
+                    });
+                if let Some(other) = nested {
+                    eprintln!(
+                        "refused: {} is a parent of the registered working copy of \
+                         {}/{} ({}). Deleting here would take that checkout with \
+                         it. Nothing was deleted — remove the nested one first, or \
+                         point this row at its own checkout.",
+                        path.display(),
+                        other.owner,
+                        other.name,
+                        other.local_path
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
+                }
+
                 // (4) Consent: an interactive confirmation, or the caller
                 // having said up front that it is not going to answer.
                 if !non_interactive && !confirm("Type 'y' to delete it: ") {
@@ -1171,10 +1468,19 @@ fn run() -> Result<()> {
                         .unwrap_or(false)
                 });
             }
-            if repos.is_empty() {
+            // The empty-registry message is for an empty registry. It used
+            // to be printed whenever the list came back empty, so `ro list
+            // --tag nonexistent` over a fleet of twelve answered "No tracked
+            // repos. Use 'ro add <spec>' to add one." — a summary that
+            // disagreed with the registry, written to stderr where it reads
+            // as an error, in all three formats. A selector that matches
+            // nothing is a question with an empty answer, not a claim that
+            // nothing is tracked.
+            let selector_given = owner.is_some() || tag.is_some();
+            if repos.is_empty() && !selector_given {
                 eprintln!("No tracked repos. Use 'ro add <spec>' to add one.");
             } else {
-                for repo in repos {
+                for repo in &repos {
                     match format {
                         OutputFormat::Text => {
                             // The path is the thing you paste into `cd`, and
@@ -1188,9 +1494,21 @@ fn run() -> Result<()> {
                                 println!("{}", repo);
                             }
                         }
+                        // `json` is a document and `ndjson` is a stream.
+                        // They shared one `println!`, so the flag named
+                        // `json` produced ndjson and a consumer doing
+                        // `json.load(stdout)` on it raised "Extra data:
+                        // line 2 column 1".
+                        OutputFormat::Json => {
+                            let rows: Vec<String> = repos
+                                .iter()
+                                .map(|r| serde_json::to_string(r))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            println!("[{}]", rows.join(","));
+                        }
                         // One object per line, so a consumer can read the
                         // first repo without waiting for the last.
-                        OutputFormat::Json | OutputFormat::Ndjson => {
+                        OutputFormat::Ndjson => {
                             println!("{}", serde_json::to_string(&repo)?);
                         }
                     }
@@ -1242,7 +1560,7 @@ fn run() -> Result<()> {
                         None,
                         selector_filter("sync", filter.as_deref(), tag.as_deref())?.as_deref(),
                         all,
-                        &paths.state_dir.join("projects"),
+                        &projects_dir,
                         include_archived,
                     )
                     .map_err(|e| {
@@ -1281,7 +1599,7 @@ fn run() -> Result<()> {
                     Some(&repos.join(" ")),
                     selector_filter("sync", filter.as_deref(), tag.as_deref())?.as_deref(),
                     all,
-                    &paths.state_dir.join("projects"),
+                    &projects_dir,
                     include_archived,
                 )
                 .map_err(|e| {
@@ -1339,8 +1657,29 @@ fn run() -> Result<()> {
                             }
                             None => println!("{label} action={} status={}", r.action, r.status),
                         }
+                        // The predict-then-verify warning. It is computed,
+                        // stored on the row, and emitted in JSON — and it
+                        // was rendered in no format at all, because
+                        // `plan_mismatch` had 25 references in `sync.rs` and
+                        // zero outside it. So a user running plain `ro sync`,
+                        // in the human-facing format, never learned that the
+                        // dry-run preview they based their decision on had
+                        // been wrong. The field's own doc says "a
+                        // disagreement nobody can read is a disagreement
+                        // nobody acts on"; this is the line that makes it
+                        // readable.
+                        if let Some(why) = r.plan_mismatch.as_deref() {
+                            println!("{label} plan-mismatch: {why}");
+                        }
                     }
-                    OutputFormat::Json | OutputFormat::Ndjson => {
+                    OutputFormat::Json => {
+                        let rows: Vec<String> = results
+                            .iter()
+                            .map(|r| serde_json::to_string(r))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        println!("[{}]", rows.join(","));
+                    }
+                    OutputFormat::Ndjson => {
                         println!("{}", serde_json::to_string(r)?);
                     }
                 }
@@ -1368,6 +1707,7 @@ fn run() -> Result<()> {
             dirty: only_dirty,
             ahead: only_ahead,
             behind: only_behind,
+            fetch,
             format,
         } => {
             let conn = ro_state::open_db(&db_path)
@@ -1387,7 +1727,7 @@ fn run() -> Result<()> {
                     },
                     filter.as_deref(),
                     true,
-                    &paths.state_dir.join("projects"),
+                    &projects_dir,
                     false,
                 )
                 .map_err(|e| {
@@ -1419,11 +1759,11 @@ fn run() -> Result<()> {
                 }
                 let mut out = Vec::with_capacity(targets.len());
                 for t in &targets {
-                    out.push(status::status_repo(&conn, &t.repo_id)?);
+                    out.push(status::status_repo_with(&conn, &t.repo_id, fetch)?);
                 }
                 out
             } else {
-                status::status_all(&conn)?
+                status::status_all_with(&conn, fetch)?
             };
 
             // `--dirty` / `--ahead` / `--behind` narrow *after* selection,
@@ -1456,6 +1796,16 @@ fn run() -> Result<()> {
                         // row, so it is named first.
                         let conflict = if s.in_conflict { " [CONFLICT] " } else { "" };
                         let protected = if s.is_protected { " (protected)" } else { "" };
+                        // A repo with no `origin` measures 0/0 perfectly
+                        // well — there is nothing to be behind — so the
+                        // counts alone render it identically to a repo that
+                        // is genuinely in sync with a remote it has. JSON
+                        // carried `has_upstream: false` and the text board
+                        // threw it away, so the default format a person
+                        // reads could not tell "in sync" from "no remote to
+                        // be in sync with". The marker is what `has_upstream`
+                        // was added for.
+                        let no_upstream = if s.has_upstream { "" } else { " (no origin)" };
                         // An unmeasurable repo prints `ahead=unknown`, never
                         // `ahead=0`. Printing zero here is the bug this bead
                         // exists to remove: a green board over rows nobody
@@ -1463,13 +1813,14 @@ fn run() -> Result<()> {
                         // because the user stops looking.
                         match (s.ahead, s.behind) {
                             (Some(a), Some(b)) => println!(
-                                "{}/{}: {}{}{}{} ahead={} behind={}",
+                                "{}/{}: {}{}{}{}{} ahead={} behind={}",
                                 s.owner,
                                 s.name,
                                 s.branch.as_deref().unwrap_or("HEAD"),
                                 conflict,
                                 dirty,
                                 protected,
+                                no_upstream,
                                 a,
                                 b
                             ),
@@ -1485,8 +1836,21 @@ fn run() -> Result<()> {
                             ),
                         }
                     }
+                    // A **document**, not a stream. `--format json` and
+                    // `--format ndjson` were the same `println!`, so a
+                    // consumer doing `json.load(stdout)` on the flag named
+                    // `json` — the obvious thing to do — raised
+                    // "Extra data: line 2 column 1". The help text gives
+                    // ndjson its own description ("One JSON object per
+                    // line, for a consumer that reads a stream"), which was
+                    // the behaviour `json` also had: a flag that changed
+                    // nothing, under two names.
                     OutputFormat::Json => {
-                        println!("{}", serde_json::to_string(s)?);
+                        let rows: Vec<String> = statuses
+                            .iter()
+                            .map(|s| serde_json::to_string(s))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        println!("[{}]", rows.join(","));
                     }
                     // One object per line, no wrapping array. The point
                     // is that a consumer can start reading before the
@@ -1630,6 +1994,160 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── resolve_paths: each flag is independently overridable ────────────
+    //
+    // `resolve_paths` used to match only `(Some, Some)` and fall back to
+    // `ConfigPaths::discover()` otherwise, so `--config-dir` alone and
+    // `--state-dir` alone were both silently discarded. Measured against the
+    // real binary: `ro init --state-dir /tmp/vB/state` printed
+    // "Initialized: /tmp/vA/cfg/ro", created nothing under /tmp/vB, and
+    // exited 0 — a CI run isolating its state wrote to the real state
+    // database with no diagnostic. That is the most dangerous shape the bug
+    // takes, so the tests below pin each of the four combinations.
+
+    /// `--state-dir` alone must be honoured, not dropped.
+    ///
+    /// This is the case that was measured broken: the flag was parsed, the
+    /// value was thrown away, and the run proceeded against the discovered
+    /// state directory.
+    #[test]
+    fn state_dir_alone_is_honoured_not_discovered() {
+        let cli = Cli {
+            config_dir: None,
+            state_dir: Some(PathBuf::from("/tmp/ro-test/state-only")),
+            non_interactive: false,
+            command: Commands::Init,
+        };
+        let paths = resolve_paths(&cli).expect("paths resolve");
+        assert_eq!(
+            paths.state_dir,
+            PathBuf::from("/tmp/ro-test/state-only"),
+            "--state-dir alone was discarded in favour of the discovered path"
+        );
+        // The config side is still discovered: only the flag that was given
+        // is overridden.
+        assert_ne!(
+            paths.config_dir,
+            PathBuf::from("/tmp/ro-test/state-only"),
+            "an override of one directory must not invent the other"
+        );
+    }
+
+    /// `--config-dir` alone must be honoured, not dropped.
+    #[test]
+    fn config_dir_alone_is_honoured_not_discovered() {
+        let cli = Cli {
+            config_dir: Some(PathBuf::from("/tmp/ro-test/cfg-only")),
+            state_dir: None,
+            non_interactive: false,
+            command: Commands::Init,
+        };
+        let paths = resolve_paths(&cli).expect("paths resolve");
+        assert_eq!(
+            paths.config_dir,
+            PathBuf::from("/tmp/ro-test/cfg-only"),
+            "--config-dir alone was discarded in favour of the discovered path"
+        );
+        assert_ne!(
+            paths.state_dir,
+            PathBuf::from("/tmp/ro-test/cfg-only"),
+            "an override of one directory must not invent the other"
+        );
+    }
+
+    /// Both flags together: the case that already worked, pinned so the fix
+    /// for the two single-flag cases cannot take it away.
+    #[test]
+    fn both_flags_together_are_honoured() {
+        let cli = Cli {
+            config_dir: Some(PathBuf::from("/tmp/ro-test/cfg")),
+            state_dir: Some(PathBuf::from("/tmp/ro-test/state")),
+            non_interactive: false,
+            command: Commands::Init,
+        };
+        let paths = resolve_paths(&cli).expect("paths resolve");
+        assert_eq!(paths.config_dir, PathBuf::from("/tmp/ro-test/cfg"));
+        assert_eq!(paths.state_dir, PathBuf::from("/tmp/ro-test/state"));
+    }
+
+    /// Neither flag: discovery, unchanged.
+    #[test]
+    fn no_flags_still_discovers() {
+        let cli = Cli {
+            config_dir: None,
+            state_dir: None,
+            non_interactive: false,
+            command: Commands::Init,
+        };
+        let paths = resolve_paths(&cli).expect("paths resolve");
+        assert!(
+            paths.config_dir.ends_with("ro"),
+            "the discovered config dir is the XDG one, got {}",
+            paths.config_dir.display()
+        );
+        assert!(
+            paths.state_dir.ends_with("ro"),
+            "the discovered state dir is the XDG one, got {}",
+            paths.state_dir.display()
+        );
+    }
+
+    /// The cache directory follows the state directory whenever the state
+    /// directory is overridden.
+    ///
+    /// The both-flags arm already derived `cache_dir` from `state_dir`, so a
+    /// single-flag override that left it pointing at the *discovered* state
+    /// directory would put disposable caches next to a different
+    /// installation's durable state — the two would disagree about which
+    /// install they are talking about. With no override at all, discovery
+    /// still wins, because that is where `XDG_CACHE_HOME` points and nobody
+    /// asked for anything else.
+    #[test]
+    fn the_cache_dir_follows_the_state_dir_whenever_it_is_overridden() {
+        for state_dir in [
+            Some(PathBuf::from("/tmp/ro-test/s")),
+            Some(PathBuf::from("/tmp/ro-test/other")),
+        ] {
+            let cli = Cli {
+                config_dir: None,
+                state_dir,
+                non_interactive: false,
+                command: Commands::Init,
+            };
+            let paths = resolve_paths(&cli).expect("paths resolve");
+            assert_eq!(
+                paths.cache_dir,
+                paths.state_dir.join("cache"),
+                "cache_dir must be state_dir/cache, got {} for state {}",
+                paths.cache_dir.display(),
+                paths.state_dir.display()
+            );
+        }
+    }
+
+    /// With no override, discovery still supplies all three directories.
+    #[test]
+    fn no_override_leaves_all_three_to_discovery() {
+        let cli = Cli {
+            config_dir: None,
+            state_dir: None,
+            non_interactive: false,
+            command: Commands::Init,
+        };
+        let paths = resolve_paths(&cli).expect("paths resolve");
+        for (label, dir) in [
+            ("config", &paths.config_dir),
+            ("state", &paths.state_dir),
+            ("cache", &paths.cache_dir),
+        ] {
+            assert!(
+                dir.ends_with("ro"),
+                "the discovered {label} dir is the XDG one, got {}",
+                dir.display()
+            );
+        }
+    }
 
     /// The two spellings of one remote are the same repository.
     ///

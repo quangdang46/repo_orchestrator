@@ -95,6 +95,7 @@ fn guards(plan: &RepoPlan, repo: &std::path::Path, opts: &RunOptions) -> Option<
         Err(e) => {
             return Some(RepoOutcome::Failed {
                 error: format!("could not read {}: {e:#}", plan.label),
+                class: ro_core::FailureClass::MissingProvider,
             });
         }
     }
@@ -242,6 +243,16 @@ pub enum RepoOutcome {
     },
     Failed {
         error: String,
+        /// The taxonomy, carried to the user.
+        ///
+        /// `classify_agent_output` computed it correctly and it was dropped
+        /// at this boundary, so a rate-limited run ("retry in five minutes")
+        /// and a timeout run ("retry now") were the same news: both rendered
+        /// `failed: <error>`, and the JSON output had no class field at all.
+        /// A conflict-class fake and an auth-class fake were likewise
+        /// indistinguishable. The class is the difference between "wait" and
+        /// "fix something", and it was being thrown away.
+        class: ro_core::FailureClass,
     },
 }
 
@@ -284,7 +295,7 @@ impl RepoOutcome {
             RepoOutcome::Refused { reason, .. } => format!("refused: {reason}"),
             RepoOutcome::HandedOver { detail } => format!("needs you: {detail}"),
             RepoOutcome::Pushed { oid } => format!("pushed {oid}"),
-            RepoOutcome::Failed { error } => format!("failed: {error}"),
+            RepoOutcome::Failed { error, class } => format!("failed ({class}): {error}"),
         }
     }
 }
@@ -432,6 +443,7 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             Ok(false) => RepoOutcome::NothingToCommit,
             Err(e) => RepoOutcome::Failed {
                 error: format!("could not read {}: {e:#}", plan.label),
+                class: ro_core::FailureClass::MissingProvider,
             },
         };
     }
@@ -445,6 +457,7 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         Err(e) => {
             return RepoOutcome::Failed {
                 error: format!("could not lock {}: {e:#}", plan.label),
+                class: ro_core::FailureClass::MissingProvider,
             };
         }
     };
@@ -477,12 +490,14 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                             r.stderr.trim()
                         }
                     ),
-                };
+                class: ro_core::FailureClass::MissingProvider,
+            };
             }
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: format!("fetch failed: {e:#}"),
-                };
+                class: ro_core::FailureClass::MissingProvider,
+            };
             }
         }
     }
@@ -536,11 +551,14 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                             }
                         }
                         crate::ship::resolve::Resolution::Failed { error } => {
-                            RepoOutcome::Failed { error }
+                            RepoOutcome::Failed { error,
+                class: ro_core::FailureClass::MissingProvider,
+            }
                         }
                         _ => RepoOutcome::Failed {
                             error: "the rebase did not finish".to_string(),
-                        },
+                class: ro_core::FailureClass::MissingProvider,
+            },
                     };
                 }
             }
@@ -551,7 +569,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: e.to_string(),
-                };
+                class: ro_core::FailureClass::MissingProvider,
+            };
             }
         }
     }
@@ -591,7 +610,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             None => {
                 return RepoOutcome::Failed {
                     error: "the engine reported a commit with no commit id".into(),
-                };
+                class: ro_core::FailureClass::MissingProvider,
+            };
             }
         },
         // Nothing for the *engine* to do is not nothing for the *run*.
@@ -609,26 +629,32 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                 Ok(None) => {
                     return RepoOutcome::Failed {
                         error: "there is work to push but HEAD does not resolve".into(),
-                    }
+                class: ro_core::FailureClass::MissingProvider,
+            }
                 }
                 Err(e) => {
                     return RepoOutcome::Failed {
                         error: format!("could not read HEAD: {e:#}"),
-                    }
+                class: ro_core::FailureClass::MissingProvider,
+            }
                 }
             }
         }
         EngineOutcome::Unavailable { binary, hint } => {
             return RepoOutcome::Failed {
                 error: format!("{binary} is not installed. {hint}"),
+                class: ro_core::FailureClass::MissingProvider,
             };
         }
         EngineOutcome::TimedOut { after } => {
             return RepoOutcome::Failed {
                 error: format!("the engine did not finish within {after:?} and was killed"),
+                class: ro_core::FailureClass::MissingProvider,
             };
         }
-        EngineOutcome::Failed { error, .. } => return RepoOutcome::Failed { error },
+        EngineOutcome::Failed { error, .. } => return RepoOutcome::Failed { error,
+                class: ro_core::FailureClass::MissingProvider,
+            },
     };
 
     // `--amend`: fold what the engine just committed into the commit
@@ -653,7 +679,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: format!("amending HEAD failed: {e:#}"),
-                }
+                class: ro_core::FailureClass::MissingProvider,
+            }
             }
         }
     } else {
@@ -679,6 +706,7 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         Err(e) => {
             return RepoOutcome::Failed {
                 error: format!("credential: {e}"),
+                class: ro_core::FailureClass::MissingProvider,
             };
         }
     };
@@ -702,10 +730,12 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         Ok(r) if r.ok() => RepoOutcome::Pushed { oid },
         Ok(r) => RepoOutcome::Failed {
             error: format!("push failed: {}", r.stderr.trim()),
-        },
+                class: ro_core::FailureClass::MissingProvider,
+            },
         Err(e) => RepoOutcome::Failed {
             error: format!("push failed: {e:#}"),
-        },
+                class: ro_core::FailureClass::MissingProvider,
+            },
     }
 }
 
@@ -1467,7 +1497,9 @@ mod resolve_stage_tests {
         let outcome = run_one(&plan, &opts);
 
         match &outcome {
-            RepoOutcome::Failed { error } => {
+            RepoOutcome::Failed { error,
+                class: ro_core::FailureClass::MissingProvider,
+            } => {
                 assert!(
                     error.contains("ro-test-no-such-agent-binary-8f3a"),
                     "the engine's own message must reach the user, got: {error}"
@@ -2264,7 +2296,9 @@ mod protected_tests {
             unsafe { ro_testkit::TestEnv::new().shim(&shim).run(|| run_one(&plan, &opts)) };
 
         match &outcome {
-            RepoOutcome::Failed { error } => {
+            RepoOutcome::Failed { error,
+                class: ro_core::FailureClass::MissingProvider,
+            } => {
                 assert!(
                     error.contains("fetch failed"),
                     "the failure must name the fetch, got: {error}"

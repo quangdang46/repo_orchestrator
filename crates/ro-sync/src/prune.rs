@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn prune_repo_removes_tracked_repo() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let result = prune_repo(&conn, &repo.id).unwrap();
         assert!(result.removed);
         assert_eq!(result.owner, "alice");
@@ -340,7 +340,7 @@ mod tests {
     #[test]
     fn prune_archived_removes_archived() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/archived-repo", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/archived-repo", &projects_dir(&tmp), "nested").unwrap();
         // Mark as archived
         conn.execute(
             "UPDATE repos SET archived = 1 WHERE id = ?1",
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn prune_archived_skips_non_archived() {
         let (tmp, conn) = setup();
-        crate::manage::add(&conn, "alice/active", &projects_dir(&tmp)).unwrap();
+        crate::manage::add(&conn, "alice/active", &projects_dir(&tmp), "nested").unwrap();
         let results = prune_archived(&conn).unwrap();
         assert!(results.is_empty());
         assert_eq!(crate::manage::list(&conn, None).unwrap().len(), 1);
@@ -367,7 +367,7 @@ mod tests {
     #[test]
     fn prune_missing_removes_nonexistent_paths() {
         let (tmp, conn) = setup();
-        let _repo = crate::manage::add(&conn, "alice/gone", &projects_dir(&tmp)).unwrap();
+        let _repo = crate::manage::add(&conn, "alice/gone", &projects_dir(&tmp), "nested").unwrap();
         // Don't create the directory
         let results = prune_missing(&conn).unwrap();
         assert_eq!(results.len(), 1);
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn prune_missing_keeps_existing_paths() {
         let (tmp, conn) = setup();
-        let _repo = crate::manage::add(&conn, "alice/present", &projects_dir(&tmp)).unwrap();
+        let _repo = crate::manage::add(&conn, "alice/present", &projects_dir(&tmp), "nested").unwrap();
         // Create the local path
         let local = projects_dir(&tmp).join("alice").join("present");
         std::fs::create_dir_all(&local).unwrap();
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn prune_repo_with_sync_history_succeeds() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/with-history", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/with-history", &projects_dir(&tmp), "nested").unwrap();
 
         // Insert a run + sync_result so FK enforcement bites.
         conn.execute(
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn prune_archived_with_sync_history_succeeds() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/old", &projects_dir(&tmp)).unwrap();
+        let repo = crate::manage::add(&conn, "alice/old", &projects_dir(&tmp), "nested").unwrap();
         ro_state::queries::score_repo_health(&conn, &repo.id).unwrap();
         conn.execute(
             "UPDATE repos SET archived = 1 WHERE id = ?1",
@@ -447,7 +447,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
 
         let tracked_path = root.join("alice").join("tracked");
-        let tracked = crate::manage::add(&conn, "alice/tracked", &root).unwrap();
+        let tracked = crate::manage::add(&conn, "alice/tracked", &root, "nested").unwrap();
         make_repo_at(&tracked_path);
         make_repo_at(&root.join("alice").join("stray"));
         make_repo_at(&root.join("nobody").join("also-stray"));
@@ -466,7 +466,7 @@ mod tests {
         let root = projects_dir(&tmp);
         std::fs::create_dir_all(&root).unwrap();
         let p = root.join("alice").join("only");
-        crate::manage::add(&conn, "alice/only", &root).unwrap();
+        crate::manage::add(&conn, "alice/only", &root, "nested").unwrap();
         make_repo_at(&p);
 
         assert!(find_orphans(&conn, &root).unwrap().is_empty());
@@ -496,7 +496,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let p = root.join("alice").join("legacy");
         make_repo_at(&p);
-        crate::manage::add(&conn, "alice/legacy", &root).unwrap();
+        crate::manage::add(&conn, "alice/legacy", &root, "nested").unwrap();
 
         // Rewrite the stored path into the pre-fix spelling.
         let legacy = p.to_string_lossy().replace('\\', "/");
@@ -535,7 +535,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let p = root.join("alice").join("vanished");
         make_repo_at(&p);
-        crate::manage::add(&conn, "alice/vanished", &root).unwrap();
+        crate::manage::add(&conn, "alice/vanished", &root, "nested").unwrap();
 
         let stored = p.to_string_lossy();
         let with_trailing = format!("{stored}/");

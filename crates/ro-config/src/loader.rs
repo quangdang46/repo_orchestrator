@@ -153,6 +153,23 @@ pub fn classify_key(dotted_key: &str) -> KeyVerdict {
     let segments: Vec<&str> = dotted_key.split('.').collect();
     let table = segments[0];
 
+    // An empty segment — `core..parallel`, `core.parallel.`, `.core.layout` —
+    // is not a key. It is checked here, and not only in `set_key_in_file`,
+    // because this function is public: a caller that used it directly would
+    // otherwise be told `core..parallel` is a **known** key, because the leaf
+    // after the last dot is `parallel` and that is a real key of `[core]`.
+    if segments.iter().any(|s| s.is_empty()) {
+        return KeyVerdict::UnknownKey {
+            dotted: dotted_key.to_string(),
+            valid: known_keys_for(table)
+                .unwrap_or(&[])
+                .iter()
+                .map(|k| format!("{table}.{k}"))
+                .collect(),
+            suggestion: None,
+        };
+    }
+
     // A table ro no longer reads. This is the case the docs get wrong:
     // FEATURES.md tells a user to write `checkpoint.secret_scan = "warn"`,
     // and the file would then carry a table `load_config` warns about on the
@@ -174,6 +191,11 @@ pub fn classify_key(dotted_key: &str) -> KeyVerdict {
 
     // `[identity]` is a map of user-named profiles, so `identity.work.name` is
     // a real key and `identity.work.emali` is a typo inside a real profile.
+    //
+    // The profile name is the one segment a user chooses, and a name is
+    // allowed to contain a space — `identity.my profile.name` is a real key
+    // that round-trips today. So the malformed-key check below is skipped
+    // here, and the profile name is carried through untouched.
     if table == "identity" && segments.len() >= 3 {
         let leaf = segments[segments.len() - 1];
         let profile = format!("{}.<profile>", segments[..2].join("."));
@@ -204,6 +226,24 @@ pub fn classify_key(dotted_key: &str) -> KeyVerdict {
         };
     };
 
+    // A key that is not a TOML bare key. `is_modelled_field` builds a document
+    // out of the key and parses it, and a key containing a character that is
+    // not legal in a bare key — a space, a non-ASCII letter — makes that
+    // document unparseable. It used to `.expect` the parse, so
+    // `ro config set "core.parallel 4=1"` panicked with a stack trace. A
+    // config tool that panics on a typo is worse than one that rejects it.
+    //
+    // This runs before the `valid.contains` check on purpose: `core.parallel
+    // 4` is not a key of `[core]`, and the message must say what a key looks
+    // like rather than listing four valid keys the user did not mean.
+    if !is_bare_key(leaf) {
+        return KeyVerdict::UnknownKey {
+            dotted: dotted_key.to_string(),
+            valid: valid.iter().map(|k| format!("{table}.{k}")).collect(),
+            suggestion: nearest_key(leaf, valid).map(|k| format!("{table}.{k}")),
+        };
+    }
+
     if valid.contains(&leaf) {
         return KeyVerdict::Known;
     }
@@ -221,11 +261,23 @@ pub fn classify_key(dotted_key: &str) -> KeyVerdict {
     // name a key the schema rejects: `identity.default` and
     // `identity.personal` are both structurally `Option<String>`-shaped, and
     // only the first is a real key.
+    //
+    // The suggestion is computed from the leaf, not from this probe. On a
+    // struct with `deny_unknown_fields` — `[auth]`, `[agent]`, and each
+    // engine slot — the probe returns true for *every* key, because a typo is
+    // refused by serde and that refusal is the same signal the probe reads as
+    // "a real field". So the branch below was unreachable for `[auth]`, and
+    // `ro config set auth.hets=…` was refused with no suggestion while the
+    // same typo inside `[github]` was offered `Did you mean github.auth?`.
+    // The leaf is what a suggestion is about, and it is the same information
+    // either way.
+    let suggestion = nearest_key(leaf, valid).map(|k| format!("{table}.{k}"));
+
     if !is_modelled_field::<AppConfig>(dotted_key) {
         return KeyVerdict::UnknownKey {
             dotted: dotted_key.to_string(),
             valid: valid.iter().map(|k| format!("{table}.{k}")).collect(),
-            suggestion: nearest_key(leaf, valid).map(|k| format!("{table}.{k}")),
+            suggestion,
         };
     }
 
@@ -233,8 +285,42 @@ pub fn classify_key(dotted_key: &str) -> KeyVerdict {
     KeyVerdict::UnknownKey {
         dotted: dotted_key.to_string(),
         valid: valid.iter().map(|k| format!("{table}.{k}")).collect(),
-        suggestion: None,
+        suggestion,
     }
+}
+
+/// Is `leaf` a TOML bare key?
+///
+/// Bare keys are ASCII `A-Za-z0-9_-` only. Anything else — a space, a
+/// non-ASCII letter, a `"` — makes the document `is_modelled_field` builds
+/// unparseable, which is the difference between a clear error and a panic.
+///
+/// This is checked on the **leaf** rather than the whole dotted key: the
+/// segments above it are table names, and a table name is not something the
+/// user types into a key — it is the key's first half, already validated by
+/// `known_keys_for` returning `Some`.
+fn is_bare_key(leaf: &str) -> bool {
+    !leaf.is_empty()
+        && leaf
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// The note written when a key lands in a table ro has never heard of.
+///
+/// Split out so the promise in it can be checked against the behaviour it
+/// describes. It names `ro doctor --fix` and not `ro doctor`: plain `doctor`
+/// returns a verdict for a config that parses and never inspects what else
+/// is in the file, so a provisioning script that seeds a table for a future
+/// ro was told ro would surface it and then ro said nothing. `--fix` is the
+/// verb that reaches the code reporting "left unrecognised table(s) in
+/// place: …", so that is the verb named here.
+fn unknown_table_warning(table: &str, dotted_key: &str) -> String {
+    format!(
+        "warning: [{table}] is not a table this version of ro reads; \
+         writing {dotted_key} anyway in case it belongs to a newer ro. \
+         `ro doctor --fix` will name it as unrecognised."
+    )
 }
 
 /// Set one `dotted.key` in a TOML file, in place.
@@ -280,12 +366,7 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
             // it is the same posture `doctor --fix` takes: the table stays,
             // and the user is told which one ro did not recognise. Silently
             // writing it is what makes a future key look like a live one.
-            let note = format!(
-                "warning: [{table}] is not a table this version of ro reads; \
-                 writing {dotted_key} anyway in case it belongs to a newer ro. \
-                 `ro doctor` will name it as unrecognised.",
-                table = segments[0]
-            );
+            let note = unknown_table_warning(segments[0], dotted_key);
             tracing::warn!("{note}");
             eprintln!("{note}");
         }
@@ -320,9 +401,12 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
         }
     }
 
-    let (leaf, parents) = segments
-        .split_last()
-        .expect("split('.').collect() always yields at least one segment");
+    // An `expect` here would be unreachable — `split` always yields at least
+    // one segment — but this is the path a user-supplied key walks, and an
+    // error costs nothing where a panic would be a stack trace.
+    let Some((leaf, parents)) = segments.split_last() else {
+        anyhow::bail!("config key {dotted_key:?} has no path segment");
+    };
 
     // Walk or create each parent table. A key like `core.layout` on a file that
     // has no `[core]` yet should add the table, not fail.
@@ -855,5 +939,249 @@ bin = \"claude\"
         let msg = err.to_string();
         assert!(msg.contains("core.layout.x"), "got: {msg}");
         assert!(msg.contains("core.layout"), "got: {msg}");
+    }
+
+    // ── A key that is not a key ──────────────────────────────────────────
+    //
+    // `is_modelled_field` builds a TOML document out of the key the user
+    // typed and parses it. A key containing a character that is not legal in
+    // a TOML bare key — a space, a non-ASCII letter — makes that document
+    // unparseable, and the `.expect` on the parse panicked. A config tool
+    // that panics on a typo is worse than one that rejects it: the user
+    // typed something, and the answer was a stack trace.
+
+    /// The most likely typo of all: a space where the dot goes.
+    /// `ro config set "core.parallel 4=1"` panicked with
+    /// `a bare key and a bool always parse`.
+    #[test]
+    fn a_key_with_a_space_is_an_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = default_config_toml();
+        std::fs::write(&path, original).unwrap();
+
+        let err = set_key_in_file(&path, "core.parallel 4", "1").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("core.parallel 4"),
+            "the error must name the key as typed, got: {msg}"
+        );
+        assert!(
+            msg.contains("core.parallel"),
+            "the error must name the key that was meant, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a malformed key must not be written"
+        );
+    }
+
+    /// An empty segment: `core..parallel` and `core.parallel.`. The first
+    /// is a typo; the second is a trailing dot. Both are refused, and
+    /// `classify_key` refuses them too — a caller that used it directly
+    /// would otherwise be told `core..parallel` is a **known** key, because
+    /// the leaf after the last dot is `parallel` and that is real.
+    #[test]
+    fn an_empty_segment_is_an_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = default_config_toml();
+        std::fs::write(&path, original).unwrap();
+
+        for key in ["core..parallel", "core.parallel.", ".core.parallel"] {
+            let err = set_key_in_file(&path, key, "1").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains(key), "the error must name {key}, got: {msg}");
+            assert!(
+                msg.contains("empty"),
+                "the error must say what is wrong, got: {msg}"
+            );
+            // Never `Known`. `core..parallel` is the case that matters: the
+            // leaf after the last dot is `parallel`, which IS a real key of
+            // `[core]`, so a check that only looked at the leaf would accept
+            // it.
+            match classify_key(key) {
+                KeyVerdict::UnknownKey { suggestion, .. } => {
+                    assert_eq!(suggestion, None, "{key} must suggest nothing")
+                }
+                other => panic!("{key} must classify as UnknownKey, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "no malformed key may be written"
+        );
+    }
+
+    /// A non-ASCII character. TOML bare keys are ASCII `A-Za-z0-9_-`, so
+    /// `core.parallèle` is not a key this tool can write — and it must say
+    /// so rather than panic.
+    #[test]
+    fn a_non_ascii_key_is_an_error_not_a_panic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = default_config_toml();
+        std::fs::write(&path, original).unwrap();
+
+        let err = set_key_in_file(&path, "core.parallèle", "1").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("core.parallèle"),
+            "the error must name the key as typed, got: {msg}"
+        );
+        assert!(
+            msg.contains("core.parallel"),
+            "the error must name the key that was meant, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a malformed key must not be written"
+        );
+    }
+
+    /// A key that is malformed in a way no valid key is near. The error
+    /// must still name what a valid key looks like, because that is the
+    /// only thing the user came here to learn.
+    #[test]
+    fn a_malformed_key_with_no_near_neighbour_still_says_what_a_key_looks_like() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = default_config_toml();
+        std::fs::write(&path, original).unwrap();
+
+        let err = set_key_in_file(&path, "core.zzzzzzzz", "1").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("core.zzzzzzzz"), "got: {msg}");
+        assert!(
+            msg.contains("core.layout"),
+            "the valid keys must be named, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a malformed key must not be written"
+        );
+    }
+
+    /// The probe itself must not panic on any key. This is the property the
+    /// `.expect` violated, asserted directly rather than through the four
+    /// shapes above.
+    #[test]
+    fn is_modelled_field_never_panics_on_a_user_supplied_key() {
+        for key in [
+            "core.parallel 4",
+            "core..parallel",
+            "core.parallel.",
+            "core.parallèle",
+            "core.zzzzzzzz",
+            "core",
+            "",
+            "core.layout.x",
+            "identity.work.emali",
+            "auth.tokn",
+            "github.aut",
+            "agent.engin",
+            "checkpoint.secret_scan",
+            "future_feature.experimental",
+        ] {
+            let _ = crate::schema::is_modelled_field::<crate::schema::AppConfig>(key);
+        }
+    }
+
+    // ── [auth] gets a "Did you mean" like every other table ─────────────
+    //
+    // `AuthConfig` carries `deny_unknown_fields`, so `is_modelled_field`
+    // returns true for EVERY auth key — a typo is refused by serde, which is
+    // the same "is an error" signal the probe reads as "this is a real
+    // field". The branch that computed the suggestion was therefore
+    // unreachable for `[auth]`, and execution fell through to the final
+    // return, which carries `suggestion: None`. `ro config set auth.hets=…`
+    // said "not a setting ro reads" and stopped.
+    //
+    // The fix is to decide the suggestion from the leaf, which is what the
+    // suggestion is *about*, rather than from a probe whose answer is
+    // degenerate on a closed struct.
+
+    /// The bug: a typo inside `[auth]` gets no suggestion, while the same
+    /// typo inside `[github]` does.
+    #[test]
+    fn a_typo_inside_auth_gets_the_same_suggestion_as_every_other_table() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = default_config_toml();
+        std::fs::write(&path, original).unwrap();
+
+        let err = set_key_in_file(&path, "auth.hets", "\"env:X\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("auth.hets"), "got: {msg}");
+        assert!(
+            msg.contains("Did you mean auth.https?"),
+            "[auth] must get the same treatment as every other table, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a refused key must not be written"
+        );
+    }
+
+    /// The shape of the property, stated once for every table rather than
+    /// for `[auth]` alone: whenever a leaf is one edit away from a valid key
+    /// of the same table, the refusal says which one.
+    #[test]
+    fn every_table_suggests_a_near_miss() {
+        for (typo, expected) in [
+            ("core.paralel", "core.parallel"),
+            ("github.aut", "github.auth"),
+            ("agent.engin", "agent.engine"),
+            ("auth.hets", "auth.https"),
+            ("auth.exected_login", "auth.expected_login"),
+        ] {
+            match classify_key(typo) {
+                KeyVerdict::UnknownKey { suggestion, .. } => assert_eq!(
+                    suggestion.as_deref(),
+                    Some(expected),
+                    "{typo} must be refused with a suggestion of {expected}"
+                ),
+                other => panic!("{typo} must be UnknownKey, got {other:?}"),
+            }
+        }
+    }
+
+    // ── The message and the behaviour must agree ─────────────────────────
+    //
+    // This warning used to promise that `ro doctor` would name the
+    // unrecognised table. Plain `ro doctor` does not: with no `--fix` it
+    // returns a verdict for a config that parses and never inspects what
+    // else is in the file. Only `doctor --fix` reaches the code that reports
+    // "left unrecognised table(s) in place: …".
+    //
+    // The check below is against `--fix` because that is the verb that does
+    // it. The one-line change that would make plain `ro doctor` name the
+    // table as well is recorded against `crates/ro/src/doctor.rs`, which
+    // this stream does not own.
+
+    /// The promise names the verb that keeps it.
+    #[test]
+    fn the_unknown_table_warning_promises_the_verb_that_keeps_the_promise() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        // `set_key_in_file` writes the note to stderr, so the message is
+        // checked where it is built rather than by capturing the stream.
+        let note = unknown_table_warning("future_feature", "future_feature.x");
+        assert!(
+            note.contains("ro doctor --fix"),
+            "the promise must name the verb that keeps it, got: {note}"
+        );
+        assert!(
+            !note.contains("`ro doctor` will"),
+            "plain `ro doctor` stays silent about an unrecognised table, so \
+             the note must not promise it: {note}"
+        );
     }
 }

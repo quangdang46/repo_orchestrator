@@ -138,7 +138,7 @@ fn register(t: &Test, path: &std::path::Path) -> String {
     t.cmd().arg("add").arg(path).assert().success();
     let out = t
         .cmd()
-        .args(["list", "--format", "json"])
+        .args(["list", "--format", "ndjson"])
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);

@@ -61,7 +61,7 @@ impl Test {
         self.cmd().arg("add").arg(path).assert().success();
         let out = self
             .cmd()
-            .args(["list", "--format", "json"])
+            .args(["list", "--format", "ndjson"])
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);

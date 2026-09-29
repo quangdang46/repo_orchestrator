@@ -121,7 +121,7 @@ impl Test {
     fn rows(&self) -> Vec<serde_json::Value> {
         let out = self
             .cmd()
-            .args(["list", "--format", "json"])
+            .args(["list", "--format", "ndjson"])
             .output()
             .expect("ro list runs");
         assert!(
@@ -245,7 +245,7 @@ fn name_sets_an_alias_and_not_the_repo_name() {
 
     // And the alias resolves, which is the whole point of setting it.
     t.cmd()
-        .args(["status", "backend", "--format", "json"])
+        .args(["status", "backend", "--format", "ndjson"])
         .assert()
         .success();
 }

@@ -222,7 +222,6 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
 
     let mut checks = Vec::new();
     checks.push(check_git());
-    checks.push(check_github_auth());
     let paths = opts.paths.clone().unwrap_or_else(|| {
         ConfigPaths::discover().unwrap_or_else(|_| {
             // fallback to tmp dir for testability - in real usage this should not fail
@@ -235,6 +234,7 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
         })
     });
 
+    checks.push(check_github_auth(&paths));
     let (cfg_check, applied_fix_count) = check_and_optionally_fix_config(&paths, opts.fix);
     checks.push(cfg_check);
 
@@ -256,7 +256,17 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
     // happened is that ro created it.
     if paths.state_db().exists() {
         if let Ok(conn) = ro_state::open_db(&paths.state_db()) {
-            checks.extend(check_repo_write_access(&conn, None));
+            // `github.host` is read here. The `base_uri` was a hardcoded
+            // `None`, so every probe went to `github.com` whatever the
+            // config said — a workspace-wide grep for `github.host` found it
+            // only in comments and tests. A user on GitHub Enterprise was
+            // diagnosed against the public API and told their token was
+            // rejected (HTTP 401) when it had never been offered to the
+            // right host. `ro_github::auth::build_client` already takes
+            // `Option<&str>` and builds `https://{host}/api/v3` for a host
+            // that is not `github.com`; it was simply never given one.
+            let host = github_host(&paths);
+            checks.extend(check_repo_write_access(&conn, host.as_deref()));
         }
     }
 
@@ -542,9 +552,52 @@ fn check_repo_write_access(
 /// swallowed — so a run could push with a credential nobody chose and the only
 /// evidence was that it worked. Naming the source is what turns "it found a
 /// token" into something a user can check against what they expected.
-fn check_github_auth() -> CheckResult {
-    let env_result = discover_token("env");
-    let gh_result = if env_result.is_err() {
+/// The `github.host` the doctor should probe, or `None` for github.com.
+///
+/// `None` is what `build_client` wants for the public API, so a default
+/// install takes the same path it always did.
+fn github_host(paths: &ro_config::ConfigPaths) -> Option<String> {
+    let cfg = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
+    match cfg.github.host.as_str() {
+        "" | "github.com" | "api.github.com" => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// The `github.auth` strategy, mapped onto what `discover_token` implements.
+///
+/// `discover_token` accepts `env` and `gh` and **rejects** `auto` and
+/// `config-token` with the sentence "a strategy that falls back silently can
+/// push with a credential nobody chose". `validate` accepts all four. So
+/// the two the validator permits and the discoverer refuses are mapped here
+/// rather than passed through naively: `auto` is genuinely "try, and say
+/// which one answered" and `config-token` is the per-row `credential_ref`
+/// path, which the per-repo probe below already covers.
+fn github_auth_strategy(configured: &str) -> &'static str {
+    match configured {
+        "gh" => "gh",
+        // `auto` and `config-token` both mean "more than one place" or
+        // "not the ambient env"; neither is a single source, so both are
+        // probed in order and the source is named.
+        _ => "env",
+    }
+}
+
+fn check_github_auth(paths: &ro_config::ConfigPaths) -> CheckResult {
+    // `github.auth` is read here. It was hardcoded to `env` then `gh`, so
+    // all four settings produced byte-identical output — and a user who
+    // wrote `github.auth = "env"` **specifically to pin the credential
+    // source** got a `gh` credential anyway, which is exactly the silent
+    // fallback `discover_token`'s own error text says ro forbids.
+    let configured = ro_config::load_config(&paths.config_toml())
+        .unwrap_or_default()
+        .github
+        .auth;
+    let pinned = matches!(configured.as_str(), "env" | "gh");
+    let env_result = discover_token(github_auth_strategy(&configured));
+    // A **pinned** strategy is not allowed to fall through. An unpinned one
+    // still gets the second source, and the result says which answered.
+    let gh_result = if env_result.is_err() && !pinned {
         discover_token("gh").err()
     } else {
         None
@@ -2053,6 +2106,7 @@ layout = \"flat\"
             &checkout.to_string_lossy(),
             projects.path(),
             &ro_sync::manage::AddOptions::default(),
+            "flat",
         )
         .expect("the repo is tracked");
         assert_eq!(repo.owner, owner);

@@ -111,7 +111,12 @@ pub fn init(paths: &ConfigPaths) -> Result<bool> {
 /// Add a repo to tracking. Parses the spec, resolves the local path, and
 /// inserts into the `repos` table. Fails on duplicate (host, owner, name).
 /// Owner and name are normalized to lowercase (GitHub is case-insensitive).
-pub fn add(conn: &Connection, spec_str: &str, projects_dir: &Path) -> Result<TrackedRepo> {
+pub fn add(
+    conn: &Connection,
+    spec_str: &str,
+    projects_dir: &Path,
+    layout: &str,
+) -> Result<TrackedRepo> {
     let mut spec =
         RepoSpec::parse(spec_str).map_err(|e| anyhow::anyhow!("invalid repo spec: {e}"))?;
     spec.owner = spec.owner.to_ascii_lowercase();
@@ -134,7 +139,7 @@ pub fn add(conn: &Connection, spec_str: &str, projects_dir: &Path) -> Result<Tra
     }
 
     let id = Uuid::new_v4().to_string();
-    let local_path = resolve_local_path(projects_dir, &spec);
+    let local_path = resolve_local_path(projects_dir, &spec, layout);
     let now = now_secs();
 
     conn.execute(
@@ -322,6 +327,7 @@ pub fn add_from_input(
     input: &str,
     projects_dir: &Path,
     opts: &AddOptions,
+    layout: &str,
 ) -> Result<TrackedRepo> {
     // Validate the credential before anything else, including before the
     // clone. `ro add --credential ghp_...` should fail without a network
@@ -338,10 +344,16 @@ pub fn add_from_input(
             if opts.branch.is_some() {
                 spec.branch = opts.branch.clone();
             }
-            let dest = opts
-                .clone_to
-                .clone()
-                .unwrap_or_else(|| projects_dir.join(&spec.owner).join(&spec.name));
+            // The same `core.layout` reading as `resolve_local_path`, so
+            // the path the row is written with and the path the clone
+            // happens into cannot disagree. See the comment there.
+            let dest = opts.clone_to.clone().unwrap_or_else(|| {
+                if layout == "nested" {
+                    projects_dir.join(&spec.owner).join(&spec.name)
+                } else {
+                    projects_dir.join(&spec.name)
+                }
+            });
 
             if dest.exists() {
                 bail!(
@@ -736,8 +748,28 @@ pub fn find_repo(conn: &Connection, key: &str) -> Result<TrackedRepo> {
 /// canonicalizes before comparing, which is what rescues the forward-slash
 /// rows already sitting in existing `state.db` files. Both halves are
 /// required; either alone leaves users with a wrong orphan list.
-fn resolve_local_path(projects_dir: &Path, spec: &RepoSpec) -> String {
-    let joined = projects_dir.join(&spec.owner).join(&spec.name);
+fn resolve_local_path(projects_dir: &Path, spec: &RepoSpec, layout: &str) -> String {
+    // `core.layout` says `flat | nested` in the shipped config and the code
+    // kept **neither**: both this function and `add_from_input` below did
+    // `projects_dir.join(&spec.owner).join(&spec.name)` unconditionally, so
+    // `layout=flat` and `layout=nested` produced byte-identical destinations.
+    // The key was documented, settable, echoed by `ro config print`, and
+    // read by nothing.
+    //
+    // The reading is the one the two words describe: `flat` is
+    // `projects/<name>` and `nested` is `projects/<owner>/<name>`. An
+    // unrecognised value is treated as `flat`, which is the same fallback
+    // `validate` implies by restricting the key to those two.
+    //
+    // The layout is a **parameter**, not a config read: `ro-sync` is a
+    // library and a library that reads the user's config file on the way to
+    // building a path makes every caller's tests depend on the machine they
+    // run on. The caller reads the config once and passes the value down.
+    let joined = if layout == "nested" {
+        projects_dir.join(&spec.owner).join(&spec.name)
+    } else {
+        projects_dir.join(&spec.name)
+    };
     ro_config::paths::expand_tilde(&joined.to_string_lossy())
         .to_string_lossy()
         .into_owned()
@@ -775,8 +807,8 @@ mod tests {
     fn a_bare_name_matching_two_owners_is_an_ambiguity_not_a_coin_flip() {
         let (_tmp, conn) = setup();
         let root = projects_dir(&TempDir::new().unwrap());
-        add(&conn, "acme/api", &root).unwrap();
-        add(&conn, "globex/api", &root).unwrap();
+        add(&conn, "acme/api", &root, "nested").unwrap();
+        add(&conn, "globex/api", &root, "nested").unwrap();
 
         let err = find_repo(&conn, "api").unwrap_err();
         let msg = format!("{err:#}");
@@ -796,8 +828,8 @@ mod tests {
     fn a_unique_bare_name_resolves() {
         let (_tmp, conn) = setup();
         let root = projects_dir(&TempDir::new().unwrap());
-        add(&conn, "acme/api", &root).unwrap();
-        add(&conn, "globex/web", &root).unwrap();
+        add(&conn, "acme/api", &root, "nested").unwrap();
+        add(&conn, "globex/web", &root, "nested").unwrap();
 
         assert_eq!(find_repo(&conn, "api").unwrap().owner, "acme");
         assert_eq!(find_repo(&conn, "API").unwrap().owner, "acme");
@@ -861,7 +893,7 @@ mod tests {
     #[test]
     fn add_basic() {
         let (tmp, conn) = setup();
-        let repo = add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp)).unwrap();
+        let repo = add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap();
         assert_eq!(repo.owner, "quangdang46");
         assert_eq!(repo.name, "repo_orchestrator");
         assert_eq!(repo.host, "github.com");
@@ -875,6 +907,7 @@ mod tests {
             &conn,
             "quangdang46/repo_orchestrator#develop as ro",
             &projects_dir(&tmp),
+            "flat",
         )
         .unwrap();
         assert_eq!(repo.branch.as_deref(), Some("develop"));
@@ -884,22 +917,22 @@ mod tests {
     #[test]
     fn add_rejects_duplicate() {
         let (tmp, conn) = setup();
-        add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp)).unwrap();
-        let err = add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp)).unwrap_err();
+        add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap();
+        let err = add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap_err();
         assert!(err.to_string().contains("already tracked"));
     }
 
     #[test]
     fn add_rejects_invalid_spec() {
         let (tmp, conn) = setup();
-        let err = add(&conn, "notaslash", &projects_dir(&tmp)).unwrap_err();
+        let err = add(&conn, "notaslash", &projects_dir(&tmp), "nested").unwrap_err();
         assert!(err.to_string().contains("invalid repo spec"));
     }
 
     #[test]
     fn remove_by_owner_name() {
         let (tmp, conn) = setup();
-        add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp)).unwrap();
+        add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap();
         let removed = remove(&conn, "quangdang46/repo_orchestrator").unwrap();
         assert_eq!(removed.name, "repo_orchestrator");
         assert!(list(&conn, None).unwrap().is_empty());
@@ -912,6 +945,7 @@ mod tests {
             &conn,
             "quangdang46/repo_orchestrator as ro",
             &projects_dir(&tmp),
+            "flat",
         )
         .unwrap();
         let removed = remove(&conn, "ro").unwrap();
@@ -931,7 +965,7 @@ mod tests {
     #[test]
     fn remove_clears_dependent_rows() {
         let (tmp, conn) = setup();
-        let repo = add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let repo = add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
 
         conn.execute(
             "INSERT INTO runs (id, command, started_at, args_json) VALUES (?1, ?2, ?3, ?4)",
@@ -965,8 +999,8 @@ mod tests {
     #[test]
     fn list_returns_added_repos() {
         let (tmp, conn) = setup();
-        add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
-        add(&conn, "bob/proj2", &projects_dir(&tmp)).unwrap();
+        add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        add(&conn, "bob/proj2", &projects_dir(&tmp), "nested").unwrap();
         let repos = list(&conn, None).unwrap();
         assert_eq!(repos.len(), 2);
     }
@@ -974,8 +1008,8 @@ mod tests {
     #[test]
     fn list_with_owner_filter() {
         let (tmp, conn) = setup();
-        add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
-        add(&conn, "bob/proj2", &projects_dir(&tmp)).unwrap();
+        add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        add(&conn, "bob/proj2", &projects_dir(&tmp), "nested").unwrap();
         let repos = list(&conn, Some("alice")).unwrap();
         assert_eq!(repos.len(), 1);
         assert_eq!(repos[0].owner, "alice");
@@ -991,7 +1025,7 @@ mod tests {
     #[test]
     fn setting_a_credential_ref_rejects_a_pasted_secret() {
         let (tmp, conn) = setup();
-        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        add(&conn, "acme/api", &projects_dir(&tmp), "nested").unwrap();
 
         let err = set_repo_config(
             &conn,
@@ -1017,7 +1051,7 @@ mod tests {
     #[test]
     fn setting_a_credential_ref_accepts_a_reference() {
         let (tmp, conn) = setup();
-        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        add(&conn, "acme/api", &projects_dir(&tmp), "nested").unwrap();
         set_repo_config(&conn, "acme/api", "credential_ref", "env:WORK_GH_TOKEN").unwrap();
         set_repo_config(&conn, "acme/api", "author_ref", "work").unwrap();
         set_repo_config(&conn, "acme/api", "engine", "codex").unwrap();
@@ -1035,7 +1069,7 @@ mod tests {
     #[test]
     fn non_credential_keys_are_not_parsed_as_references() {
         let (tmp, conn) = setup();
-        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        add(&conn, "acme/api", &projects_dir(&tmp), "nested").unwrap();
         set_repo_config(&conn, "acme/api", "author_ref", "Tran Quang Dang").unwrap();
         set_repo_config(&conn, "acme/api", "engine_args", "--model opus").unwrap();
         let row = &list(&conn, None).unwrap()[0];
@@ -1046,7 +1080,7 @@ mod tests {
     #[test]
     fn setting_an_unknown_config_key_is_a_named_error() {
         let (tmp, conn) = setup();
-        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        add(&conn, "acme/api", &projects_dir(&tmp), "nested").unwrap();
         let err = set_repo_config(&conn, "acme/api", "token", "whatever").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown per-repo config key"), "got: {msg}");
@@ -1139,6 +1173,7 @@ mod tests {
             "git@github.com:acme/definitely-not-a-real-repo-xyz.git",
             &projects,
             &AddOptions::default(),
+            "flat",
         );
         assert!(result.is_err(), "cloning a nonexistent remote must fail");
 
@@ -1164,6 +1199,7 @@ mod tests {
                 clone_to: Some(projects_dir(&tmp).join("acme").join("api")),
                 ..Default::default()
             },
+            "flat",
         );
         // The credential check runs before the clone, so this is the
         // credential error rather than a network failure.
@@ -1187,6 +1223,7 @@ mod tests {
                 author_ref: Some("work".into()),
                 ..Default::default()
             },
+            "flat",
         )
         .unwrap();
 
@@ -1292,7 +1329,7 @@ mod tests {
     #[test]
     fn per_repo_config_survives_the_list_round_trip() {
         let (tmp, conn) = setup();
-        let added = add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        let added = add(&conn, "acme/api", &projects_dir(&tmp), "nested").unwrap();
 
         conn.execute(
             "UPDATE repos SET credential_ref = ?1, author_ref = ?2, engine = ?3, engine_args = ?4 \
@@ -1315,8 +1352,8 @@ mod tests {
     #[test]
     fn per_repo_config_is_per_row() {
         let (tmp, conn) = setup();
-        let a = add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
-        let b = add(&conn, "acme/web", &projects_dir(&tmp)).unwrap();
+        let a = add(&conn, "acme/api", &projects_dir(&tmp), "nested").unwrap();
+        let b = add(&conn, "acme/web", &projects_dir(&tmp), "nested").unwrap();
 
         conn.execute(
             "UPDATE repos SET engine = 'claude' WHERE id = ?1",
@@ -1340,7 +1377,7 @@ mod tests {
     #[test]
     fn a_freshly_added_repo_inherits_everything() {
         let (tmp, conn) = setup();
-        add(&conn, "acme/api", &projects_dir(&tmp)).unwrap();
+        add(&conn, "acme/api", &projects_dir(&tmp), "nested").unwrap();
         let row = &list(&conn, None).unwrap()[0];
         assert_eq!(row.credential_ref, None);
         assert_eq!(row.author_ref, None);
@@ -1373,7 +1410,7 @@ mod tests {
     #[test]
     fn find_repo_by_id() {
         let (tmp, conn) = setup();
-        let added = add(&conn, "alice/proj1", &projects_dir(&tmp)).unwrap();
+        let added = add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let found = find_repo(&conn, &added.id).unwrap();
         assert_eq!(found.name, "proj1");
     }

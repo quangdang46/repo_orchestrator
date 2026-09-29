@@ -118,6 +118,22 @@ pub fn value_looks_like_a_credential(value: &str) -> bool {
     if value.starts_with("eyJ") && value.split('.').count() == 3 {
         return true;
     }
+    // **A location is not a token.** "≥32 characters and no whitespace" is
+    // not a credential shape, it is a *shape*, and ordinary configuration is
+    // full of long space-free values: a real `PATH` is 76 characters of
+    // colon-separated directories, and `/opt/app/lib/python3.12/site-packages`
+    // is 36. Both were stripped, so the agent was handed **no `PATH` at
+    // all** and `command -v node` came back NOT-FOUND — the agent could not
+    // find its own runtime. A filter that eats configuration is not a
+    // filter, it is a denial of service against the tool.
+    //
+    // A path separator, a list separator, or a backslash says the value
+    // names *where something is*, and that is true of a filesystem path, a
+    // `PATH`, a `LD_LIBRARY_PATH`, an URL, and a comma-separated include
+    // list — none of which is a bearer token.
+    if value.contains('/') || value.contains('\\') || value.contains(':') {
+        return false;
+    }
     value.len() >= 32 && !value.contains(char::is_whitespace)
 }
 
@@ -144,9 +160,25 @@ pub fn is_conclusive_credential_shape(value: &str) -> bool {
 pub fn name_looks_secret(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
     const MARKERS: &[&str] = &[
-        "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "API_KEY", "PAT",
+        "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CRED", "KEY", "PAT", "AUTH",
+        "PRIVATE",
     ];
-    MARKERS.iter().any(|m| n.contains(m))
+    // **A marker is a word, not a substring.** `PAT` matched `PATH`,
+    // `PYTHONPATH`, `PKG_CONFIG_PATH`, `COMPAT`, `SPATIAL_INDEX` and
+    // `PATTERN` — which is most of the configuration an agent needs to run
+    // at all, each one of them stripped because its *value* happened to be
+    // long and space-free. A `PAT` is a segment; a `PATH` is a different
+    // word that happens to start with the same three letters.
+    //
+    // `CRED` and `KEY` are here for the leak they close: a user who names
+    // their credential variable `WORK_CRED` and puts a 40-character opaque
+    // token in it leaked the whole token to the engine, because `CRED` is
+    // not `CREDENTIAL` and nothing else in the name agreed. The second tier
+    // exists because the user chose the name; a name they chose can be any
+    // of these.
+    n.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|seg| !seg.is_empty())
+        .any(|seg| MARKERS.iter().any(|m| seg == *m || seg.ends_with(m)))
 }
 
 /// The environment for an engine's child process.
@@ -533,5 +565,77 @@ mod leak_tests {
         for k in ["EDITOR", "SSH_AUTH_SOCK", "API_KEY_URL", "NPM_CONFIG", "API_KEY"] {
             assert!(env.get(k).is_some(), "{k} must survive the gate");
         }
+    }
+
+    /// A **realistic `PATH` is not a credential**, and neither is a
+    /// `PYTHONPATH` or a `PKG_CONFIG_PATH`.
+    ///
+    /// The gate ate all three. `name_looks_secret` returned true for any
+    /// name containing `PAT` as a substring — `PATH`, `PYTHONPATH`,
+    /// `PKG_CONFIG_PATH`, `COMPAT`, `SPATIAL_INDEX`, `PATTERN` — and
+    /// `value_looks_like_a_credential` returned true for any value ≥32
+    /// characters with no whitespace. A 76-character colon-separated `PATH`
+    /// was therefore stripped entirely, the agent was handed **no `PATH` at
+    /// all**, and `command -v node` came back NOT-FOUND: the agent could not
+    /// find its own runtime.
+    ///
+    /// This is the exact failure the negative control above was written to
+    /// prevent, and it passed that test because the test's values are all
+    /// short or contain whitespace.
+    #[test]
+    fn a_realistic_path_is_not_stripped() {
+        let env = ChildEnv::subtracting([
+            (
+                "PATH",
+                "/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            ),
+            ("PYTHONPATH", "/opt/app/lib/python3.12/site-packages"),
+            ("PKG_CONFIG_PATH", "/opt/libs/boost/1.85/lib/pkgconfig"),
+            ("LD_LIBRARY_PATH", "/opt/libs/boost/1.85/lib"),
+            ("COMPAT", "/opt/compat/lib"),
+            ("PATTERN", "/opt/patterns/*.json"),
+        ]);
+        for k in [
+            "PATH",
+            "PYTHONPATH",
+            "PKG_CONFIG_PATH",
+            "LD_LIBRARY_PATH",
+            "COMPAT",
+            "PATTERN",
+        ] {
+            assert!(env.get(k).is_some(), "{k} must survive the gate");
+        }
+    }
+
+    /// The other half: a long opaque token in an **innocuously named**
+    /// variable must still be caught.
+    ///
+    /// The second tier of the gate required the name to contain
+    /// `TOKEN`/`SECRET`/`PASSWORD`/`PASSWD`/`CREDENTIAL`/`API_KEY`/`PAT`, so
+    /// a user who named their credential variable `WORK_CRED` and put a
+    /// 40-character opaque token in it leaked the whole token to the engine.
+    /// The first tier (conclusive shapes) worked; the second had a hole.
+    #[test]
+    fn a_long_opaque_token_in_an_innocuous_name_is_still_caught() {
+        let env = ChildEnv::subtracting([(
+            "WORK_CRED",
+            "a1b2c3d4e5f60718293a4b5c6d7e8f901234567890abcdef",
+        )]);
+        assert!(
+            env.get("WORK_CRED").is_none(),
+            "a 40-char opaque token in a variable named WORK_CRED is a \
+             credential, whatever the name says"
+        );
+    }
+
+    /// And the conclusive tier still works whatever the variable is called.
+    #[test]
+    fn a_conclusive_shape_is_stripped_whatever_the_name() {
+        let env = ChildEnv::subtracting([
+            ("DEPLOY", "ghp_worktoken123456789012345678901234"),
+            ("WORK_GH_TOKEN", "ghp_worktoken123456789012345678901234"),
+        ]);
+        assert!(env.get("DEPLOY").is_none(), "a ghp_ blob is a token");
+        assert!(env.get("WORK_GH_TOKEN").is_none());
     }
 }

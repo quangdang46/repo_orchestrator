@@ -249,7 +249,13 @@ mod tests {
     fn one_failure_among_successes_exits_one() {
         let s = Summary::new(vec![
             row("acme/a", RepoOutcome::Pushed { oid: "aaa".into() }),
-            row("acme/bad", RepoOutcome::Failed { error: "no".into() }),
+            row(
+                "acme/bad",
+                RepoOutcome::Failed {
+                    error: "no".into(),
+                    class: ro_core::FailureClass::MissingProvider,
+                },
+            ),
             row("acme/c", RepoOutcome::Pushed { oid: "ccc".into() }),
         ]);
         assert_eq!(
@@ -296,6 +302,7 @@ mod tests {
             "acme/bad",
             RepoOutcome::Failed {
                 error: "push failed: permission denied".into(),
+                class: ro_core::FailureClass::GithubPermissionDenied,
             },
         )]);
         let text = s.render();

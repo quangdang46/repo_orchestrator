@@ -86,9 +86,26 @@ pub fn score_repo_health(conn: &Connection, repo_id: &str) -> Result<HealthSnaps
     }
 
     // Failed runs penalty
+    //
+    // `status = 'error'` alone was not the same set as "the run did not put
+    // the repo where the user asked for it". A repo whose sync ended in
+    // `autostash_conflict` — the user's work parked in a stash, the worktree
+    // holding conflict markers — made the run exit 1 and was persisted here
+    // as score 100, class `excellent`, `failed_syncs: 0`. So the stored
+    // snapshot said "excellent" for a repo that is, in the plainest sense,
+    // conflicted, and any consumer reading the snapshot (`ro health`,
+    // `ro list`, `ro doctor`, or an external DB reader) got that answer
+    // rather than the one `--filter health:` gives, which compensates in
+    // `ro-sync`'s `effective_health_score`. Two notions of health that
+    // disagree, and the persisted one was the wrong one.
+    //
+    // The list is the one that fails a run, not the one a query author
+    // happened to remember.
     let failed_runs: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sync_results WHERE repo_id = ?1 AND status = 'error'",
+            "SELECT COUNT(*) FROM sync_results
+             WHERE repo_id = ?1
+               AND status IN ('error', 'autostash_conflict', 'conflict')",
             params![repo_id],
             |r| r.get::<_, i64>(0),
         )

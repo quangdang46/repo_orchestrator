@@ -137,6 +137,10 @@ impl AgentEngine {
         Self {
             kind,
             bin: bin.into(),
+            // `default_args` is `None` for the built-ins, which is what
+            // makes the per-engine defaults below apply. A caller that
+            // passes `Some(vec![])` is asking for "no arguments beyond the
+            // prompt", which is a different request and is honoured.
             default_args: default_args.unwrap_or_else(|| match kind {
                 EngineKind::Codex => vec!["exec".to_string()],
                 // Same pair as `claude()` above, for the same reason.
@@ -379,10 +383,28 @@ impl AgentEngine {
             Some(id) => format!("{} <{}>", id.name, id.email),
             None => "no identity was resolved for this run".to_string(),
         };
+        // The base sentence is written **once the verdict is known**, so it
+        // cannot contradict the clause appended below it. It used to say
+        // "N commit(s) are sitting local and unreachable from any remote"
+        // unconditionally, and then append "At least one of these commits is
+        // already reachable from a remote" for a published commit — one
+        // message asserting both halves, in the same paragraph, about the
+        // same commits. The reader has to work out which half is stale, and
+        // the two halves call for opposite responses.
+        let stranded = stranded(ctx.repo_root, after);
+        let where_it_is = match stranded {
+            Stranded::Stranded => "are sitting local and unreachable from any remote",
+            Stranded::Published => {
+                "were published under that identity by the agent itself"
+            }
+            // The question could not be answered, so neither fact is
+            // claimed. Saying "sitting local" when it might be published
+            // would be the same contradiction the clause used to fix.
+            Stranded::Unknown => "are on the current branch, reachability unknown",
+        };
         let mut error = format!(
             "the agent committed the work itself, under an identity that is \
-             not the one ro resolved ({}). {} commit(s) are sitting local and \
-             unreachable from any remote:\n{}\n\
+             not the one ro resolved ({}). {} commit(s) {where_it_is}:\n{}\n\
              The work is on disk and has not been deleted. Re-commit it under \
              the resolved identity, or set the identity the agent should use \
              and re-run.",
@@ -391,11 +413,11 @@ impl AgentEngine {
             lines.join("\n")
         );
 
-        // Whether the work is stranded is a fact the user needs, and it is
-        // not the same as "the agent committed". A commit that is already
-        // reachable from a remote is published; one that is not is stranded,
-        // and the two need different responses.
-        match stranded(ctx.repo_root, after) {
+        // The clause is now the *only* place the verdict is stated, because
+        // the sentence above it already carries it. Both arms are kept so a
+        // future reader can see the two cases are still distinguished —
+        // the distinction is the whole point of asking.
+        match stranded {
             Stranded::Published => {
                 error.push_str(
                     "\nAt least one of these commits is already reachable from \
@@ -451,7 +473,22 @@ impl Engine for AgentEngine {
     /// A `PATH` probe, called at **dispatch time only** — never per repo,
     /// because a `PATH` walk across a fleet is work the answer does not
     /// depend on.
+    ///
+    /// A configured **path** is checked for existence, not for being on
+    /// `PATH`. `which` walks `PATH` looking for a *name*, so a binary given
+    /// as `/tmp/xyz/claude` — which is how `[agent] command` and every test
+    /// shim names one — was reported as missing even when it was sitting
+    /// right there and executable. The probe answered a question about a
+    /// directory listing and was asked to answer one about a file.
     fn availability(&self) -> Availability {
+        let configured = std::path::Path::new(&self.bin);
+        if configured.is_absolute() || self.bin.starts_with('.') {
+            return if configured.is_file() {
+                Availability::Present(configured.to_path_buf())
+            } else {
+                Availability::Missing
+            };
+        }
         match ro_git::which(&self.bin) {
             Some(p) => Availability::Present(p),
             None => Availability::Missing,
@@ -548,11 +585,40 @@ impl AgentEngine {
                 // prints a banner before explaining itself would
                 // otherwise be *reported* on the banner, even though it
                 // is classified on the whole thing. See `failure_message`.
-                error: failure_message(&output.stderr),
+                //
+                // **Both streams, stderr first.** It read stderr only, so
+                // an agent that reports its failure on stdout — which is
+                // where a normal program prints things — produced
+                // `failed: ` with nothing after it, and JSON
+                // `"outcome": "failed: "`. The user was told the engine
+                // failed and not why, while `classify_agent_output` a few
+                // lines below was reading both and had correctly worked
+                // out it was an auth error. The taxonomy saw the message
+                // and the message was thrown away.
+                error: failure_message(&output.stderr, &output.stdout),
                 // One taxonomy: the same `FailureClass` every other part
                 // of ro uses, not a second one for agents.
                 class: classify_agent_output(&output.stderr, &output.stdout),
             };
+        }
+
+        // **The ref moved — by anything.** Checked before the dirty test,
+        // and independent of it.
+        //
+        // The identity guard used to live inside `if !is_dirty`, so an
+        // agent that committed *some* of its own work under its own
+        // identity and left the rest dirty took the ordinary path: ro
+        // committed the remainder under its own identity and returned
+        // `Committed`. The commit the caller then pushes is the branch tip,
+        // and it still carries the agent's foreign commit underneath it.
+        // That is the exact outcome the prompt's "Do NOT run `git commit`"
+        // exists to prevent, arriving through the door the partial-commit
+        // case opens. Whether the tree happens to be clean afterwards is a
+        // fact about the *leftovers*, and it has no bearing on who wrote
+        // the commit that is already sitting under HEAD.
+        let after = ro_git::read::head_oid(ctx.repo_root).unwrap_or(None);
+        if before != after.as_deref() {
+            return self.report_agent_made_commits(ctx, before, after.as_deref());
         }
 
         // Whatever the agent wrote is now in the worktree. ro commits it
@@ -572,10 +638,6 @@ impl AgentEngine {
             // that had already happened. On `ro ship` that also means no
             // push, so the work sits local with nothing saying it is
             // stranded.
-            let after = ro_git::read::head_oid(ctx.repo_root).unwrap_or(None);
-            if before != after.as_deref() {
-                return self.report_agent_made_commits(ctx, before, after.as_deref());
-            }
             return EngineOutcome::NothingToCommit;
         }
 
@@ -1318,8 +1380,24 @@ fn classify_agent_output(stderr: &str, stdout: &str) -> FailureClass {
 /// only the head would hide the cause in exactly the case this function
 /// exists to surface; one that kept only the tail would hide the context
 /// that makes the cause intelligible.
-fn failure_message(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+fn failure_message(stderr: &str, stdout: &str) -> String {
+    // stderr first, because that is where a failure is *supposed* to be
+    // reported and where the cause usually is; stdout is the fallback for
+    // the agent that prints its error to the stream a normal program uses.
+    // An empty stderr is not a reason to report nothing — it is a reason
+    // to look at the other stream.
+    let mut lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        lines = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+    }
     if lines.len() <= MAX_ERROR_LINES {
         return lines.join("\n");
     }
@@ -1576,11 +1654,38 @@ fn run_with_deadline(
         std::thread::sleep(POLL);
     };
 
-    // Join the readers only now that the child is gone. A killed child
-    // closes its pipes, so a reader that was blocked on a full buffer
-    // returns rather than holding the join open; and a reader that already
-    // finished returns immediately. Joining before the exit would be the
-    // same deadlock this function exists to remove.
+    // The join is **inside** the deadline, and the comment above it was the
+    // claim this fixes.
+    //
+    // It used to read: "A killed child closes its pipes, so a reader that
+    // was blocked on a full buffer returns rather than holding the join
+    // open." That is true of the direct child and false of its
+    // **descendants**. A shim that exits 0 while a background job it
+    // started inherits the write ends leaves both readers blocked on a pipe
+    // that will not see an EOF for as long as the descendant lives — and
+    // the poll loop had already broken on the exit, so the join below it
+    // sat outside the deadline with nothing armed to stop it. `ro` then
+    // waited on that pipe forever: no output, no exit, no message. The
+    // deadline had already been satisfied.
+    //
+    // So the readers get whatever is left of the budget, and if they are
+    // still blocked the process **group** is killed, which is what
+    // actually closes the write ends.
+    let remaining = limit.saturating_sub(started.elapsed());
+    let deadline = Instant::now() + remaining;
+    let mut readers_done = stdout_reader.is_finished() && stderr_reader.is_finished();
+    while !readers_done && Instant::now() < deadline {
+        std::thread::sleep(POLL);
+        readers_done = stdout_reader.is_finished() && stderr_reader.is_finished();
+    }
+    if !readers_done {
+        // The descendants are what is holding the pipes open, so the group
+        // is what has to die. `kill_tree` on the already-exited direct child
+        // still reaches the group because the child was spawned with
+        // `process_group(0)`.
+        kill_tree(&mut child);
+    }
+
     let stdout = stdout_reader.join().unwrap_or_default();
     let stderr = stderr_reader.join().unwrap_or_default();
 
@@ -1641,6 +1746,10 @@ fn kill_tree(child: &mut std::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The integration tests in `tests/agent_engines.rs` drive a real
+    // binary through `ro_testkit`; the unit tests here that need the same
+    // harness import it directly.
+    use ro_testkit::TestEnv;
 
     /// The load-bearing line, asserted on the literal string so a
     /// regression is caught at the source rather than in a behavioural
@@ -1776,7 +1885,7 @@ mod tests {
                        ERROR: Reconnecting... 2/5\n\
                        ERROR: unexpected status 401 Unauthorized: Missing bearer \
                        or basic authentication in header\n";
-        let msg = failure_message(stderr);
+        let msg = failure_message(stderr, "");
         assert!(
             msg.contains("401") && msg.contains("Unauthorized"),
             "the cause is the whole point of the report, got: {msg}"
@@ -1794,7 +1903,7 @@ mod tests {
     fn a_failure_message_keeps_the_stream_around_the_cause() {
         let stderr = "banner\nworkdir: /tmp\nERROR: Reconnecting... 1/5\n\
                        ERROR: boom\n";
-        let msg = failure_message(stderr);
+        let msg = failure_message(stderr, "");
         assert!(msg.contains("banner"), "got: {msg}");
         assert!(msg.contains("Reconnecting"), "got: {msg}");
         assert!(msg.contains("boom"), "got: {msg}");
@@ -1810,7 +1919,7 @@ mod tests {
         for i in 0..500 {
             stderr.push_str(&format!("line {i}\n"));
         }
-        let msg = failure_message(&stderr);
+        let msg = failure_message(&stderr, "");
         assert!(
             msg.lines().count() <= MAX_ERROR_LINES + 3,
             "the report must stay a table cell, got {} lines",
@@ -1836,7 +1945,7 @@ mod tests {
     /// about what is missing.
     #[test]
     fn a_short_failure_is_not_annotated() {
-        let msg = failure_message("one\ntwo\n");
+        let msg = failure_message("one\ntwo\n", "");
         assert_eq!(msg, "one\ntwo");
     }
 
@@ -1900,6 +2009,149 @@ mod tests {
             .expect("a child that exits immediately must not time out");
         assert!(out.stdout.is_empty());
         assert_eq!(out.status.code(), Some(0));
+    }
+
+    /// A child that fills **stderr** while stdout is quiet must be drained
+    /// whole, and must not be reported as a timeout.
+    ///
+    /// # The gap in the fixture this closes
+    ///
+    /// `a_child_writing_past_the_pipe_buffer_is_drained_whole` is a `cat` of
+    /// one file: **stdout alone**. The stderr reader is a separate thread
+    /// over a separate pipe with its own 64 KiB buffer, and the shape that
+    /// breaks it is the mirror image of the one that breaks the stdout
+    /// reader — the child blocks on stderr while the stdout reader has
+    /// already seen EOF and its thread has gone. An agent that streams
+    /// progress on stderr and answers on stdout is the ordinary case, not an
+    /// edge, and the two are not interchangeable.
+    ///
+    /// The byte count is asserted exactly, for the reason the stdout test
+    /// gives: a reader that stopped at the first buffer boundary would
+    /// return promptly and be short by everything after 64 KiB.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_filling_stderr_while_stdout_is_quiet_is_drained_whole() {
+        let dir = tempfile::TempDir::new().expect("the fixture dir is creatable");
+        let payload = dir.path().join("payload.bin");
+        let bytes = 1024 * 1024;
+        std::fs::write(&payload, vec![b'e'; bytes]).expect("the payload is writable");
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("cat '{}' 1>&2", payload.display()))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let out = run_with_deadline(&mut cmd, Duration::from_secs(30), None)
+            .expect("a child that exits must not be reported as a timeout");
+
+        assert_eq!(
+            out.stderr.len(),
+            bytes,
+            "every byte the child wrote to stderr must come back; a reader \
+             that stopped at the pipe buffer boundary would be short by the \
+             rest"
+        );
+        assert!(out.stdout.is_empty());
+        assert_eq!(out.status.code(), Some(0));
+    }
+
+    /// A child that exits 0 while a descendant still holds both pipes open
+    /// must not hang the run.
+    ///
+    /// # The hang the deadline does not cover
+    ///
+    /// The direct child exits, so `try_wait` returns `Some` on the first poll
+    /// and the poll loop breaks — but the background job inherited the write
+    /// ends of stdout and stderr, so neither read end ever sees an EOF. A
+    /// join performed *after* the loop has broken sits outside the deadline
+    /// entirely, so `ro` waits on that pipe forever with nothing armed to
+    /// stop it. The buffer-full deadlock was fixed; this is what is left.
+    ///
+    /// The call is moved onto its own thread with a hard stop, for the
+    /// reason the integration test gives: a test that hangs takes the whole
+    /// suite with it and prints nothing, which is indistinguishable from a
+    /// machine that ran out of memory.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang() {
+        let dir = tempfile::TempDir::new().expect("the fixture dir is creatable");
+        // The descendant holds the pipes for 300 s. The deadline is 300 ms,
+        // so a run that honours it returns in well under a second and a run
+        // that waits on the pipes is still waiting when the hard stop fires.
+        //
+        // The script is written under the **name the engine looks for**,
+        // for the same reason the integration fixture does: `FakeBinary::at`
+        // expects the file at `dir/<name>`, and a script written under any
+        // other name is a shim that resolves to nothing.
+        let script = dir.path().join("claude");
+        std::fs::write(&script, "#!/bin/sh\nsleep 300 &\nexit 0\n")
+            .expect("the script is writable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&script).expect("the script exists").permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&script, p).expect("the mode is settable");
+        }
+
+        let mut cmd = std::process::Command::new(&script);
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_with_deadline(&mut cmd, Duration::from_millis(300), None));
+        });
+
+        let out = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("the run did not return within 15s; the child exited 0 but a descendant still held the pipes, and the join that collects them is outside the deadline");
+
+        let out = out.expect("a child that exits must not be reported as a timeout");
+        assert_eq!(out.status.code(), Some(0));
+    }
+
+    /// The deadline the caller gives is the deadline that fires.
+    ///
+    /// `core.timeout_secs` is documented as bounding a command and does not
+    /// reach the engine at all — `orchestrator.rs` builds its context with
+    /// `dispatch::default_timeout()` and nothing reads the configured value.
+    /// This pins the half that is in this crate's power: whatever deadline
+    /// the context carries is the deadline the engine honours. A context
+    /// built with 300 ms against a child that sleeps for 300 s must come
+    /// back as `TimedOut` in about 300 ms; if the engine ignored the field
+    /// and used its own default, this would take ten minutes.
+    #[cfg(unix)]
+    #[test]
+    fn a_short_context_timeout_really_does_fire() {
+        let dir = tempfile::TempDir::new().expect("the fixture dir is creatable");
+        let script = dir.path().join("sleeper.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 300\n").expect("the script is writable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&script).expect("the script exists").permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&script, p).expect("the mode is settable");
+        }
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(&script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let started = Instant::now();
+        let out = run_with_deadline(&mut cmd, Duration::from_millis(300), None);
+        let elapsed = started.elapsed();
+
+        match out {
+            Err(RunError::TimedOut) => {}
+            other => panic!("a child that never exits must time out, got {other:?}"),
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the run took {elapsed:?}; a 300 ms deadline that is not honoured \
+             would take the engine's own default"
+        );
     }
 
     /// `PATH` order beats extension order — the loop nesting, pinned.
@@ -2306,18 +2558,81 @@ mod tests {
     // ---- a moved HEAD with nothing enumerable is not "committed nothing" ----
 
     /// `EngineOutcome::render` turns an empty `Committed` into "committed
-    /// nothing". HEAD moving while ro enumerates nothing would therefore be
-    /// reported as a success that did not happen — the same false report
+    /// nothing", and HEAD moving while ro enumerates nothing would therefore
+    /// be reported as a success that did not happen — the same false report
     /// this module keeps fixing, one layer down.
+    ///
+    /// # Why this is not the test it replaced
+    ///
+    /// The version that stood here constructed an `EngineOutcome::Failed`
+    /// literal and asserted its `render()` did not contain "committed
+    /// nothing". It never called `report_agent_made_commits`, and it would
+    /// have passed unchanged against a build that reported a moved HEAD as
+    /// `Committed { commits: vec![] }` — the exact bug it was written to
+    /// catch. A test that counts as coverage it did not provide is worse
+    /// than no test.
+    ///
+    /// So this one drives the real path: a repository whose HEAD moves while
+    /// `commits_between` enumerates nothing, through `checkpoint`, and asserts
+    /// on the outcome that comes back. The `render` assertion is kept as the
+    /// second half, because the false report is what the user would have
+    /// seen.
+    #[cfg(unix)]
     #[test]
     fn an_empty_commit_list_is_not_rendered_as_committed_nothing() {
-        let outcome = EngineOutcome::Failed {
-            error: "the agent moved HEAD".to_string(),
-            class: FailureClass::DirtyWorktree,
-        };
+        let w = ro_testkit::Worktree::with_one_commit();
+        w.write("a.txt", "x\n");
+        w.commit("the tip the agent will undo");
+
+        // The agent resets back to the first commit: HEAD moves, the tree is
+        // clean, and there is nothing between the two refs for
+        // `commits_between` to enumerate.
+        let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
+        // The script is written under the **name the engine will look
+        // for**. `FakeBinary::at` takes the directory and the name and
+        // expects the file to already be at `dir/<name>`; this wrote
+        // `dir/reset.sh` and named the shim `claude`, so the probe found
+        // nothing and the run reported `Unavailable` for a shim that was
+        // sitting right there.
+        let script = dir.path().join("claude");
+        std::fs::write(&script, "#!/bin/sh\ngit reset -q --hard HEAD~1\nexit 0\n")
+            .expect("the script is writable");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&script).expect("the script exists").permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&script, p).expect("the mode is settable");
+        }
+        let shim = ro_testkit::FakeBinary::at(
+            dir.path().to_path_buf(),
+            script,
+            "claude",
+        );
+        let engine = AgentEngine::with(
+            EngineKind::Claude,
+            shim.program().to_string_lossy().to_string(),
+            None,
+        );
+        let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(30));
+
+        let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
+
+        match &outcome {
+            EngineOutcome::Failed { error, .. } => {
+                assert!(
+                    error.contains("could not enumerate"),
+                    "the report must say that ro could not name what happened. \
+                     Got: {error}"
+                );
+            }
+            other => panic!(
+                "a moved HEAD with nothing enumerable must not be reported as a \
+                 clean run, got {other:?}"
+            ),
+        }
         assert!(
             !outcome.render().contains("committed nothing"),
-            "a failure must never render as a success: {}",
+            "and it must never render as a success: {}",
             outcome.render()
         );
     }

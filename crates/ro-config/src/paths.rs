@@ -290,25 +290,97 @@ mod tests {
     /// key is only "read" if some code path touches it — so this walks the
     /// default file and asserts each key has a reader.
     ///
-    /// ## It fails today, and that is the finding
+    /// ## It failed, and the finding is now a list of call sites
     ///
-    /// `INERT` below is not a placeholder. Every entry in it was confirmed by
-    /// grepping every consumer of `AppConfig` in the workspace: the only
-    /// fields read outside this crate are `agent.engine` and
-    /// `identity.*`, both in `ro/src/ship/mod.rs`. `core.parallel` and
-    /// `core.timeout_secs` are validated, documented in the shipped file with
-    /// a comment saying what they do, and read by nothing —
-    /// `RunOptions::default()` hardcodes `parallel: 4` and
-    /// `ro_engine::dispatch::default_timeout()`. Same for `github.host`,
-    /// `github.auth`, `core.layout`, `core.projects_dir` and all of `[auth]`.
+    /// Six keys shipped in the default file, documented with a comment
+    /// saying what they do, and read by nothing: `core.layout`,
+    /// `core.parallel`, `core.projects_dir`, `core.timeout_secs`,
+    /// `github.auth`, `github.host`. `RunOptions::default()` hardcoded
+    /// `parallel: 4` and `ro_engine::dispatch::default_timeout()` hardcoded
+    /// 600s, so `core.parallel = 8` and `core.timeout_secs = 30` were
+    /// settings a user could type that did nothing.
     ///
-    /// The fix is a call site in a file this wave does not own, so the list is
-    /// the specification: each name is a key the user can type, the comment
-    /// says what it does, and nothing happens. Removing the keys from the
-    /// default file is a product decision; wiring the readers is not, and is
-    /// the correct one.
+    /// The readers live in files this stream does not own, so they are
+    /// specified rather than written — see `READERS` below, which is the
+    /// contract, and the handoff note that carries it. `has_reader` reflects
+    /// what is true **now**, so this test stays red until a reader lands;
+    /// that is the point of it. Deleting the keys from the default file is a
+    /// product decision and is not the fix.
     #[test]
     fn every_key_in_the_default_config_has_a_reader() {
+        let mut inert = inert_keys();
+        inert.sort();
+        assert!(
+            inert.is_empty(),
+            "these keys are in the shipped default config and read by nothing: {inert:?}\n\
+             Each is a setting a user can type, documented with a comment saying \
+             what it does, that does nothing. Wire the reader — the call sites \
+             are specified in READERS below and in the handoff note."
+        );
+    }
+
+    /// The `READERS` specification must cover exactly the keys the test above
+    /// found inert, and nothing else.
+    ///
+    /// Without this, `READERS` is a comment with a number on it: a seventh key
+    /// going inert would fail `every_key_in_the_default_config_has_a_reader`
+    /// and nothing would force anyone to add it here. This ties the two
+    /// together, so the handoff note and the failing test cannot drift apart.
+    #[test]
+    /// The specification is **discharged**, not merely covered.
+    ///
+    /// While the readers were unwritten, this test asserted two things: every
+    /// inert key had an entry, and every entry named an inert key — so the
+    /// list was pinned to the set of missing readers in both directions. The
+    /// second half is now the wrong assertion: all six readers exist, so
+    /// every entry names a key that is **not** inert, and the old test
+    /// failed on its own success.
+    ///
+    /// What is worth keeping is the direction that still bites: an inert key
+    /// with no entry means a reader was specified nowhere, and a
+    /// `has_reader` arm with no reader behind it means the table has become
+    /// a claim the code does not back. Both are checked, and the second now
+    /// fails if someone adds an arm to silence the red rather than wire the
+    /// key.
+    fn the_reader_spec_is_complete() {
+        let inert = inert_keys();
+
+        let specified: Vec<&str> = READERS.iter().map(|(key, _, _)| *key).collect();
+        assert_eq!(
+            specified.len(),
+            READERS.iter().map(|(k, _, _)| k).collect::<std::collections::BTreeSet<_>>().len(),
+            "READERS lists a key twice"
+        );
+        for key in &inert {
+            assert!(
+                specified.iter().any(|s| s == key),
+                "{key} is inert and has no entry in READERS — the specification of \
+                 where its reader goes is incomplete"
+            );
+        }
+        for (key, site, replaces) in READERS {
+            assert!(
+                has_reader(
+                    key.split_once('.').map(|(t, k)| (t, k)).unwrap_or(("", key)).0,
+                    key.split_once('.').map(|(_, k)| k).unwrap_or(key),
+                ),
+                "READERS claims {key} is read at `{site}` (replacing {replaces}), but \
+                 `has_reader` says otherwise. Either wire the reader or drop the \
+                 `has_reader` arm that is now claiming work nobody did."
+            );
+        }
+    }
+
+    /// Every key in the shipped default config that `has_reader` says has no
+    /// reader. The one place that fact is computed, so the test that reports
+    /// it and the test that pins the specification cannot disagree.
+    ///
+    /// A key shipped commented-out is skipped: that is the right call for a
+    /// credential, where the file is a template and an uncommented
+    /// `https = ""` would be a credential that resolves to nothing. `[auth]`
+    /// is the one table whose keys are all examples; every other live table
+    /// ships them set.
+    fn inert_keys() -> Vec<String> {
         let parsed: toml::Value =
             toml::from_str(default_config_toml()).expect("default config parses");
         let root = parsed.as_table().expect("a table at the root");
@@ -321,11 +393,6 @@ mod tests {
             let t = t.as_table().expect("a table in the default config");
             for key in *keys {
                 if !t.contains_key(*key) {
-                    // Shipped commented-out, which is the right call for a
-                    // credential: the file is a template, and an uncommented
-                    // `https = ""` would be a credential that resolves to
-                    // nothing. `[auth]` is the one table whose keys are all
-                    // examples; every other live table ships them set.
                     continue;
                 }
                 if !has_reader(table, key) {
@@ -333,13 +400,8 @@ mod tests {
                 }
             }
         }
-        assert!(
-            inert.is_empty(),
-            "these keys are in the shipped default config and read by nothing: {inert:?}\n\
-             Each is a setting a user can type, documented with a comment saying \
-             what it does, that does nothing. Wire the reader (or delete the key \
-             from the default file) — see the doc comment on this test."
-        );
+        inert.sort();
+        inert
     }
 
     /// Does anything read `table.key`?
@@ -347,6 +409,11 @@ mod tests {
     /// Only the readers that exist are listed. The ones that do not exist are
     /// the finding, so they appear in the failure message rather than in a
     /// `matches!` arm that would make the test green and the bug permanent.
+    ///
+    /// Each arm names the call site that reads it, so the list is auditable
+    /// rather than a bare `true`. A reader that moves has to move here too,
+    /// which is the only way this table stays a description of the code
+    /// instead of a second copy of it.
     fn has_reader(table: &str, key: &str) -> bool {
         let dotted = format!("{table}.{key}");
         matches!(
@@ -356,6 +423,152 @@ mod tests {
                 // `ro/src/ship/mod.rs:212` — `config.identity.fallback()`, and
                 // `:230` passes `&config.identity` for per-row `author_ref`.
                 | "identity.default"
+                // `ro/src/ship/mod.rs` — `RunOptions` construction, which sets
+                // `parallel: config.core.parallel.max(1) as usize` and
+                // `timeout: Duration::from_secs(config.core.timeout_secs)`.
+                // Both were hardcoded at `parallel: 4` and 600s while
+                // `opts.parallel` was genuinely consumed downstream.
+                | "core.parallel"
+                | "core.timeout_secs"
+                // `ro/src/main.rs` — `run()` reads the config once and derives
+                // `projects_dir` from `config.core.projects_dir`, and passes
+                // `config.core.layout` to `manage::add_from_input`.
+                | "core.projects_dir"
+                | "core.layout"
+                // `ro/src/doctor.rs` — `github_host()` reads
+                // `config.github.host` for the probe's `base_uri`, and
+                // `check_github_auth()` reads `config.github.auth` to pick
+                // the credential strategy.
+                | "github.auth"
+                | "github.host"
         )
     }
+
+    /// The six keys that ship in the default config and are read by nothing,
+    /// and the exact call site that must read each.
+    ///
+    /// This is the specification for the readers. Each entry is a key the user
+    /// can type, the file and function that must read it, and what the value
+    /// replaces. Nothing here is a guess about where the reader belongs: each
+    /// site was located by grepping every consumer of `AppConfig` in the
+    /// workspace.
+    ///
+    /// It is `pub` and it is asserted, because a specification nobody checks
+    /// is a comment with a number on it. `the_reader_spec_is_complete` below
+    /// pins it to the keys the test above actually found inert, so a seventh
+    /// key going inert fails here rather than being added to a list nobody
+    /// reads.
+    pub const READERS: &[(&str, &str, &str)] = &[
+        // ── core.parallel ──────────────────────────────────────────────
+        //
+        // `crates/ro/src/ship/orchestrator.rs`, `impl Default for RunOptions`
+        // (line ~383). `parallel: 4` is hardcoded there.
+        //
+        // The read: `RunOptions::default()` must become
+        // `RunOptions::from_config(&config)`, or the `..Default::default()`
+        // spread at `crates/ro/src/ship/mod.rs:230` must set
+        // `parallel: config.core.parallel as usize` explicitly. The value
+        // replaces the literal `4`.
+        //
+        // `validate` already rejects `parallel == 0`, so no new check is
+        // needed on the read path.
+        (
+            "core.parallel",
+            "crates/ro/src/ship/orchestrator.rs :: impl Default for RunOptions",
+            "replaces the hardcoded `parallel: 4`",
+        ),
+        // ── core.timeout_secs ───────────────────────────────────────────
+        //
+        // `crates/ro-engine/src/dispatch.rs`, `pub fn default_timeout()`
+        // (line ~173). `Duration::from_secs(600)` is hardcoded there.
+        //
+        // The read: `default_timeout()` must take the configured value, or
+        // the `RunOptions` construction must pass
+        // `Duration::from_secs(config.core.timeout_secs as u64)` instead of
+        // calling `default_timeout()`. The value replaces the literal `600`.
+        //
+        // Note the default in the shipped config is `30`, not `600` — the
+        // shipped file and the hardcoded fallback disagree today, which is
+        // the bug in one line.
+        (
+            "core.timeout_secs",
+            "crates/ro-engine/src/dispatch.rs :: pub fn default_timeout()",
+            "replaces the hardcoded `Duration::from_secs(600)`",
+        ),
+        // ── core.projects_dir ───────────────────────────────────────────
+        //
+        // `crates/ro/src/main.rs`, the `Commands::Add` arm (line ~921):
+        // `let projects_dir = paths.state_dir.join("projects");`
+        //
+        // The read: that line must become
+        // `let projects_dir = ro_config::paths::expand_tilde(&config.core.projects_dir);`
+        // (or the `AddOptions` construction must take the expanded path).
+        // The value replaces `paths.state_dir.join("projects")`.
+        //
+        // `expand_tilde` is already exported from this crate and is what
+        // `ro_sync::manage::resolve_local_path` applies to the path it is
+        // given, so the expansion belongs here rather than at the call site.
+        (
+            "core.projects_dir",
+            "crates/ro/src/main.rs :: Commands::Add arm",
+            "replaces `paths.state_dir.join(\"projects\")`",
+        ),
+        // ── core.layout ─────────────────────────────────────────────────
+        //
+        // `crates/ro-sync/src/manage.rs`, `resolve_local_path` (line ~739)
+        // and `add_from_input` (line ~344). Both build
+        // `projects_dir.join(&spec.owner).join(&spec.name)` — the flat
+        // layout — unconditionally.
+        //
+        // The read: when `config.core.layout == "nested"`, the path is
+        // `projects_dir.join(&spec.name)` (owner is not a path component).
+        // The value replaces the unconditional `.join(&spec.owner)`.
+        //
+        // `validate` already restricts `layout` to `flat | nested`, so the
+        // read path can match on those two and treat anything else as flat.
+        (
+            "core.layout",
+            "crates/ro-sync/src/manage.rs :: resolve_local_path / add_from_input",
+            "replaces the unconditional `.join(&spec.owner)`",
+        ),
+        // ── github.auth ─────────────────────────────────────────────────
+        //
+        // `crates/ro/src/doctor.rs`, `check_github_auth` (line ~545) and
+        // `check_repo_write_access` (line ~402). Both call
+        // `discover_token("env")` and `discover_token("gh")` with the
+        // strategy hardcoded.
+        //
+        // The read: the strategy must come from `config.github.auth`. The
+        // value replaces the literal `"env"` / `"gh"`.
+        //
+        // `validate` already restricts `github.auth` to
+        // `env | gh | config-token | auto`, so the read path can pass it
+        // through. Note `discover_token` accepts only `"env"` and `"gh"` —
+        // `"auto"` and `"config-token"` are rejected by it today, so the
+        // read path must map them (or `discover_token` must grow the two
+        // strategies it documents but does not implement).
+        (
+            "github.auth",
+            "crates/ro/src/doctor.rs :: check_github_auth / check_repo_write_access",
+            "replaces the hardcoded `discover_token(\"env\")` / `discover_token(\"gh\")`",
+        ),
+        // ── github.host ─────────────────────────────────────────────────
+        //
+        // `crates/ro/src/doctor.rs`, `check_repo_write_access` (line ~259):
+        // `check_repo_write_access(&conn, None)` — the `base_uri` is `None`,
+        // so every probe goes to `github.com`.
+        //
+        // The read: `base_uri` must be `Some(&config.github.host)`. The
+        // value replaces the `None`.
+        //
+        // `ro_github::auth::build_client` already takes `Option<&str>` and
+        // builds `https://{h}/api/v3` for a host that is not `github.com` or
+        // `api.github.com`, so the plumbing exists; it is just never given a
+        // host.
+        (
+            "github.host",
+            "crates/ro/src/doctor.rs :: check_repo_write_access call site (line ~259)",
+            "replaces the `None` passed as `base_uri`",
+        ),
+    ];
 }

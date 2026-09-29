@@ -78,6 +78,193 @@ fn big_output_agent(
     ro_testkit::FakeBinary::at(dir.to_path_buf(), file, name)
 }
 
+/// A shim that writes `filler_line` to **both** streams until each stream is
+/// at least `bytes`, then `tail` to stdout, then exits 0.
+///
+/// # Why this exists, and why `big_output_agent` does not cover it
+///
+/// `big_output_agent` is a `cat` of one file: **stdout alone**. That proves
+/// the stdout reader drains, and says nothing about the stderr one. The two
+/// are separate pipes with separate buffers and separate reader threads, and
+/// the shape that breaks is not the same for both:
+///
+///   * A child that fills **stdout** and leaves **stderr** quiet blocks on
+///     stdout, and stderr's reader simply sees EOF first.
+///   * A child that fills **stderr** while stdout is quiet blocks on stderr,
+///     while the stdout reader has already finished and its thread is gone.
+///
+/// The second is the one an agent hits: `codex` writes its banner,
+/// preamble, reconnect progress and error to stderr, and its answer to
+/// stdout. A drain bug that only ever drained the stream carrying the plan
+/// passes every stdout-only fixture and fails the first time a real agent
+/// fills up the other pipe.
+fn both_streams_agent(
+    dir: &std::path::Path,
+    name: &str,
+    filler_line: &str,
+    bytes: usize,
+    tail: &str,
+) -> ro_testkit::FakeBinary {
+    let mut payload = String::with_capacity(bytes + tail.len() + filler_line.len());
+    while payload.len() < bytes {
+        payload.push_str(filler_line);
+        payload.push('\n');
+    }
+
+    let out_data = dir.join("stdout.bin");
+    let err_data = dir.join("stderr.bin");
+    std::fs::write(&out_data, format!("{payload}{tail}")).expect("stdout payload is writable");
+    std::fs::write(&err_data, &payload).expect("stderr payload is writable");
+
+    // Both streams, interleaved rather than one after the other: a child
+    // that writes 5 MB to stdout and *then* 5 MB to stderr fills the first
+    // pipe while the second is idle, which is the easy case. Writing both
+    // at once is what an agent streaming progress on both does.
+    let body = if cfg!(windows) {
+        format!(
+            "@echo off\r\ntype \"{}\" 1>&2\r\ntype \"{}\"\r\nexit /b 0\r\n",
+            err_data.display(),
+            out_data.display()
+        )
+    } else {
+        format!(
+            "#!/bin/sh\ncat '{}' &\ncat '{}'\nwait\nexit 0\n",
+            err_data.display(),
+            out_data.display()
+        )
+    };
+    let file = if cfg!(windows) {
+        dir.join(format!("{name}.cmd"))
+    } else {
+        dir.join(name)
+    };
+    std::fs::write(&file, body).expect("the shim is writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&file, p).expect("the mode is settable");
+    }
+    ro_testkit::FakeBinary::at(dir.to_path_buf(), file, name)
+}
+
+/// A shim that commits **some** of the work under a foreign identity, then
+/// writes more work and leaves it in the tree.
+///
+/// # Why the tree is deliberately left dirty
+///
+/// `checkpoint` reached `report_agent_made_commits` only inside its
+/// `!is_dirty` branch, so the identity guard was conditional on the tree
+/// happening to be clean *afterwards*. An agent that commits some of its own
+/// work and leaves the rest dirty therefore took the ordinary path: ro
+/// committed the remainder under its own identity and returned
+/// `EngineOutcome::Committed` — and the commit the caller then pushed is
+/// the branch tip, which still carries the agent's foreign commit beneath
+/// it. The one outcome the prompt's "Do NOT run `git commit`" exists to
+/// prevent, arriving through the door the partial-commit case opens.
+///
+/// So the fixture has to leave the tree dirty, or it reproduces the case
+/// that was already covered and proves nothing.
+fn partial_self_committing_agent(
+    dir: &std::path::Path,
+    name: &str,
+) -> ro_testkit::FakeBinary {
+    let body = if cfg!(windows) {
+        "@echo off\r\n\
+         git add a.txt\r\n\
+         git -c user.name=Agent -c user.email=agent@elsewhere.invalid commit -q -m \"agent own commit\"\r\n\
+         echo more work > b.txt\r\n\
+         exit /b 0\r\n"
+            .to_string()
+    } else {
+        "#!/bin/sh\n\
+         git add a.txt\n\
+         git -c user.name=Agent -c user.email=agent@elsewhere.invalid commit -q -m 'agent own commit'\n\
+         echo 'more work' > b.txt\n\
+         echo '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"```ro-commits\\n[{\\\"subject\\\":\\\"the rest\\\",\\\"files\\\":[\\\"b.txt\\\"]}]\\n```\"}]}}'\n\
+         exit 0\n"
+            .to_string()
+    };
+    let file = if cfg!(windows) {
+        dir.join(format!("{name}.cmd"))
+    } else {
+        dir.join(name)
+    };
+    std::fs::write(&file, body).expect("the shim is writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&file, p).expect("the mode is settable");
+    }
+    ro_testkit::FakeBinary::at(dir.to_path_buf(), file, name)
+}
+
+/// A shim that leaves a **descendant** holding both pipes open, and then
+/// exits 0 itself.
+///
+/// # The hang the deadline does not cover
+///
+/// The direct child exits, so `try_wait` returns `Some` on the first poll
+/// and the poll loop breaks — but the background job inherited the write
+/// ends of stdout and stderr, so neither read end ever sees an EOF. A join
+/// performed *after* the loop has broken sits outside the deadline
+/// entirely, so `ro` waits on that pipe forever with nothing armed to stop
+/// it. The buffer-full deadlock was fixed; this one is what is left.
+///
+/// No `setsid` and no daemonisation: a plain background job in the same
+/// process group reproduces it, and that is exactly what an agent gets when
+/// it shells out to a build, a watcher, or a dev server and moves on.
+fn pipe_holding_agent(
+    dir: &std::path::Path,
+    name: &str,
+    hold_secs: u32,
+) -> ro_testkit::FakeBinary {
+    let body = if cfg!(windows) {
+        format!("@echo off\r\nstart \"\" /b ping -n {hold_secs} 127.0.0.1\r\nexit /b 0\r\n")
+    } else {
+        format!("#!/bin/sh\nsleep {hold_secs} &\nexit 0\n")
+    };
+    let file = if cfg!(windows) {
+        dir.join(format!("{name}.cmd"))
+    } else {
+        dir.join(name)
+    };
+    std::fs::write(&file, body).expect("the shim is writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&file, p).expect("the mode is settable");
+    }
+    ro_testkit::FakeBinary::at(dir.to_path_buf(), file, name)
+}
+
+/// Run `body` on its own thread and return what it produced, or `None` if
+/// it had not finished after `hard_stop`.
+///
+/// # Why the call is moved off the test thread
+///
+/// The defect this file exists to catch is a **hang**. A test that hangs
+/// takes the whole suite with it and produces no output at all, which is
+/// indistinguishable from a machine that ran out of memory. A thread plus
+/// `recv_timeout` turns "ro never came back" into a red line naming the
+/// deadline, and leaves the wedged run behind on a thread this test has
+/// already stopped caring about.
+fn with_a_hard_stop<T: Send + 'static>(
+    hard_stop: Duration,
+    body: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(body());
+    });
+    rx.recv_timeout(hard_stop).ok()
+}
+
 /// A shim that commits the work itself, as an identity that is **not** the
 /// one ro resolved.
 ///
@@ -464,6 +651,212 @@ fn an_agent_writing_more_than_a_pipe_buffer_does_not_hang_the_run() {
     }
 }
 
+/// A child that fills **stderr** while stdout is quiet must not hang the run,
+/// and the whole of stderr must survive.
+///
+/// # The gap in the fixture this closes
+///
+/// `an_agent_writing_more_than_a_pipe_buffer_does_not_hang_the_run` is a
+/// `cat` of one file: stdout only. The stderr reader is a separate thread
+/// over a separate pipe with its own 64 KiB buffer, and the shape that
+/// breaks it is the mirror image of the one that breaks the stdout reader —
+/// the child blocks on stderr while the stdout reader has already seen EOF
+/// and its thread has gone. An agent that streams progress on stderr and
+/// answers on stdout is the ordinary case, not an edge.
+///
+/// The plan is on **stdout** here, so the assertion is about the stderr
+/// drain: a run that returned promptly with the plan but dropped the tail of
+/// stderr would pass the stdout fixture and this one.
+#[test]
+fn an_agent_filling_stderr_while_stdout_is_quiet_does_not_hang_the_run() {
+    let w = Worktree::with_one_commit();
+    w.write("a.txt", "x\n");
+
+    let plan = concat!(
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"done\n\n```ro-commits\n"#,
+        r#"[{\"subject\":\"the plan on stdout\",\"files\":[\"a.txt\"]}]\n```"}]}}"#,
+        "\n",
+    );
+    let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
+    let shim = both_streams_agent(dir.path(), "claude", FILLER_LINE, 5 * 1024 * 1024, plan);
+    let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
+
+    let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(30));
+
+    let started = std::time::Instant::now();
+    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
+    let elapsed = started.elapsed();
+
+    assert!(
+        !matches!(outcome, EngineOutcome::TimedOut { .. }),
+        "an agent that finished its work must not be reported as a timeout; \
+         the stderr pipe was not drained while it ran. Outcome: {outcome:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the run took {elapsed:?}; a run that blocked on a full stderr pipe \
+         would take the whole deadline"
+    );
+    match outcome {
+        EngineOutcome::Committed { commits } => {
+            assert_eq!(
+                commits.len(),
+                1,
+                "5 MB of stderr filler then one group on stdout is one commit"
+            );
+            assert_eq!(
+                commits[0].message, "the plan on stdout",
+                "the plan is on stdout, so finding it proves the stdout reader \
+                 kept draining while stderr filled its own buffer"
+            );
+        }
+        other => panic!(
+            "the plan on stdout must still be found while stderr is full; a \
+             reader that stopped at the 64 KiB boundary on either stream would \
+             report {other:?}"
+        ),
+    }
+}
+
+/// A child that exits 0 while a descendant still holds both pipes open must
+/// not hang the run.
+///
+/// # The bug
+///
+/// The direct child exits, so `try_wait` returns `Some` on the first poll
+/// and the poll loop breaks. The background job inherited the write ends of
+/// stdout and stderr, so neither read end ever sees an EOF — and the join
+/// that collects them sits *after* the loop, outside the deadline entirely.
+/// `ro` waits on that pipe forever with nothing armed to stop it: the
+/// buffer-full deadlock was fixed, and this is what is left of it.
+///
+/// The assertion is on the **elapsed time**, and the run is moved onto its
+/// own thread with a hard stop. A test that hangs takes the whole suite with
+/// it and prints nothing, which is indistinguishable from a machine that ran
+/// out of memory; a thread plus `recv_timeout` turns "ro never came back"
+/// into a red line naming the deadline.
+#[test]
+fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run() {
+    // The descendant holds the pipes for 300 s. The engine's own deadline is
+    // 300 ms, so a run that honours it returns in well under a second and a
+    // run that waits on the pipes is still waiting when the hard stop fires.
+    let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
+    let shim = pipe_holding_agent(dir.path(), "claude", 300);
+
+    let started = std::time::Instant::now();
+    // Everything the run touches is built **inside** the closure: the hard
+    // stop is `'static`, so it owns whatever it runs, and a closure that
+    // borrowed the worktree or the shim from the test thread could not be
+    // moved onto it.
+    let outcome = with_a_hard_stop(Duration::from_secs(15), move || {
+        let w = Worktree::with_one_commit();
+        w.write("a.txt", "x\n");
+        let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
+        let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_millis(300));
+        unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) }
+    });
+    let elapsed = started.elapsed();
+
+    let Some(outcome) = outcome else {
+        panic!(
+            "the run did not return within {elapsed:?}; the child exited 0 but \
+             a descendant still held the pipes, and the join that collects them \
+             is outside the deadline"
+        );
+    };
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the run took {elapsed:?}; a run that waited on a pipe a killed child \
+         never closed would take the whole deadline"
+    );
+    assert!(
+        matches!(outcome, EngineOutcome::Committed { .. } | EngineOutcome::NothingToCommit),
+        "a run that returned must still report what the engine did, got {outcome:?}"
+    );
+}
+
+/// An agent that commits **some** of its own work and leaves the rest dirty
+/// must not have that commit handed back for pushing.
+///
+/// # The bug
+///
+/// `report_agent_made_commits` was reached only inside the `!is_dirty`
+/// branch, so the identity guard was conditional on the tree happening to be
+/// clean afterwards. An agent that commits some of its work under its own
+/// identity and leaves the rest dirty takes the ordinary path: ro commits
+/// the remainder under its own identity and returns `EngineOutcome::Committed`
+/// — and the commit the caller then pushes is the branch tip, which still
+/// carries the agent's foreign commit beneath it. That is the exact outcome
+/// the prompt's "Do NOT run `git commit`" exists to prevent, arriving through
+/// the door the partial-commit case opens.
+///
+/// The guard must not depend on whether the tree happens to be clean
+/// afterwards.
+#[test]
+fn a_partial_self_commit_is_still_reported_as_the_agents_own() {
+    let w = Worktree::with_one_commit();
+    w.write("a.txt", "x\n");
+    w.write("b.txt", "y\n");
+
+    let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
+    let shim = partial_self_committing_agent(dir.path(), "claude");
+    let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
+
+    let identity = ro_core::CommitIdentity {
+        name: "Ro User".into(),
+        email: "ro-user@example.com".into(),
+    };
+    let ctx = EngineContext::new(w.path(), "main")
+        .with_identity(Some(&identity))
+        .with_timeout(Duration::from_secs(30));
+
+    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
+
+    // The fixture only proves anything if the agent really committed under
+    // its own identity, and really left work dirty. Both are read back
+    // rather than assumed.
+    let head = std::process::Command::new(ro_testkit::git_path())
+        .args(["log", "-1", "--format=%an <%ae>"])
+        .current_dir(w.path())
+        .output()
+        .expect("git runs");
+    let author = String::from_utf8_lossy(&head.stdout).trim().to_string();
+    assert_eq!(
+        author, "Agent <agent@elsewhere.invalid>",
+        "this fixture only proves anything if the agent really committed under \
+         its own identity"
+    );
+    let dirty = std::process::Command::new(ro_testkit::git_path())
+        .args(["status", "--porcelain"])
+        .current_dir(w.path())
+        .output()
+        .expect("git runs");
+    assert!(
+        !dirty.stdout.is_empty(),
+        "and it must have left work dirty, or this is the case that was already \
+         covered: {}",
+        String::from_utf8_lossy(&dirty.stdout)
+    );
+
+    match outcome {
+        EngineOutcome::Failed { error, .. } => {
+            assert!(
+                error.contains("agent@elsewhere.invalid"),
+                "the report must name the author that was found. Got: {error}"
+            );
+            assert!(
+                error.contains("ro-user@example.com"),
+                "and the identity ro resolved, so the difference is visible. \
+                 Got: {error}"
+            );
+        }
+        other => panic!(
+            "a commit the agent made under its own identity must not be handed \
+             back for pushing, whatever state the tree is left in; got {other:?}"
+        ),
+    }
+}
+
 /// A commit the agent made itself is reported as something ro can push, or
 /// not at all — never as a commit ro will publish under someone else's name.
 ///
@@ -730,6 +1123,54 @@ fn a_failure_is_reported_from_the_whole_of_stderr_not_its_first_line() {
         }
         other => panic!("a non-zero exit must be Failed, got {other:?}"),
     }
+}
+
+/// A short timeout really does fire, and the run returns rather than hanging.
+///
+/// # The gap this closes
+///
+/// `core.timeout_secs` is documented as bounding a command, and it does not
+/// reach the engine at all: `orchestrator.rs` builds its context with
+/// `dispatch::default_timeout()` and nothing reads the configured value. So
+/// the setting a user reaches for to bound a wedged agent is inert, and the
+/// only deadline the engine ever sees is the one hardcoded in
+/// `EngineContext::new`.
+///
+/// This test pins the half that is in this crate's power: whatever deadline
+/// the context carries is the deadline the engine honours. A context built
+/// with 300 ms against a child that sleeps for 300 s must come back as
+/// `TimedOut` in about 300 ms. If the engine ignored the field and used its
+/// own default, this would take ten minutes and the harness would kill it.
+#[test]
+fn a_short_context_timeout_really_does_fire() {
+    let w = Worktree::with_one_commit();
+    w.write("a.txt", "x\n");
+
+    let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
+    let shim = ro_testkit::FakeBinary::hanging("claude");
+    let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
+    let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_millis(300));
+
+    let started = std::time::Instant::now();
+    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
+    let elapsed = started.elapsed();
+
+    match outcome {
+        EngineOutcome::TimedOut { after } => {
+            assert_eq!(
+                after,
+                Duration::from_millis(300),
+                "the outcome must report the deadline the context carried, not \
+                 some other one"
+            );
+        }
+        other => panic!("a child that never exits must be TimedOut, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the run took {elapsed:?}; a 300 ms deadline that is not honoured \
+         would take the engine's own default"
+    );
 }
 
 /// A non-zero agent exit is classified into the shared taxonomy.
@@ -1249,6 +1690,162 @@ fn an_agents_own_commit_is_not_called_stranded_when_it_is_published() {
         }
         other => panic!("a foreign commit must not be handed back for pushing, got {other:?}"),
     }
+}
+
+/// A report about the agent's own commit must not say two opposite things.
+///
+/// # The bug
+///
+/// The report was assembled as a prefix that already settled the question
+/// — "N commit(s) are sitting local and unreachable from any remote" — and
+/// the reachability clause was then appended to it unconditionally. On a
+/// commit that the agent had *also pushed*, the result was a single message
+/// saying the work was unreachable from any remote and, a few lines later,
+/// that it is already reachable from a remote.
+///
+/// A message that contradicts itself is worse than one that is merely wrong:
+/// the user cannot tell which half is stale, so they have to go and read
+/// `git reflog` to find out whether their work went out. The prefix must
+/// carry the fact that is true in both cases, and the clause must carry the
+/// one that is not.
+#[test]
+fn a_report_about_the_agents_own_commit_never_contradicts_itself() {
+    let w = Worktree::with_one_commit();
+    w.write("a.txt", "x\n");
+
+    let remote = ro_testkit::BareRemote::ephemeral();
+    w.add_remote("origin", remote.path());
+
+    // The agent commits **and pushes**, so the reachability clause has to
+    // say "published". Every one of these fixtures has to be free of the
+    // opposite claim, in both directions.
+    let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
+    let body = if cfg!(windows) {
+        "@echo off\r\n\
+         git add -A\r\n\
+         git -c user.name=Agent -c user.email=agent@elsewhere.invalid commit -q -m \"agent own commit\"\r\n\
+         git push -q origin main\r\n\
+         exit /b 0\r\n"
+            .to_string()
+    } else {
+        "#!/bin/sh\n\
+         git add -A\n\
+         git -c user.name=Agent -c user.email=agent@elsewhere.invalid commit -q -m 'agent own commit'\n\
+         git push -q origin main\n\
+         exit 0\n"
+            .to_string()
+    };
+    let file = if cfg!(windows) {
+        dir.path().join("claude.cmd")
+    } else {
+        dir.path().join("claude")
+    };
+    std::fs::write(&file, body).expect("the shim is writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        p.set_mode(0o755);
+        std::fs::set_permissions(&file, p).expect("the mode is settable");
+    }
+    let shim = ro_testkit::FakeBinary::at(dir.path().to_path_buf(), file, "claude");
+    let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
+
+    let identity = ro_core::CommitIdentity {
+        name: "Ro User".into(),
+        email: "ro-user@example.com".into(),
+    };
+    let ctx = EngineContext::new(w.path(), "main")
+        .with_identity(Some(&identity))
+        .with_timeout(Duration::from_secs(30));
+
+    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
+
+    let EngineOutcome::Failed { error, .. } = outcome else {
+        panic!("a foreign commit must not be handed back for pushing, got {outcome:?}");
+    };
+    assert!(
+        error.contains("already reachable from a remote"),
+        "the commit did go out, and the report must say so. Got: {error}"
+    );
+    assert!(
+        !error.contains("unreachable from any remote"),
+        "the report says the work is unreachable from any remote and, elsewhere \
+         in the same message, that it is already reachable from one. A message \
+         that contradicts itself sends the user to read `git reflog` to find \
+         out which half is stale. Got: {error}"
+    );
+    assert!(
+        !error.contains("stranded"),
+        "and a published commit is not stranded. Got: {error}"
+    );
+}
+
+/// A cause on the **last** line of a long stream must survive the elision.
+///
+/// # Why this is the case that matters
+///
+/// `failure_message` exists so that "a truncation that kept only the head
+/// would hide the cause in exactly the case this function exists to
+/// surface" cannot happen. An agent that prints a banner, a preamble,
+/// reconnect progress and *then* the error puts the cause last — which is
+/// the real `codex` shape, and it is also the shape that a head-only
+/// truncation destroys. The banner is the part nobody needs; the last line
+/// is the whole point.
+///
+/// The stream here is longer than `MAX_ERROR_LINES` on purpose: a
+/// fourteen-line banner is under the bound and never reaches the elision at
+/// all, so a test that used the real `codex` shape would pass unchanged
+/// against a head-only truncation.
+#[test]
+fn a_cause_on_the_last_line_of_a_long_stream_survives_the_elision() {
+    let w = Worktree::with_one_commit();
+    w.write("a.txt", "x\n");
+
+    // Forty lines of banner — longer than the bound, so the elision really
+    // fires — with the cause on the very last line.
+    let mut lines: Vec<String> = (0..40)
+        .map(|i| format!("INFO: reconnect progress line {i}"))
+        .collect();
+    lines.push(
+        "ERROR: unexpected status 401 Unauthorized: Missing bearer or basic \
+         authentication in header"
+            .to_string(),
+    );
+    let borrowed: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+    let shim = ro_testkit::FakeBinary::failing_lines("codex", 1, &borrowed);
+    let engine = AgentEngine::with(
+        ro_engine::EngineKind::Codex,
+        shim.program().to_string_lossy().to_string(),
+        None,
+    );
+    let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(20));
+
+    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
+
+    let EngineOutcome::Failed { error, class } = outcome else {
+        panic!("a non-zero exit must be Failed, got {outcome:?}");
+    };
+    assert!(
+        error.contains("401") && error.contains("Unauthorized"),
+        "the cause is on the LAST line of a 41-line stream, past the elision \
+         bound, and it is the one thing this report exists to surface. \
+         Got only: {error}"
+    );
+    assert_eq!(
+        class,
+        ro_core::FailureClass::AuthError,
+        "and the classification reads the whole stream, so it is right even \
+         when the message is bounded"
+    );
+    // And the report is still a table cell, so the elision is not "fixed" by
+    // simply printing everything.
+    assert!(
+        error.lines().count() < 41,
+        "the elision must still bound the report; got {} lines",
+        error.lines().count()
+    );
 }
 
 /// HEAD moving while ro enumerates nothing is not "committed nothing".

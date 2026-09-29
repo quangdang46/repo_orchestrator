@@ -320,8 +320,22 @@ pub fn is_modelled_field<T: serde::de::DeserializeOwned>(key: &str) -> bool {
     // Bare-key syntax only. `engine-args` is a serde `rename`, not a TOML
     // bare key, and a document that fails to *parse* would be indistinguishable
     // from a field that rejected its value.
+    //
+    // The parse is checked, not `.expect`ed. A key containing a character that
+    // is not legal in a TOML bare key — a space, a non-ASCII letter — makes
+    // the probe document unparseable, and the old `.expect("a bare key and a
+    // bool always parse")` panicked on it. `ro config set "core.parallel 4=1"`
+    // — a space where the dot goes, the most likely typo for this tool —
+    // exited 10 with a stack trace. A config tool that panics on a typo is
+    // worse than one that rejects it.
+    //
+    // An unparseable probe is not a modelled field: the key cannot be written
+    // as a bare key, so it cannot name a field. The caller turns that into an
+    // error naming what a valid key looks like.
     let probe = format!("{key} = true\n");
-    toml::from_str::<toml::Table>(&probe).expect("a bare key and a bool always parse") ;
+    if toml::from_str::<toml::Table>(&probe).is_err() {
+        return false;
+    }
     toml::from_str::<T>(&probe).is_err()
 }
 
@@ -484,25 +498,74 @@ engine = "codex"
         }
     }
 
-    /// The mirror image: a key the structs accept and the table omits is a
-    /// setting `ro config set` will refuse to write.
+    /// The mirror image, and a genuinely different loop.
     ///
-    /// Probed with a `true` for the reason given on `is_modelled_field`: a
-    /// valid value is accepted by a real field and *ignored* by a name ro does
-    /// not know, so only a value nothing accepts separates the two.
+    /// The test above walks `CONFIG_KEYS` and proves each declared entry is a
+    /// real field. This one walks **`AppConfig` itself** and proves every
+    /// table it has is declared — the direction that leaves a user unable to
+    /// configure something ro supports. A test of that name used to live
+    /// here, with a doc comment claiming the mirror direction; it iterated
+    /// `CONFIG_KEYS` in the same order and asserted the same thing as the
+    /// test above it, so it could never have caught what its name promised.
+    /// A test that counts as coverage it did not provide is worse than no
+    /// test, so it is gone and this is what replaced it.
+    ///
+    /// The table list is **derived from the serialized struct**, not written
+    /// out. A hand-written list of `AppConfig`'s fields is precisely the
+    /// mirror this file exists to keep from drifting — it would go stale the
+    /// moment a table was added and read as a passing test. Serializing
+    /// `AppConfig::default()` cannot go stale: a field added to the struct
+    /// appears in the output with no edit here.
+    ///
+    /// What this does and does not catch, stated plainly:
+    ///
+    /// - **Catches**: a table added to `AppConfig` and not to `CONFIG_KEYS`.
+    ///   `ro config set <new>.key=…` classifies as `UnknownTable`, is written
+    ///   with a "belongs to a newer ro" warning, and is read by nothing —
+    ///   the exact class of bug this wave is about. Nothing else checks it.
+    /// - **Catches**: any leaf the default config can serialize that
+    ///   `CONFIG_KEYS` omits (that is `[core]` and `[github]`, whose fields
+    ///   are not `Option`).
+    /// - **Does not catch**: an `Option` field added to `[auth]`, `[agent]` or
+    ///   `[identity]`, because serde omits `None` and it is not in the
+    ///   output. Enumerating those needs `serde_ignored` or a derived
+    ///   key-listing, and the note on `is_modelled_field` says why neither is
+    ///   the answer here.
     #[test]
-    fn no_modelled_key_is_missing_from_the_table() {
-        let mut missing = Vec::new();
-        for (table, keys) in CONFIG_KEYS {
-            for key in *keys {
-                if !is_modelled_field::<AppConfig>(&format!("{table}.{key}")) {
-                    missing.push(format!("{table}.{key}"));
+    fn every_table_appconfig_has_is_declared() {
+        let serialized = toml::to_string(&AppConfig::default()).expect("AppConfig serializes");
+        let parsed: toml::Value =
+            toml::from_str(&serialized).expect("the serialized config re-parses");
+        let root = parsed.as_table().expect("a table at the root");
+
+        let mut undeclared_tables = Vec::new();
+        let mut undeclared_keys = Vec::new();
+        for (table, value) in root {
+            let Some(declared) = known_keys_for(table) else {
+                undeclared_tables.push(table.clone());
+                continue;
+            };
+            let fields = value
+                .as_table()
+                .expect("a table in the serialized config")
+                .keys();
+            for key in fields {
+                if !declared.contains(&key.as_str()) {
+                    undeclared_keys.push(format!("{table}.{key}"));
                 }
             }
         }
+
         assert!(
-            missing.is_empty(),
-            "these keys are in the table but not in the structs: {missing:?}"
+            undeclared_tables.is_empty(),
+            "AppConfig has these tables and CONFIG_KEYS does not declare them, so \
+             `ro config set <table>.<key>=…` writes a setting ro reports as \
+             belonging to a newer ro and that nothing reads: {undeclared_tables:?}"
+        );
+        assert!(
+            undeclared_keys.is_empty(),
+            "AppConfig serializes these keys and CONFIG_KEYS does not declare them, so \
+             `ro config set` refuses to write a setting ro supports: {undeclared_keys:?}"
         );
     }
 
