@@ -77,6 +77,29 @@ impl Test {
     /// Written straight to SQLite: `ro config set` validates what it will
     /// write, and the whole point is a row that was not written by a path
     /// that validates.
+    /// Set the row's `clone_url`, so the origin gate compares against the
+    /// remote the target actually has.
+    ///
+    /// `repoint_row` moves the path and leaves the URL, which is enough for
+    /// the path checks and not enough for the origin one — and a test that
+    /// reaches the wrong gate passes while claiming the right one.
+    fn set_clone_url(&self, label: &str, url: &std::path::Path) {
+        let conn =
+            ro_state::open_db(&self.state_dir.path().join("state.db")).expect("the state db opens");
+        let (owner, name) = label.split_once('/').expect("label is owner/name");
+        let n = conn
+            .execute(
+                "UPDATE repos SET clone_url = ?1 WHERE owner = ?2 AND name = ?3",
+                rusqlite_params(&[
+                    url.to_string_lossy().to_string(),
+                    owner.to_string(),
+                    name.to_string(),
+                ]),
+            )
+            .expect("the row is updated");
+        assert_eq!(n, 1, "exactly one row was updated");
+    }
+
     fn repoint_row(&self, label: &str, path: &std::path::Path) {
         let conn =
             ro_state::open_db(&self.state_dir.path().join("state.db")).expect("the state db opens");
@@ -361,34 +384,78 @@ fn delete_refuses_a_parent_of_the_real_checkout() {
     let t = Test::new();
     let label = t.add();
 
-    // The real checkout, nested one level below the path the row will name.
-    let nested = t.repo.path().join("nested-checkout");
-    std::fs::create_dir_all(&nested).unwrap();
+    // A remote for the nested checkout to clone from.
     let bare_root = TempDir::new().unwrap();
     let bare = bare_root.path().join("origin.git");
     ro_testkit::worktree::run(
         bare_root.path(),
         &["init", "-q", "--bare", &bare.to_string_lossy()],
     );
-    ro_testkit::worktree::run(
-        &nested,
-        &[
-            "clone",
-            "-q",
-            &bare.to_string_lossy(),
-            &nested.to_string_lossy(),
-        ],
-    );
 
     // Repoint the row at the *parent*, which is a git repository and whose
     // origin matches the row's clone_url.
-    t.repoint_row(&label, t.repo.path());
+    //
+    // The parent has to be a **real clone with a real origin**, and this
+    // comment used to claim it was one when it was not: `Test::new()` builds
+    // `Worktree::empty()`, which is `git init` with no remote. The run was
+    // therefore refused by the origin gate — "no origin remote" — and the
+    // nested check this test exists for was never reached. It passed, and its
+    // comment said the parent's origin matched the row's clone_url. A test
+    // that passes for a reason unrelated to what it claims is worse than no
+    // test, because it counts as coverage it did not provide.
+    let parent_root = TempDir::new().unwrap();
+    let parent_bare = parent_root.path().join("parent.git");
+    ro_testkit::worktree::run(
+        parent_root.path(),
+        &["init", "-q", "--bare", &parent_bare.to_string_lossy()],
+    );
+    let parent = parent_root.path().join("parent");
+    ro_testkit::worktree::run(
+        parent_root.path(),
+        &["clone", "-q", &parent_bare.to_string_lossy(), "parent"],
+    );
+    ro_testkit::worktree::run(&parent, &["config", "user.email", "t@e.com"]);
+    ro_testkit::worktree::run(&parent, &["config", "user.name", "T"]);
 
-    t.cmd()
+    // The nested checkout lives *inside* the parent, so deleting the parent
+    // would take it.
+    let nested = parent.join("nested-checkout");
+    ro_testkit::worktree::run(
+        &parent,
+        &["clone", "-q", &bare.to_string_lossy(), "nested-checkout"],
+    );
+    assert!(
+        nested.join(".git").exists(),
+        "the nested checkout must exist for this test to mean anything"
+    );
+
+    t.repoint_row(&label, &parent);
+    // The URL too, or the origin gate fires first: it compares the target's
+    // `origin` against the row's `clone_url`, and a row repointed at a local
+    // clone still carries the synthesised GitHub URL. The test then passes
+    // for the wrong reason — which is the whole failure being fixed here.
+    t.set_clone_url(&label, &parent_bare);
+
+    let out = t
+        .cmd()
         .args(["remove", &label, "--delete", "--non-interactive"])
-        .assert()
-        .code(64)
-        .stderr(predicate::str::contains("refused"));
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(64),
+        "a parent directory is not the working copy: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // And the refusal must be the nested check, not the origin gate. Without
+    // this the test cannot tell which gate answered, and a fixture that
+    // reaches the wrong gate passes while claiming the right one.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("starts at") || stderr.contains("contains another git repository"),
+        "the refusal must be the nested check, got: {stderr}"
+    );
 
     assert!(
         nested.join(".git").exists(),
