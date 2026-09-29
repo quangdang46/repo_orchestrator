@@ -84,6 +84,23 @@ pub fn resolve_targets(
     // selection itself used.
     let mut token_hit = vec![false; tokens.len()];
 
+    // A `--filter` is validated **once, before the loop**, and the
+    // validation is the same one the per-repo path applies.
+    //
+    // Doing it inside the loop was wrong twice over. A malformed filter
+    // ('tag:work tag:infra') was reported on the first repo and then again on
+    // every other one, and a filter that is structurally impossible
+    // ('health:999') was reported per repo rather than as the usage error it
+    // is. And the loop is the wrong place for a decision that does not depend
+    // on the repo: the answer to "is this filter well-formed" is the same for
+    // all twenty.
+    //
+    // The narrowing itself still happens per repo, below — this is only the
+    // refusal.
+    if let Some(f) = filter {
+        validate_filter(f)?;
+    }
+
     for repo in &tracked {
         // `archived = 0 AND disabled = 0` is the default, not a filter
         // somebody remembered to apply at the call site. A row the user
@@ -142,11 +159,45 @@ pub fn resolve_targets(
                 }
                 hit
             })
-        } else if let Some(f) = filter {
-            matches_filter(conn, &repo.id, &label, f)?
+        } else if filter.is_some() {
+            // No pattern and a filter: the filter is the whole request, so
+            // the row is a candidate and the filter below decides. Returning
+            // `all` here instead would skip the row before the filter was
+            // ever consulted, and `--filter tag:work` alone would select
+            // nothing.
+            true
         } else {
             all
         };
+
+        // A `--filter` narrows the selection; it never replaces it.
+        //
+        // Three cases, and each is a different sentence:
+        //
+        //   * No pattern and a filter — the filter IS the request, so it
+        //     decides. `--filter tag:work` alone.
+        //   * A glob and a filter — the filter narrows the glob. 'ro sync
+        //     "proj/*" --filter health:50' is "the sick repos under proj/",
+        //     and this used to discard the filter entirely, so `health:999`
+        //     synced every repo the glob matched. A glob is a *set*, and a
+        //     filter that does not narrow a set selects more than was asked.
+        //   * A literal name and a filter — the name is an *identity*, not a
+        //     set, and it is the more specific request. A filter alongside it
+        //     could only subtract something the user already named on
+        //     purpose, so the name wins and the filter is not consulted.
+        //
+        // The glob is detected by metacharacter rather than by token count:
+        // one token is still a set if it is 'proj/*', and two literal names
+        // are still identities.
+        if let Some(f) = filter {
+            let narrow = tokens.is_empty()
+                || tokens
+                    .iter()
+                    .any(|(tok, _)| tok.contains(['*', '?', '[']));
+            if narrow && !matches_filter(conn, &repo.id, &label, f)? {
+                continue;
+            }
+        }
 
         if !matches {
             continue;
@@ -369,6 +420,65 @@ fn matches_health(conn: &ro_state::Connection, repo_id: &str, threshold: i64) ->
 /// used to match everything, which meant a typo quietly selected the whole
 /// fleet — the same failure as the glob fallback, in the other selector.
 ///
+/// Refuse a `--filter` that cannot be a filter, before any repo is asked.
+///
+/// The same validation [`matches_filter`] applies per repo, hoisted out so
+/// the decision is made once. A malformed filter reported inside the loop
+/// was reported once per repository, and a structurally impossible one
+/// ('health:999') was reported as a per-repo fact rather than as the usage
+/// error it is.
+///
+/// This does not answer the question for any repo — it only rejects the
+/// filters that have no answer. A well-formed filter that matches nothing is
+/// not an error and is not this function's business.
+fn validate_filter(filter: &str) -> Result<()> {
+    if filter.contains(char::is_whitespace) {
+        bail!(
+            "--filter {filter:?} contains whitespace. A single --filter takes a single \
+             expression — pass `--tag` for a tag, or fold several conditions into one \
+             expression with no spaces."
+        );
+    }
+    if let Some(rest) = filter
+        .strip_prefix("health:")
+        .map(|r| r.trim_start_matches(['<', ' ']))
+    {
+        let threshold = rest
+            .trim_end_matches(['>', ' '])
+            .parse::<i64>()
+            .with_context(|| format!("--filter health:<N> needs a number, got {rest:?}"))?;
+        if threshold >= HEALTH_CEILING {
+            bail!(
+                "--filter health:{threshold} would select every repo. A health score is at most \
+                 {HEALTH_CEILING}, so no repository can score above this threshold and the \
+                 filter cannot narrow anything. Nothing was selected. Use a threshold below \
+                 {HEALTH_CEILING} to ask for the repos that need a human, or --all to mean the \
+                 whole fleet."
+            );
+        }
+        if threshold < HEALTH_FLOOR {
+            bail!(
+                "--filter health:{threshold} cannot select any repo. A health score is never \
+                 below {HEALTH_FLOOR}, so this threshold is below every score a repo can have. \
+                 Nothing was selected."
+            );
+        }
+        return Ok(());
+    }
+    if filter.starts_with("tag:") || filter.starts_with("group:") {
+        return Ok(());
+    }
+    if let Some(flag) = filter.strip_prefix("has:") {
+        return match flag {
+            "archived" | "disabled" | "cloned" => Ok(()),
+            other => bail!(
+                "unknown --filter has:{other}. Expected has:archived, has:disabled or has:cloned."
+            ),
+        };
+    }
+    bail!("unknown --filter {filter:?}. Expected health:<N>, tag:<name>, or has:<flag>.")
+}
+
 /// Every selector kind answers "you matched nothing" the same way, because
 /// the same typo must not produce a different answer depending on which
 /// flag the user reached for. `tag:` and `has:` already do: they return
