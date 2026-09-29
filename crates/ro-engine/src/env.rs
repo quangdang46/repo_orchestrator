@@ -81,6 +81,74 @@ pub fn is_stripped(name: &str) -> bool {
     STRIPPED.contains(&name)
 }
 
+/// True if a variable's **value** is shaped like a credential.
+///
+/// This is the second gate, and it exists because the name list cannot be
+/// complete. `credential_ref = "env:WORK_GH_TOKEN"` names a variable that
+/// no list will ever contain, because the user chose the name — and the
+/// whole point of that row is that a secret is sitting in it. The
+/// subtraction was unconditional on the six well-known names and silent on
+/// every other one, so a per-repo credential walked straight into the
+/// agent's environment: the exact leak this module exists to prevent,
+/// arriving through the door the per-repo credential feature opened.
+///
+/// The shape is deliberately narrow so an ordinary value is not destroyed.
+/// A file path, a hostname, a prompt, a JSON blob without one of these
+/// prefixes all survive.
+///
+/// Two tiers, and the distinction is the whole point:
+///
+///   * A **recognised credential shape** — a `ghp_`/`github_pat_`/`sk-` prefix,
+///     a JWT — is conclusive on its own. It is stripped whatever the variable
+///     is called, because a `ghp_` blob in a variable named `DEPLOY` is still
+///     a GitHub token. Requiring a cooperating name here would leave the
+///     obvious case open.
+///   * A **long opaque token with no prefix** is only stripped when the
+///     variable's name says it holds a secret. A long value in `PATH` is not a
+///     credential; a long value in `MY_API_KEY` almost certainly is.
+pub fn value_looks_like_a_credential(value: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-", "xoxb-", "xoxp-",
+    ];
+    if PREFIXES.iter().any(|p| value.starts_with(p)) {
+        return true;
+    }
+    // A bare JWT: three base64url segments, the first of which decodes to a
+    // header beginning `{"alg"` or `{"typ"`. No prefix covers it.
+    if value.starts_with("eyJ") && value.split('.').count() == 3 {
+        return true;
+    }
+    value.len() >= 32 && !value.contains(char::is_whitespace)
+}
+
+/// True if a value is a credential **regardless of its variable's name**.
+///
+/// The conclusive tier of [`value_looks_like_a_credential`]. Split out so the
+/// two tiers are visibly paired at the call sites rather than one silently
+/// unreachable.
+pub fn is_conclusive_credential_shape(value: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-", "xoxb-", "xoxp-",
+    ];
+    if PREFIXES.iter().any(|p| value.starts_with(p)) {
+        return true;
+    }
+    value.starts_with("eyJ") && value.split('.').count() == 3
+}
+
+/// True if a variable's name says it holds a secret.
+///
+/// The name-based half of the second gate. Kept separate from the value
+/// test so the two are visibly paired rather than one silently
+/// unreachable, and so a future rule has one home.
+pub fn name_looks_secret(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    const MARKERS: &[&str] = &[
+        "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "API_KEY", "PAT",
+    ];
+    MARKERS.iter().any(|m| n.contains(m))
+}
+
 /// The environment for an engine's child process.
 ///
 /// Built as an owned map so the subtraction is *visible* — a caller
@@ -115,6 +183,16 @@ impl ChildEnv {
         for (k, v) in parent {
             let k = k.as_ref();
             if is_stripped(k) {
+                continue;
+            }
+            // The second gate. The name list above cannot be complete,
+            // because the per-repo credential feature lets a user name the
+            // variable themselves, and the variable they named is a secret
+            // by construction. A recognised shape is conclusive on its own; a
+            // bare long token needs the name to agree.
+            if is_conclusive_credential_shape(v.as_ref())
+                || (name_looks_secret(k) && value_looks_like_a_credential(v.as_ref()))
+            {
                 continue;
             }
             vars.insert(k.to_string(), v.as_ref().to_string());
@@ -203,9 +281,19 @@ impl ChildEnv {
     /// is refused rather than re-added — otherwise this function would be
     /// a way to put `GH_TOKEN` back and the whole design would be a
     /// convention.
+    ///
+    /// The second gate applies here too, and it is the one that matters:
+    /// `EngineContext.env` is how a caller hands the engine its own
+    /// environment, and a per-repo credential named by the user is exactly
+    /// the kind of thing that arrives through it.
     pub fn with_additions(mut self, additions: &[(String, String)]) -> Self {
         for (k, v) in additions {
             if is_stripped(k) {
+                continue;
+            }
+            if is_conclusive_credential_shape(v)
+                || (name_looks_secret(k) && value_looks_like_a_credential(v))
+            {
                 continue;
             }
             self.vars.insert(k.clone(), v.clone());
@@ -365,5 +453,85 @@ mod tests {
             None,
             "no value in the child environment may look like a credential"
         );
+    }
+}
+
+#[cfg(test)]
+mod leak_tests {
+    use super::*;
+
+    /// A per-repo credential must not reach the engine.
+    ///
+    /// `credential_ref = "env:WORK_GH_TOKEN"` names a variable no fixed
+    /// list can contain, because the user chose the name — and the whole
+    /// point of that row is that a secret is in it. The six-name strip was
+    /// silent on every other name, so this value walked straight into the
+    /// agent's environment: the exact leak this module exists to prevent,
+    /// arriving through the door the per-repo credential feature opened.
+    #[test]
+    fn a_per_repo_credential_never_reaches_an_engine() {
+        let secret = "ghp_worktoken123456789012345678901234";
+        let env = ChildEnv::subtracting([
+            ("WORK_GH_TOKEN", secret),
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/me"),
+        ]);
+
+        assert_eq!(
+            env.get("WORK_GH_TOKEN"),
+            None,
+            "the row's own credential variable reached the engine: {:?}",
+            env.to_pairs()
+        );
+        // And the environment is not simply empty — the two controls must
+        // survive, or this test also passes on a build that strips
+        // everything.
+        assert_eq!(env.get("PATH"), Some("/usr/bin"), "other vars survive");
+        assert_eq!(env.get("HOME"), Some("/home/me"));
+    }
+
+    /// The same refusal on the addition path.
+    ///
+    /// `EngineContext.env` is a caller-supplied list merged in AFTER the
+    /// subtraction. It carried the same rule and the same hole.
+    #[test]
+    fn with_additions_refuses_a_credential_shaped_value() {
+        let env = ChildEnv::subtracting([("PATH", "/usr/bin")]).with_additions(&[(
+            "DEPLOY_SECRET".into(),
+            "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123".into(),
+        )]);
+        assert_eq!(env.get("DEPLOY_SECRET"), None, "it got through");
+        assert_eq!(env.get("PATH"), Some("/usr/bin"), "other vars survive");
+    }
+
+    /// The gate is a value test, not a name test, so a secret-shaped value
+    /// in an innocuously-named variable is still caught.
+    #[test]
+    fn a_credential_shaped_value_is_caught_whatever_its_name() {
+        let env = ChildEnv::subtracting([("DEPLOY", "ghp_AAAABBBBCCCCDDDDEEEEFFFF00001111")]);
+        assert_eq!(env.get("DEPLOY"), None, "the name is not a defence");
+    }
+
+    /// The negative control, and the one that matters: the gate must not
+    /// become a filter that eats ordinary configuration.
+    ///
+    /// A user with `EDITOR=code --wait`, a long `PATH`, a JSON blob, a URL
+    /// and a base64 blob that is not a credential must all still get them.
+    #[test]
+    fn an_ordinary_value_is_never_mistaken_for_a_credential() {
+        let env = ChildEnv::subtracting([
+            ("EDITOR", "code --wait"),
+            ("SSH_AUTH_SOCK", "/run/user/1000/keyring/ssh"),
+            ("API_KEY_URL", "https://api.example.com/v1/keys"),
+            ("NPM_CONFIG", r#"{"registry":"https://registry.npmjs.org"}"#),
+            (
+                "API_KEY",
+                // Not credential-shaped: it has whitespace and reads as prose.
+                "the key is in the vault, ask the platform team for the current one",
+            ),
+        ]);
+        for k in ["EDITOR", "SSH_AUTH_SOCK", "API_KEY_URL", "NPM_CONFIG", "API_KEY"] {
+            assert!(env.get(k).is_some(), "{k} must survive the gate");
+        }
     }
 }
