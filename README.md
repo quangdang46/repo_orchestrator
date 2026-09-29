@@ -49,7 +49,10 @@ ro ship --dry-run
 **Output conventions**
 - stdout = structured data (JSON)
 - stderr = diagnostics, warnings
-- exit 0 = success, 1 = partial, 2 = all failed, 64 = bad usage, 70 = fatal
+- exit 0 = success, 1 = partial, 2 = all failed
+- 2 is also clap's own usage error (an unknown flag or a bad `--format`
+  value). 64 is a **ro** usage error — you named something that matched
+  nothing. 70 is fatal.
 
 ---
 
@@ -85,7 +88,8 @@ Managing dozens of GitHub repos by hand fails in predictable ways:
 | Feature | What it does |
 |---------|--------------|
 | **Fleet inventory** | One SQLite DB for all tracked repos |
-| **First-class sync** | ff-only / rebase / merge, parallel, autostash |
+| **First-class sync** | ff-only / rebase / merge, autostash |
+| **Parallel fleet runs** | `ro ship` / `ro commit` / `ro push` run repos concurrently (`core.parallel`) |
 | **Attention** | `ro status --dirty --ahead --behind` — the repos that need you |
 | **An agent in the loop** | `claude` by default, `codex` or `git` — you choose per run |
 | **Agent-ready JSON** | Structured reads for coding agents |
@@ -315,8 +319,9 @@ ro doctor
 ```
 
 Workspace: `ro-core`, `ro-config`, `ro-state`, `ro-git`, `ro-github`, `ro-sync`,
-`ro-engine`, `ro-sweep`, `ro-jobs`, `ro-testkit`. The CLI depends on all of
-them.
+`ro-engine`, `ro-sweep`, `ro-jobs`, `ro-testkit`. The CLI depends on all but
+the last — `ro-testkit` is a dev-dependency, so it is compiled into the test
+suite and never linked into the shipped binary.
 
 ---
 
@@ -498,6 +503,6 @@ MIT (see [LICENSE](LICENSE)). Workspace metadata also allows `MIT OR Apache-2.0`
 
 <div align="center">
 
-**Many repos. One orchestrator. Plan before apply.**
+**Many repos. One command.**
 
 </div>
