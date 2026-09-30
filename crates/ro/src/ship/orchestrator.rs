@@ -2070,7 +2070,30 @@ pub(crate) mod tests_support {
     /// that wants the output is asking a different question from one that
     /// wants a side effect, and a `bool` parameter that changes what the
     /// function returns is how the two get confused.
+    ///
+    /// **One retry, and only on a transport failure.** A local-path remote
+    /// cannot be "inaccessible" in the way a network one can — there is no
+    /// network involved — so `unable to access the remote` here is git
+    /// failing to spawn `git-upload-pack`, which on a memory-constrained
+    /// machine means the fork did not succeed. The test suite runs many test
+    /// binaries in parallel, and this one failed intermittently at exactly
+    /// that point while passing every time it ran alone.
+    ///
+    /// The retry is deliberately narrow: only that one signature, only once,
+    /// and the failure is still reported if it repeats. A blanket retry would
+    /// hide a real failure behind a second attempt, which is the cost every
+    /// other test in this file has been paying to avoid.
     pub fn run_git_out(dir: &Path, args: &[&str]) -> std::process::Output {
+        let out = run_git_once(dir, args);
+        let transport_failure = String::from_utf8_lossy(&out.stderr)
+            .contains("unable to access the remote");
+        if out.status.success() || !transport_failure {
+            return out;
+        }
+        run_git_once(dir, args)
+    }
+
+    fn run_git_once(dir: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
