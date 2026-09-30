@@ -65,7 +65,14 @@ impl Test {
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
-        let wanted = path.to_str().unwrap();
+        // The row holds the **canonicalized** path, so the expected side has
+        // to be canonicalized too - see `ro_testkit::registered_path`. On
+        // macOS the temp dir is `/var/folders/...` while `canonicalize`
+        // resolves it to `/private/var/...`, so the raw comparison found no
+        // row and the test failed for a reason that had nothing to do with
+        // what it was testing.
+        let registered = ro_testkit::registered_path(path);
+        let wanted = registered.to_str().unwrap();
         text.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())

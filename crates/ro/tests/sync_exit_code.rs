@@ -145,7 +145,10 @@ fn register(t: &Test, path: &std::path::Path) -> String {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    let wanted = path.to_str().unwrap();
+    // The row holds the **canonicalized** path - see
+    // `ro_testkit::registered_path` - so the expected side is too.
+    let registered = ro_testkit::registered_path(path);
+    let wanted = registered.to_str().unwrap();
     let mut labels = text
         .lines()
         .map(str::trim)

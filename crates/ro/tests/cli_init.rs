@@ -225,10 +225,18 @@ fn remove_delete_refuses_a_nested_registered_repo() {
 
     // Find the label for the parent row (owner is derived from the parent
     // directory name, so match on the recorded `local_path`).
+    //
+    // Canonicalized, via the shared helper, because that is what the row
+    // holds: `ro add` stores the canonicalized checkout. Matching the raw
+    // `Worktree` path instead found the row on Linux and missed it on macOS
+    // (`/var` vs `/private/var`) and on a Windows runner whose canonical form
+    // differs from the temp path it handed out — a failure about path spelling
+    // that read as a failure of the nested-repo gate this test exists for.
     let rows = listed(&t);
+    let parent_registered = ro_testkit::registered_path(parent.path());
     let parent_label = rows
         .iter()
-        .find(|r| r["local_path"].as_str() == Some(parent.path().to_str().unwrap()))
+        .find(|r| r["local_path"].as_str() == Some(parent_registered.to_str().unwrap()))
         .map(|r| {
             format!(
                 "{}/{}",

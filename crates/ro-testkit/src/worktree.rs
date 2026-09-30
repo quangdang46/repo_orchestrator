@@ -166,3 +166,37 @@ pub fn run(dir: &Path, args: &[&str]) -> String {
     );
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
+
+/// The path a registry row will carry for `checkout`, for comparison in a test.
+///
+/// A row's `local_path` is the **canonicalized** checkout, not the path the
+/// caller typed: `AddSource::Local::path` documents that, and
+/// `classify_add_input` is where the `canonicalize` happens. A test that
+/// compares the row against the raw fixture path therefore matches only when
+/// the two happen to be spelled the same, and a temp dir is routinely a case
+/// where they are not — on macOS `TempDir` hands back `/var/folders/...` while
+/// `canonicalize` resolves `/var` to `/private/var`.
+///
+/// It is here rather than copied into each test file because that is exactly
+/// what happened: the same comparison was written twice, and the second
+/// copy failed on macOS and on a Windows runner whose canonical form differs
+/// from the temp path it was given, for a reason that had nothing to do with
+/// the behaviour under test.
+///
+/// The `\\?\` prefix is stripped for the same reason one level down: Windows'
+/// `canonicalize` returns verbatim paths, and the product strips them before
+/// storing, so the expected side has to be stripped to be spelled like the
+/// row.
+pub fn registered_path(checkout: &Path) -> PathBuf {
+    let canonical = checkout
+        .canonicalize()
+        .expect("the checkout exists, so it can be canonicalized");
+    #[cfg(windows)]
+    {
+        let s = canonical.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    canonical
+}

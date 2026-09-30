@@ -35,4 +35,4 @@ pub mod worktree;
 pub use capture::{Captured, contains_pat};
 pub use remote::{BareRemote, RemotePair};
 pub use shim::{FakeBinary, TestEnv, git_path, path_lock};
-pub use worktree::Worktree;
+pub use worktree::{Worktree, registered_path};

@@ -177,34 +177,6 @@ fn innocent_directory(parent: &std::path::Path) -> std::path::PathBuf {
     dir
 }
 
-/// The path `ro add` will have written into the row for `checkout`.
-///
-/// A row's `local_path` is the **canonicalized** checkout, not the path the
-/// caller typed: `AddSource::Local::path` documents that, and
-/// `classify_add_input` is where the `canonicalize` happens. A test that
-/// compares the row against the raw fixture path therefore matches only when
-/// the two happen to be spelled the same, and every temp dir is a case where
-/// they are not — on macOS `TempDir` hands back `/var/folders/...` while
-/// `canonicalize` resolves `/var` to `/private/var`, so the lookup found
-/// nothing and the test failed on a fact about the platform rather than about
-/// the gate it exists for.
-///
-/// The `\\?\` prefix is stripped for the same reason one level down: Windows'
-/// `canonicalize` returns verbatim paths, and the product strips them before
-/// storing, so the expected side has to be stripped to be spelled like the
-/// row.
-fn registered_path(checkout: &std::path::Path) -> std::path::PathBuf {
-    let canonical = checkout.canonicalize().expect("the checkout exists");
-    #[cfg(windows)]
-    {
-        let s = canonical.as_os_str().to_string_lossy();
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return std::path::PathBuf::from(rest);
-        }
-    }
-    canonical
-}
-
 /// A stale `local_path` naming a directory that is not a checkout at all.
 ///
 /// The row is the only evidence, and the evidence is wrong.
@@ -671,14 +643,17 @@ fn delete_refuses_a_checkout_containing_an_unregistered_nested_repo() {
             .args(["list", "--format", "ndjson"])
             .output()
             .expect("ro list runs");
-        String::from_utf8_lossy(&out.stdout)
+        // The row holds the **canonicalized** checkout, so the expected side
+        // is canonicalized too — see `ro_testkit::registered_path`.
+        let wanted = ro_testkit::registered_path(&checkout);
+        let rows: Vec<serde_json::Value> = String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .map(|l| serde_json::from_str::<serde_json::Value>(&l).expect("a JSON row"))
-            .find(|v| {
-                v["local_path"].as_str() == Some(registered_path(&checkout).to_str().unwrap())
-            })
+            .collect();
+        rows.iter()
+            .find(|v| v["local_path"].as_str() == wanted.to_str())
             .map(|v| {
                 format!(
                     "{}/{}",
@@ -686,7 +661,13 @@ fn delete_refuses_a_checkout_containing_an_unregistered_nested_repo() {
                     v["name"].as_str().unwrap()
                 )
             })
-            .expect("the checkout is registered")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the checkout must be registered.\n  fixture path: {}\n  row would hold: {}\n  ro list said: {rows:?}",
+                    checkout.display(),
+                    wanted.display(),
+                )
+            })
     };
 
     // A nested clone at a depth the walk has to find. It is **not** a
