@@ -72,19 +72,58 @@ pub fn run(plans: &[RepoPlan], opts: &RunOptions) -> Summary {
     let rows = plans
         .iter()
         .zip(slots)
-        .map(|(plan, outcome)| SummaryRow {
-            label: plan.label.clone(),
-            branch: plan.base_branch.clone(),
-            engine: plan.engine.label().to_string(),
-            account: None,
-            outcome: outcome.unwrap_or(RepoOutcome::Failed {
+        .map(|(plan, outcome)| {
+            let outcome = outcome.unwrap_or(RepoOutcome::Failed {
                 class: ro_core::FailureClass::MissingProvider,
                 error: "the worker produced no result".into(),
-            }),
+            });
+            SummaryRow {
+                label: plan.label.clone(),
+                // The branch that was **written to**, which is `--onto` when
+                // the user named one and the checkout otherwise. This used to
+                // be `base_branch` unconditionally, so a `--onto` run named
+                // the branch the work was standing on — a branch the run never
+                // touched — in the row FEATURES.md calls "the record of the
+                // run". A reader comparing the row against the remote was
+                // comparing it against the wrong ref.
+                branch: written_branch(plan, &outcome),
+                engine: plan.engine.label().to_string(),
+                account: None,
+                outcome,
+            }
         })
         .collect();
 
     Summary::new(rows)
+}
+
+/// The branch a run wrote to, for the summary row.
+///
+/// `--onto` when the user named one, the checkout's own branch otherwise —
+/// the same rule `push_refspec` uses to build the refspec, and for the same
+/// reason: the two have to agree, or the row names a ref the push never
+/// touched. Kept next to the row rather than inside `RepoPlan` because it
+/// is a fact about a **run**, not about a plan: the same plan run twice
+/// writes the same branch, and a plan that has not run yet has written
+/// nothing.
+///
+/// A run that never pushed — a refusal, a conflict, a failure — has no
+/// branch it wrote to, and the checkout's name is then the honest answer:
+/// it is where the work is, and it is the branch the next run will start
+/// from. The distinction is drawn by the outcome, not by a flag, so a
+/// `Pushed` row and a `Refused` row from the same plan cannot disagree
+/// about what happened.
+fn written_branch(plan: &RepoPlan, outcome: &RepoOutcome) -> String {
+    if matches!(outcome, RepoOutcome::Pushed { .. }) {
+        return plan
+            .onto
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .unwrap_or(&plan.base_branch)
+            .to_string();
+    }
+    plan.base_branch.clone()
 }
 
 /// Build a plan for a tracked row, resolving the engine and the identity.
@@ -283,6 +322,106 @@ mod tests {
             plan.identity.as_ref().map(|i| i.email.as_str()),
             Some("work@example.invalid"),
             "the local file's author must outrank the row's"
+        );
+    }
+
+    /// A plan on `work`, optionally aimed by `--onto`, with a checkout that
+    /// need not exist: `written_branch` is a rule about the plan and the
+    /// outcome, and a test that stood up a real repository to exercise it
+    /// would be testing git.
+    fn plan_onto(onto: Option<&str>) -> RepoPlan {
+        let row = ro_sync::manage::TrackedRepo {
+            id: "id-1".into(),
+            host: "github.com".into(),
+            owner: "acme".into(),
+            name: "api".into(),
+            branch: None,
+            alias: None,
+            clone_url: "https://example.com/x.git".into(),
+            local_path: "/nonexistent".into(),
+            visibility: "private".into(),
+            archived: false,
+            disabled: false,
+            credential_ref: None,
+            author_ref: None,
+            engine: None,
+            engine_args: None,
+        };
+        let plan = plan_for(
+            &row,
+            &ro_engine::EngineSlots::default(),
+            "git",
+            None,
+            &IdentityConfig::default(),
+            None,
+        )
+        .expect("the plan builds");
+        RepoPlan {
+            base_branch: "work".into(),
+            onto: onto.map(str::to_string),
+            ..plan
+        }
+    }
+
+    fn pushed() -> RepoOutcome {
+        RepoOutcome::Pushed {
+            oid: "aaa".into(),
+            warnings: Vec::new(),
+        }
+    }
+
+    /// The row for a `--onto` run names the branch that was **written to**.
+    ///
+    /// FEATURES.md calls this line "the record of the run", and it named the
+    /// checkout's branch — so a `--onto` run recorded a branch the run never
+    /// touched, and a reader comparing the row against the remote was
+    /// comparing it against the wrong ref. The rule is `push_refspec`'s,
+    /// which is the same rule for the same reason: the row and the refspec
+    /// have to agree, or the record and the write disagree.
+    #[test]
+    fn a_pushed_row_names_the_branch_that_was_written_to() {
+        assert_eq!(
+            written_branch(&plan_onto(Some("release")), &pushed()),
+            "release",
+            "the row must name the branch the work landed on"
+        );
+    }
+
+    /// A run that never pushed wrote nothing, so the checkout's branch is
+    /// the honest answer — it is where the work is, and where the next run
+    /// starts from.
+    ///
+    /// Scoped by the outcome rather than by a flag, so a `Pushed` row and a
+    /// `Refused` row from the same plan cannot disagree about what happened.
+    #[test]
+    fn a_row_that_never_pushed_names_the_checkout_branch() {
+        let refused = RepoOutcome::Refused {
+            branch: "release".into(),
+            reason: "protected".into(),
+        };
+        assert_eq!(
+            written_branch(&plan_onto(Some("release")), &refused),
+            "work",
+            "a refused run wrote nothing; the checkout is where the work is"
+        );
+    }
+
+    /// And with no `--onto` at all, the two rules agree — which is the
+    /// common case, and the reason the bug survived: a plain run named the
+    /// right branch by accident.
+    #[test]
+    fn without_onto_the_written_branch_is_the_checkout() {
+        assert_eq!(written_branch(&plan_onto(None), &pushed()), "work");
+    }
+
+    /// `--onto ""` is the same as no `--onto`, because an empty name names
+    /// no branch. `push_refspec` filters it; if the row did not, a
+    /// whitespace-only flag would leave the row naming `""`.
+    #[test]
+    fn an_empty_onto_names_the_checkout_branch() {
+        assert_eq!(
+            written_branch(&plan_onto(Some("   ")), &pushed()),
+            "work"
         );
     }
 }

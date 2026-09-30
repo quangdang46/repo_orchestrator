@@ -1,14 +1,50 @@
 //! Sync engine implementation.
 //!
-//! Read repos from SQLite → create run record → for each repo:
-//! acquire fs4 lock → clone if missing → fetch → pull per strategy
-//! → record pre/post OID → release lock.
+//! Read repos from SQLite → create run record → sync each repo (clone if
+//! missing → fetch → pull per strategy) → record the outcome → finalise the
+//! run.
+//!
+//! # The fleet runs concurrently; the coordinator owns the database
+//!
+//! `sync_all` hands the repos to a bounded worker pool, and the results come
+//! back in **registry order** rather than completion order, so two runs over
+//! the same fleet produce byte-identical summaries.
+//!
+//! `rusqlite::Connection` is `Send` but **not** `Sync` — it holds a
+//! `RefCell` — so no reference to one can cross a thread boundary. That is a
+//! compile error (E0277) rather than a runtime surprise, which is the right
+//! way to learn it, and it settles the shape: **workers touch only git and
+//! the filesystem.** Each one hands back the row it owes the audit trail,
+//! and the coordinator writes every `sync_results` row through the single
+//! [`record_result`]. There is no second place the trail is written from.
+//!
+//! The run row still brackets the whole thing: `open_run` before the pool,
+//! `finalize_run` after it, on the coordinator, once.
+//!
+//! # Two rows naming one worktree do not run at once
+//!
+//! `repos.local_path` is **not** unique — the uniqueness constraint is on
+//! `(host, owner, name)` — so a registry can legitimately hold two rows
+//! pointing at one checkout. That was harmless while the run was a plain
+//! `for` loop: they were serialised by accident. Under a pool it is not, and
+//! two `git pull`s in one worktree fight over `.git/index.lock`. So each
+//! distinct path gets one lock and a repo holds it for the length of its own
+//! sync, which restores the old ordering without giving up the parallelism
+//! across paths.
+//!
+//! Note what this is *not*: `sync` has never taken the cross-process
+//! [`ro_git::RepoLock`] that `ro ship` takes. The doc comment at the top of
+//! this file used to claim it did. Two `ro` processes syncing the same
+//! checkout was already possible before this change and still is; what this
+//! change removes is the *new* in-process race.
 
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::manage::TrackedRepo;
@@ -31,6 +67,29 @@ impl std::fmt::Display for SyncStrategy {
             SyncStrategy::Merge => write!(f, "merge"),
         }
     }
+}
+
+/// The credential reference a row's sync should use: the per-repo file's
+/// value if it has one, otherwise the row's.
+///
+/// The same precedence `ro ship` applies, and it has to be the same one —
+/// `ro ship` reads the merged value through `plan_for`, so a sync that read
+/// only the row would fetch with a token the push does not use, and the
+/// per-repo file would be honoured by one verb and ignored by the other.
+fn effective_credential_ref(repo: &TrackedRepo) -> Option<String> {
+    let local = ro_config::local::RepoLocalConfig::load(Path::new(&repo.local_path))
+        .ok()
+        .flatten();
+    let mut reference = repo.credential_ref.clone();
+    if let Some(l) = &local {
+        // Only the credential is read here, but `apply_to` takes all four
+        // slots, so the other three are filled with throwaway `Option`s.
+        let mut discard_a = None;
+        let mut discard_b = None;
+        let mut discard_c = None;
+        l.apply_to(&mut discard_a, &mut reference, &mut discard_b, &mut discard_c);
+    }
+    reference
 }
 
 /// Options for a sync operation.
@@ -95,6 +154,34 @@ impl SyncOptions {
             timeout: self.git_timeout(),
             ..ro_git::mutation::RunOpts::none()
         }
+    }
+
+    /// [`Self::run_opts`] plus this repo's credential, scoped to this repo's
+    /// own host.
+    ///
+    /// The credential is resolved here rather than at the call site so the
+    /// fetch, the pull **and** the clone on one row all carry the same token,
+    /// and so a bad reference is reported once instead of per network call.
+    ///
+    /// This is the same pair `ro ship` makes — [`fetch_with_credential`] and
+    /// [`push_with_credential`] — and it was missing on the sync side
+    /// entirely: `sync_repo_inner` built `FetchOpts::default()` and handed
+    /// `opts.run_opts()` to `fetch_in`, so `host` was `None`, no header was
+    /// scoped, and **every** fetch a sync made went out anonymously. A private
+    /// repo enrolled with `--credential` — the one case the flag exists for —
+    /// synced with `fatal: could not read Username`, while `ro ship` over the
+    /// same row succeeded. The flag was validated, stored, echoed by
+    /// `ro list`, and used by exactly one verb.
+    ///
+    /// `Err` is a malformed or unresolvable reference, which is the user's
+    /// problem to hear about and not something to answer by falling back to
+    /// the machine's own credential — that would be the wrong account,
+    /// silently.
+    pub fn run_opts_for(&self, repo: &TrackedRepo) -> Result<crate::manage::CredentialEnv> {
+        crate::manage::credential_env(
+            &repo.clone_url,
+            effective_credential_ref(repo).as_deref(),
+        )
     }
 
     /// Set the deadline on a git invocation and run it.
@@ -182,6 +269,29 @@ pub struct SyncResult {
     /// every repo where the user asked for it"; this field answers "did the
     /// preview tell the truth", and they are different questions.
     pub plan_mismatch: Option<String>,
+    /// Why this row is not a success, when it is not a success for a reason
+    /// that is **not** an error.
+    ///
+    /// `skipped_dirty` and `skipped_unpushed` are the two. Both used to carry
+    /// their whole explanation in the `sync_results` row's `error` column and
+    /// nowhere else: `SyncResult::error` was left `None` for exactly these two
+    /// (neither is an error, and the field's doc says so), and the text, json
+    /// and ndjson renderers all read `error`. So a plain `ro sync` printed
+    /// the bare word
+    ///
+    /// ```text
+    /// work/api action=skipped_dirty status=skipped
+    /// ```
+    ///
+    /// and nothing else — the word, with none of the sentence that tells the
+    /// user the fix is `--autostash`. The reason existed, was correct, was
+    /// written to the database on every run, and reached no reader at all.
+    ///
+    /// A separate field rather than a second meaning on `error`, so a caller
+    /// that treats "there is an error message" as "this repo failed" keeps
+    /// being right: the run-level verdict reads [`status_fails_run`], which
+    /// reads `status`, and `skipped` is not a failure.
+    pub reason: Option<String>,
 }
 
 /// The statuses `sync_repo` can put in [`SyncResult::status`], and what each
@@ -693,10 +803,52 @@ pub fn sync_repo(
     opts: &SyncOptions,
     run_id: &str,
 ) -> Result<SyncResult> {
+    let (result, row) = run_repo(repo, opts)?;
+    // Written here rather than inside `sync_repo_inner` so that the single
+    // repo and the fleet share one writer — see [`record_result`].
+    record_result(conn, run_id, row)?;
+    Ok(result)
+}
+
+/// The audit row a finished sync owes, taken off the result itself.
+///
+/// Derived from the result rather than passed alongside it so a caller cannot
+/// record a row that disagrees with the row it is returning: there is one
+/// source, and it is the thing the user is shown. The two branches that say
+/// something extra hand their row over [`sync_repo_inner`]'s `explicit_row`
+/// instead, and they are the only reason that parameter exists.
+fn pending_from(result: &SyncResult) -> PendingResult {
+    pending(
+        &result.repo_id,
+        &result.action,
+        &result.status,
+        result.duration_ms,
+        result.error.as_deref(),
+        &result.pre_oid,
+        &result.post_oid,
+    )
+}
+
+/// Sync one repo and hand back the row it owes the audit trail.
+///
+/// The seam between "do the work" and "write it down". Both callers — the
+/// single-repo [`sync_repo`] and the fleet's worker — go through here, so
+/// there is one answer to "what row does this repo produce".
+///
+/// It is also where the predict-then-verify comparison lives, and that is
+/// not incidental. The fleet used to call `sync_repo_inner` directly, which
+/// meant a fleet run never compared its own prediction with its own outcome
+/// — the invariant was checked on the one-repo path and skipped on the
+/// twenty-repo path, which is the path that matters. One function, one
+/// comparison, whichever caller arrived.
+fn run_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<(SyncResult, PendingResult)> {
     // A dry run's plan *is* its result; there is no second outcome to
     // compare it against, so prediction is for the real run only.
     if opts.dry_run {
-        return sync_repo_inner(conn, repo, opts, run_id);
+        let mut explicit = None;
+        let result = sync_repo_inner(&mut explicit, repo, opts)?;
+        let row = explicit.unwrap_or_else(|| pending_from(&result));
+        return Ok((result, row));
     }
 
     // Taken **before** `sync_repo_inner` runs, deliberately. The prediction
@@ -706,7 +858,8 @@ pub fn sync_repo(
     // would compare the outcome with itself and could never disagree.
     let predicted = plan_repo(repo, opts).ok();
 
-    let mut result = sync_repo_inner(conn, repo, opts, run_id)?;
+    let mut explicit = None;
+    let mut result = sync_repo_inner(&mut explicit, repo, opts)?;
 
     if let Some(plan) = &predicted {
         let predicted_row = planned_row(&repo.id, plan);
@@ -730,7 +883,8 @@ pub fn sync_repo(
         }
     }
 
-    Ok(result)
+    let row = explicit.unwrap_or_else(|| pending_from(&result));
+    Ok((result, row))
 }
 
 /// A [`PlannedSync`] as the row a comparison can be made against.
@@ -747,6 +901,7 @@ fn planned_row(repo_id: &str, plan: &PlannedSync) -> SyncResult {
         status: plan.status.to_string(),
         duration_ms: 0,
         error: plan.plan.clone(),
+        reason: None,
         pre_oid: None,
         post_oid: None,
         ahead: plan.ahead,
@@ -757,12 +912,28 @@ fn planned_row(repo_id: &str, plan: &PlannedSync) -> SyncResult {
     }
 }
 
-/// The sync itself. [`sync_repo`] wraps this; nothing else should call it.
+/// The sync itself. [`run_repo`] wraps this; nothing else should call it.
+///
+/// Takes **no** `Connection` and no `run_id`. It is the function the worker
+/// pool runs, and a `Connection` cannot cross a thread boundary — so the row
+/// this owes is built here and written by the caller. See the module docs.
+///
+/// `explicit_row` is the escape hatch for the two branches whose audit row is
+/// **not** the returned result: `skipped_dirty` and `skipped_unpushed` leave
+/// the returned result's `error` empty, because neither is an error and a
+/// caller reading `error` should not find one. Deriving the row from the
+/// result would therefore blank those two reasons out of the audit trail, so
+/// those branches state their own row and everything else derives one.
+///
+/// The **reason** those branches return goes on [`SyncResult::reason`], which
+/// is the field the text, json and ndjson renderers read for a row that is
+/// not a success. `error` stays `None` — a caller that treats "there is an
+/// error message" as "this repo failed" is right, because `skipped` is not a
+/// failure — and the sentence still reaches every reader.
 fn sync_repo_inner(
-    conn: &Connection,
+    explicit_row: &mut Option<PendingResult>,
     repo: &TrackedRepo,
     opts: &SyncOptions,
-    run_id: &str,
 ) -> Result<SyncResult> {
     let start = Instant::now();
     let local = Path::new(&repo.local_path);
@@ -812,17 +983,6 @@ fn sync_repo_inner(
         // entry in `sync_results` and an exit code on the run a script can
         // read. A verdict that exists only on screen is a verdict nothing
         // downstream can act on.
-        record_result(
-            conn,
-            run_id,
-            &repo.id,
-            &planned.action,
-            planned.status,
-            duration,
-            planned.plan.as_deref(),
-            &pre_oid,
-            &pre_oid,
-        )?;
         return Ok(SyncResult {
             repo_id: repo.id.clone(),
             action: planned.action,
@@ -845,8 +1005,15 @@ fn sync_repo_inner(
             // not an error. Both carry it now.
             plan: planned.plan,
             plan_mismatch: None,
+            reason: None,
         });
     }
+
+    // Resolved **once**, before any network call, and reused by the clone,
+    // the fetch and the pull below. Resolving per call site would be three
+    // chances for them to disagree about which token this repo is using.
+    let credential = opts.run_opts_for(repo)?;
+    let credential_env = credential.env;
 
     if !local.join(".git").exists() {
         if opts.pull_only {
@@ -864,6 +1031,7 @@ fn sync_repo_inner(
                 unmeasurable_reason: None,
                 plan: None,
             plan_mismatch: None,
+            reason: None,
             });
         }
         // Clone
@@ -873,22 +1041,20 @@ fn sync_repo_inner(
             branch: repo.branch.clone(),
             ..Default::default()
         };
-        match ro_git::mutation::clone_in(&repo.clone_url, local, &clone_opts, &opts.run_opts()) {
+        // The clone carries the credential too. It is the one git call that
+        // happens when there is no checkout to read a `.ro/config.local.toml`
+        // from, so the row is the only source — and `ro add` resolved the
+        // same reference through the same code to make this clone in the
+        // first place.
+        let clone_run = ro_git::mutation::RunOpts {
+            env: &credential_env,
+            ..opts.run_opts()
+        };
+        match ro_git::mutation::clone_in(&repo.clone_url, local, &clone_opts, &clone_run) {
             Ok(outcome) => {
                 if !outcome.result.ok() {
                     let duration = start.elapsed().as_millis() as u64;
                     let err_msg = outcome.result.stderr.trim().to_string();
-                    record_result(
-                        conn,
-                        run_id,
-                        &repo.id,
-                        "clone",
-                        "error",
-                        duration,
-                        Some(&err_msg),
-                        &pre_oid,
-                        &None,
-                    )?;
                     return Ok(SyncResult {
                         repo_id: repo.id.clone(),
                         action: "clone".into(),
@@ -902,13 +1068,11 @@ fn sync_repo_inner(
                         unmeasurable_reason: None,
                         plan: None,
             plan_mismatch: None,
+            reason: None,
                     });
                 }
                 let post_oid = ro_git::read::head_oid(local).ok().flatten();
                 let duration = start.elapsed().as_millis() as u64;
-                record_result(
-                    conn, run_id, &repo.id, "clone", "success", duration, None, &pre_oid, &post_oid,
-                )?;
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "clone".into(),
@@ -922,22 +1086,12 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 })
             }
             Err(e) => {
                 let duration = start.elapsed().as_millis() as u64;
                 let err_msg = format!("{e:#}");
-                record_result(
-                    conn,
-                    run_id,
-                    &repo.id,
-                    "clone",
-                    "error",
-                    duration,
-                    Some(&err_msg),
-                    &pre_oid,
-                    &None,
-                )?;
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "clone".into(),
@@ -951,6 +1105,7 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 })
             }
         }
@@ -970,6 +1125,7 @@ fn sync_repo_inner(
                 unmeasurable_reason: None,
                 plan: None,
             plan_mismatch: None,
+            reason: None,
             });
         }
         // Fetch + pull
@@ -984,7 +1140,15 @@ fn sync_repo_inner(
         // grew a `--prune` or a remote name would quietly make this a
         // different command than the option struct describes.
         let fetch_opts = ro_git::mutation::FetchOpts::default();
-        if let Err(e) = ro_git::mutation::fetch_in(local, &fetch_opts, &opts.run_opts()) {
+        // `env` is the credential; `timeout` is this run's deadline. Both in
+        // one `RunOpts`, because a deadline that reaches only some of a run's
+        // git calls is not a deadline and a credential that reaches only some
+        // of them is not a credential.
+        let fetch_run = ro_git::mutation::RunOpts {
+            env: &credential_env,
+            ..opts.run_opts()
+        };
+        if let Err(e) = ro_git::mutation::fetch_in(local, &fetch_opts, &fetch_run) {
             // A fetch that hit the deadline is a timeout, not a refusal, and
             // the two need different responses: a refusal is a wrong flag or
             // a bad URL, a timeout is a network that never answered and the
@@ -999,17 +1163,6 @@ fn sync_repo_inner(
                     "git fetch did not finish within {after:?} and was killed, along with \
                      anything it had started. The next repo is unaffected."
                 );
-                record_result(
-                    conn,
-                    run_id,
-                    &repo.id,
-                    "fetch",
-                    "error",
-                    duration,
-                    Some(&err_msg),
-                    &pre_oid,
-                    &pre_oid,
-                )?;
                 return Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "fetch".into(),
@@ -1023,21 +1176,11 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 });
             }
             let duration = start.elapsed().as_millis() as u64;
             let err_msg = format!("{e:#}");
-            record_result(
-                conn,
-                run_id,
-                &repo.id,
-                "fetch",
-                "error",
-                duration,
-                Some(&err_msg),
-                &pre_oid,
-                &pre_oid,
-            )?;
             return Ok(SyncResult {
                 repo_id: repo.id.clone(),
                 action: "fetch".into(),
@@ -1051,6 +1194,7 @@ fn sync_repo_inner(
                 unmeasurable_reason: None,
                 plan: None,
             plan_mismatch: None,
+            reason: None,
             });
         }
 
@@ -1092,17 +1236,18 @@ fn sync_repo_inner(
         if dirty_count > 0 && !opts.autostash && !opts.dry_run {
             let duration = start.elapsed().as_millis() as u64;
             let detail = format!("{dirty_count} uncommitted change(s) (use --autostash)");
-            record_result(
-                conn,
-                run_id,
+            // The row and the result now carry the same sentence. They did
+            // not: the row's `error` column got the reason and the result
+            // got `None`, and every renderer reads the result.
+            *explicit_row = Some(pending(
                 &repo.id,
                 "skipped_dirty",
-                "skipped",
+                STATUS_SKIPPED,
                 duration,
                 Some(&detail),
                 &pre_oid,
                 &pre_oid,
-            )?;
+            ));
             return Ok(SyncResult {
                 repo_id: repo.id.clone(),
                 action: "skipped_dirty".into(),
@@ -1116,10 +1261,17 @@ fn sync_repo_inner(
                 unmeasurable_reason: None,
                 plan: None,
             plan_mismatch: None,
+                // `--autostash` is the whole remedy and the user cannot act on
+                // the word `skipped_dirty` alone.
+                reason: Some(detail),
             });
         }
 
-        let pull_result = ro_git::mutation::pull_in(local, &pull_opts, &opts.run_opts());
+        let pull_run = ro_git::mutation::RunOpts {
+            env: &credential_env,
+            ..opts.run_opts()
+        };
+        let pull_result = ro_git::mutation::pull_in(local, &pull_opts, &pull_run);
         let post_oid = ro_git::read::head_oid(local).ok().flatten();
 
         let duration = start.elapsed().as_millis() as u64;
@@ -1143,17 +1295,6 @@ fn sync_repo_inner(
                 let detail = outcome.autostash_hold.clone().unwrap_or_else(|| {
                     "the autostash did not pop; your uncommitted work is in the stash".to_string()
                 });
-                record_result(
-                    conn,
-                    run_id,
-                    &repo.id,
-                    "pull",
-                    STATUS_AUTOSTASH_CONFLICT,
-                    duration,
-                    Some(&detail),
-                    &pre_oid,
-                    &post_oid,
-                )?;
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "pull".into(),
@@ -1167,6 +1308,7 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 })
             }
             // `pull` returns `Ok` when the command *ran*, not when it
@@ -1183,9 +1325,6 @@ fn sync_repo_inner(
                 } else {
                     "updated"
                 };
-                record_result(
-                    conn, run_id, &repo.id, action, "success", duration, None, &pre_oid, &post_oid,
-                )?;
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: action.into(),
@@ -1199,6 +1338,7 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 })
             }
             // The command ran and failed. Distinguish a conflict from a
@@ -1213,17 +1353,6 @@ fn sync_repo_inner(
                     stderr
                 };
                 let err_msg = format!("conflicted: {detail}");
-                record_result(
-                    conn,
-                    run_id,
-                    &repo.id,
-                    "pull",
-                    STATUS_CONFLICT,
-                    duration,
-                    Some(&err_msg),
-                    &pre_oid,
-                    &post_oid,
-                )?;
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "pull".into(),
@@ -1237,6 +1366,7 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 })
             }
             Ok(outcome) => {
@@ -1256,9 +1386,10 @@ fn sync_repo_inner(
                         "{branch} has no remote branch yet — it has never been pushed. \
                          Nothing to fetch."
                     );
-                    record_result(
-                        conn,
-                        run_id,
+                    // The row and the result carry the same sentence. They
+                    // did not: the row's `error` column got the reason and the
+                    // result got `None`, and every renderer reads the result.
+                    *explicit_row = Some(pending(
                         &repo.id,
                         "pull",
                         "skipped_unpushed",
@@ -1266,7 +1397,7 @@ fn sync_repo_inner(
                         Some(&detail),
                         &pre_oid,
                         &post_oid,
-                    )?;
+                    ));
                     return Ok(SyncResult {
                         repo_id: repo.id.clone(),
                         action: "skipped_unpushed".into(),
@@ -1280,6 +1411,11 @@ fn sync_repo_inner(
                         unmeasurable_reason: None,
                         plan: None,
             plan_mismatch: None,
+                        // The branch is new and unpushed, which is the normal
+                        // state of `git checkout -b` — the sentence says so,
+                        // because the word `skipped_unpushed` alone reads as
+                        // something went wrong.
+                        reason: Some(detail),
                     });
                 }
                 let err_msg = if stderr.is_empty() {
@@ -1287,17 +1423,6 @@ fn sync_repo_inner(
                 } else {
                     stderr
                 };
-                record_result(
-                    conn,
-                    run_id,
-                    &repo.id,
-                    "pull",
-                    "error",
-                    duration,
-                    Some(&err_msg),
-                    &pre_oid,
-                    &post_oid,
-                )?;
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "pull".into(),
@@ -1311,21 +1436,11 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 })
             }
             Err(e) => {
                 let err_msg = format!("{e:#}");
-                record_result(
-                    conn,
-                    run_id,
-                    &repo.id,
-                    "pull",
-                    "error",
-                    duration,
-                    Some(&err_msg),
-                    &pre_oid,
-                    &post_oid,
-                )?;
                 Ok(SyncResult {
                     repo_id: repo.id.clone(),
                     action: "pull".into(),
@@ -1339,6 +1454,7 @@ fn sync_repo_inner(
                     unmeasurable_reason: None,
                     plan: None,
             plan_mismatch: None,
+            reason: None,
                 })
             }
         }
@@ -1349,11 +1465,14 @@ fn sync_repo_inner(
 ///
 /// A dry run and a real run differ in the per-repo rows but not in the run
 /// row, so the run row has to say which it was — and the deadline in force
-/// is the other fact a reader cannot recover afterwards.
-fn run_args(opts: &SyncOptions, selected: &[String]) -> Vec<String> {
+/// is the other fact a reader cannot recover afterwards. The worker bound is
+/// the third: a run over one repo and a run over twenty took the same wall
+/// time for the first repo, and only this says why.
+fn run_args(opts: &SyncOptions, selected: &[String], parallel: usize) -> Vec<String> {
     let mut args = vec![
         format!("strategy={}", opts.strategy),
         format!("timeout_secs={}", opts.timeout_secs),
+        format!("parallel={parallel}"),
     ];
     if opts.dry_run {
         args.push("dry_run".to_string());
@@ -1395,10 +1514,73 @@ fn run_args(opts: &SyncOptions, selected: &[String]) -> Vec<String> {
 /// named a repo: `ro sync` on an empty registry is a legitimate question
 /// with the answer "nothing to do", and `ro sync nonexistent` is a typo
 /// that deserves to be reported rather than absorbed.
+///
+/// The bound is [`SyncOptions::default_parallel`] — the shipped default for
+/// `core.parallel`. See [`sync_all_bounded`] for why this function cannot
+/// read the user's config for itself.
 pub fn sync_all(
     conn: &Connection,
     opts: &SyncOptions,
     selected: &[String],
+) -> Result<Vec<SyncResult>> {
+    sync_all_bounded(conn, opts, selected, default_parallel())
+}
+
+/// How many repos a sync may touch at once when nobody said otherwise.
+///
+/// Read from `ro_config`'s own default rather than written out as a number,
+/// so the bound cannot drift away from the one the shipped config file
+/// documents and the fleet verbs use. `core.parallel` is `>= 1` by
+/// validation; the `max(1)` is belt-and-braces for a caller that has not
+/// been through the validator.
+fn default_parallel() -> usize {
+    ro_config::schema::AppConfig::default().core.parallel.max(1) as usize
+}
+
+/// Sync every selected repo, at most `parallel` at a time.
+///
+/// The bound is a parameter rather than something read here on purpose.
+/// `ro-config`'s rule is that the CLI resolves settings once and threads
+/// them down — a library function that reached for `~/.config/ro/config.toml`
+/// on its own would make a unit test's behaviour depend on the developer's
+/// home directory, which is how a test suite starts passing on one machine
+/// and failing on another. So [`sync_all`] supplies the shipped default, and
+/// the CLI passes `config.core.parallel` to say what the user actually typed.
+///
+/// **Order of results is registry order, not completion order.** The pool
+/// writes each outcome into its own slot, and the slots are read back in the
+/// order the repos were listed. A summary that reorders itself run to run is
+/// worse than a slow one: a diff between two runs stops meaning "nothing
+/// changed".
+///
+/// Two rows may name one `local_path` — uniqueness is on
+/// `(host, owner, name)`, not on the checkout — so the workers share one
+/// lock per distinct path and a repo holds it for its own sync. Without it,
+/// two `git pull`s in one worktree race for `.git/index.lock`, which is a
+/// failure mode this function did not have while it was a `for` loop.
+pub fn sync_all_bounded(
+    conn: &Connection,
+    opts: &SyncOptions,
+    selected: &[String],
+    parallel: usize,
+) -> Result<Vec<SyncResult>> {
+    sync_all_observed(conn, opts, selected, parallel, &FleetObserver::none())
+}
+
+/// [`sync_all_bounded`], with the pool's concurrency made observable.
+///
+/// The observer is a parameter rather than a global because the tests that
+/// use it run **concurrently in one process**: a `static` would have each
+/// test's counters overwritten by whichever sibling happened to be running,
+/// which is a test that fails for a reason that has nothing to do with the
+/// code. `&FleetObserver::none()` is what production passes, and it costs
+/// one `Option` test per repo.
+fn sync_all_observed(
+    conn: &Connection,
+    opts: &SyncOptions,
+    selected: &[String],
+    parallel: usize,
+    observer: &FleetObserver,
 ) -> Result<Vec<SyncResult>> {
     // Archived and disabled rows are excluded here rather than at each
     // call site. `list(conn, None)` returns every row, so a sync that did
@@ -1411,22 +1593,36 @@ pub fn sync_all(
         .filter(|r| !r.archived && !r.disabled)
         .filter(|r| selected.is_empty() || selected.contains(&r.id))
         .collect();
+    let parallel = parallel.max(1);
     // The run row records what the run *was*. It used to be opened with an
     // empty args slice, so every sync — dry or real, any `--timeout`, any
     // strategy — wrote `args_json = '[]'` and the two were byte-identical
     // in the audit trail. A reader could tell a dry run from a real one by
     // looking at the per-repo rows, but could not tell what flags were in
     // force, which is the question the run-level record exists to answer.
-    let run = ro_jobs::open_run(conn, "sync", &run_args(opts, selected))
+    //
+    // Opened before any worker and finalised after every one of them, on
+    // this thread: the run row brackets the whole fleet either way.
+    let run = ro_jobs::open_run(conn, "sync", &run_args(opts, selected, parallel))
         .context("opening the sync run record")?;
     let run_id = run.id.clone();
 
-    let mut results = Vec::new();
-    for repo in &repos {
-        // A failed *write* aborts the run rather than being folded into a
-        // per-repo result: the audit trail is missing, so every result in
-        // this run is untrustworthy, including the ones already recorded.
-        results.push(sync_repo(conn, repo, opts, &run_id)?);
+    let outcomes = sync_fleet(&repos, opts, parallel, observer)?;
+    let results: Vec<SyncResult> = outcomes.iter().map(|(r, _)| r.clone()).collect();
+    // Every `sync_results` row this run owes, written here on the
+    // coordinator in registry order. A failed *write* aborts the run rather
+    // than being folded into a per-repo result: the audit trail is missing,
+    // so every result in this run is untrustworthy, including the ones
+    // already recorded.
+    //
+    // The rows the workers built are the ones written, **not** rows
+    // re-derived from the results. Two of them — `skipped_dirty` and
+    // `skipped_unpushed` — carry a reason in the row's `error` column that
+    // the result they return deliberately leaves empty, and re-deriving would
+    // have written a `NULL` there: a silent, unreported blanking of the
+    // audit trail on exactly the two rows where the reason is the point.
+    for (_, row) in &outcomes {
+        record_result(conn, &run_id, row.clone())?;
     }
 
     // Exit code reflects the worst outcome, so a run that recorded a failure
@@ -1476,7 +1672,278 @@ pub fn run_exit_code(results: &[SyncResult]) -> i32 {
     }
 }
 
+/// Sync `repos`, at most `parallel` at a time, and return the outcomes in
+/// **registry order**.
+///
+/// The shape is the fleet verbs' — `crates/ro/src/ship/emit.rs` — because
+/// it is the same problem: bounded concurrency, deterministic output. The
+/// workers touch git and the filesystem and nothing else; no `Connection`
+/// crosses this boundary, which is not a style preference but the only thing
+/// the type system permits (see the module docs).
+///
+/// Two details worth naming, because both are the way this goes quietly
+/// wrong:
+///
+///  * **Results are placed by index, not appended.** Appending would return
+///    completion order, and a summary that reorders itself between two runs
+///    over the same fleet cannot be diffed.
+///  * **One lock per distinct path.** Two rows naming one checkout are legal
+///    (uniqueness is on `(host, owner, name)`) and used to be serialised by
+///    the loop itself. Two concurrent `git pull`s in one worktree are not a
+///    slower version of that; they are two writers on one index.
+fn sync_fleet(
+    repos: &[TrackedRepo],
+    opts: &SyncOptions,
+    parallel: usize,
+    observer: &FleetObserver,
+) -> Result<Vec<(SyncResult, PendingResult)>> {
+    if repos.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let locks = path_locks(repos);
+
+    // A `try_lock` would be wrong here in the other direction: this mutex
+    // guards the slots, and a poisoned one still holds every slot that was
+    // written. `into_inner` keeps the results a panicking worker managed to
+    // produce instead of turning its neighbours' work into a second panic.
+    let outcomes: Mutex<Vec<Option<(SyncResult, PendingResult)>>> =
+        Mutex::new((0..repos.len()).map(|_| None).collect());
+
+    // Exactly `parallel` workers, each pulling the **next index** off a
+    // shared cursor, rather than static chunking.
+    //
+    // The chunking this replaces computed `workers = min(parallel, n)` and
+    // then spawned one thread per `repos.chunks(div_ceil(n, workers))` — so
+    // the thread count was `ceil(n / ceil(n/p))`, not `min(p, n)`. For 12
+    // repos at `p = 8` that is **6** wide, not 8: measured peak concurrency
+    // was 6, while the `runs` row recorded `parallel=8`. Uniform costs hide
+    // it, because the wave count is preserved; a skewed fleet pays for it and
+    // the audit trail overstates the width the tool used.
+    //
+    // A shared cursor also makes the pool self-balancing, which static
+    // chunks are not: one slow repo cannot hold up a whole chunk's worth of
+    // fast ones behind it.
+    let next = AtomicUsize::new(0);
+    let cursor = &next;
+    std::thread::scope(|scope| {
+        for _ in 0..parallel.min(repos.len()) {
+            let outcomes = &outcomes;
+            let locks = &locks;
+            scope.spawn(move || loop {
+                let index = cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(repo) = repos.get(index) else {
+                    break;
+                };
+                let pair = sync_one(repo, opts, locks, observer);
+                let mut slots = outcomes.lock().unwrap_or_else(|e| e.into_inner());
+                // The index, not the repo id: a repo id is a UUID, and
+                // parsing one as a slot number is a silent
+                // mis-assignment.
+                slots[index] = Some(pair);
+            });
+        }
+    });
+
+    let slots = outcomes.into_inner().unwrap_or_else(|e| e.into_inner());
+    let mut results = Vec::with_capacity(repos.len());
+    for (repo, slot) in repos.iter().zip(slots) {
+        results.push(slot.unwrap_or_else(|| {
+            let result = worker_produced_nothing(repo);
+            let row = pending_from(&result);
+            (result, row)
+        }));
+    }
+    Ok(results)
+}
+
+/// Sync one repo, holding its path's lock for the whole of it.
+///
+/// The lock is held across the git work on purpose: two rows naming one
+/// checkout have to be serialised end to end, not just at the moment they
+/// happen to touch the index.
+fn sync_one(
+    repo: &TrackedRepo,
+    opts: &SyncOptions,
+    locks: &std::collections::HashMap<PathBuf, Arc<Mutex<()>>>,
+    observer: &FleetObserver,
+) -> (SyncResult, PendingResult) {
+    let guard = match locks.get(Path::new(&repo.local_path)) {
+        Some(lock) => lock.lock().unwrap_or_else(|e| e.into_inner()),
+        // Unreachable: the map is built from the same rows. Answering with a
+        // visible failure beats `expect`, which would take down a fleet run
+        // over a bookkeeping bug.
+        None => {
+            return (
+                SyncResult {
+                    repo_id: repo.id.clone(),
+                    action: "error".into(),
+                    status: STATUS_ERROR.into(),
+                    duration_ms: 0,
+                    error: Some(format!(
+                        "no lock was prepared for {}; the sync pool and the repo \
+                         list disagree",
+                        repo.local_path
+                    )),
+                    pre_oid: None,
+                    post_oid: None,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
+                    plan_mismatch: None,
+            reason: None,
+                },
+                pending(
+                    &repo.id,
+                    "error",
+                    STATUS_ERROR,
+                    0,
+                    Some("the sync pool and the repo list disagree"),
+                    &None,
+                    &None,
+                ),
+            );
+        }
+    };
+    // The lock is a guard, not a `drop(guard)` at the end of the function:
+    // every early return below has to release it, and there are a dozen.
+    let _held = guard;
+
+    // Entered **after** the lock, and that ordering is the whole point. A
+    // worker waiting for another row's checkout is not doing git work; if
+    // the observer counted it, two rows sharing a path would report a peak of
+    // 2 while the second sat blocked — which is exactly the number this
+    // observer exists to keep honest.
+    let _observed = observer.enter();
+
+    match run_repo(repo, opts) {
+        Ok(pair) => pair,
+        // A `plan_repo` failure is the only way the body gets here, and it
+        // used to abort the whole fleet. In a pool there is nothing to abort
+        // — the other repos have already run — so it is a row for this repo
+        // and the run's exit code says what it means.
+        Err(e) => {
+            let err_msg = format!("{e:#}");
+            (
+                SyncResult {
+                    repo_id: repo.id.clone(),
+                    action: "error".into(),
+                    status: STATUS_ERROR.into(),
+                    duration_ms: 0,
+                    error: Some(err_msg.clone()),
+                    pre_oid: None,
+                    post_oid: None,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
+                    plan_mismatch: None,
+            reason: None,
+                },
+                pending(&repo.id, "error", STATUS_ERROR, 0, Some(&err_msg), &None, &None),
+            )
+        }
+    }
+}
+
+/// The row for a repo whose worker came back with nothing.
+///
+/// `std::thread::scope` re-raises a panicking worker's panic when the scope
+/// closes, so this is belt-and-braces rather than a live path. It is here
+/// because the alternative — an `expect` on the slot — reports "the worker
+/// produced no result" as a panic about an index, which names the wrong
+/// thing.
+fn worker_produced_nothing(repo: &TrackedRepo) -> SyncResult {
+    SyncResult {
+        repo_id: repo.id.clone(),
+        action: "error".into(),
+        status: STATUS_ERROR.into(),
+        duration_ms: 0,
+        error: Some(
+            "the worker for this repo produced no result; the sync did not \
+             complete for it"
+                .into(),
+        ),
+        pre_oid: None,
+        post_oid: None,
+        ahead: None,
+        behind: None,
+        unmeasurable_reason: None,
+        plan: None,
+        plan_mismatch: None,
+        reason: None,
+    }
+}
+
+/// One lock per distinct checkout, shared by every row naming it.
+///
+/// Keyed on a **canonicalised** path so `/tmp/x`, `/tmp/x/` and a symlink to
+/// it are one checkout and not three. Canonicalisation fails for a path that
+/// does not exist yet — which is every repo about to be cloned — so the raw
+/// path is the fallback, exactly as `ro_git::RepoLock::acquire` does it. Two
+/// rows spelling the same not-yet-created path the same way still collide,
+/// which is the case that matters.
+fn path_locks(repos: &[TrackedRepo]) -> std::collections::HashMap<PathBuf, Arc<Mutex<()>>> {
+    let mut locks = std::collections::HashMap::new();
+    for repo in repos {
+        let raw = PathBuf::from(&repo.local_path);
+        let key = std::fs::canonicalize(&raw).unwrap_or(raw);
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())));
+    }
+    locks
+}
+
+/// A `sync_results` row that has been decided but not yet written.
+///
+/// Produced by a worker, written by the coordinator. Owned rather than
+/// borrowed for the obvious reason: it has to outlive the frame it was
+/// built in, and cross a thread boundary to get there.
+#[derive(Debug, Clone)]
+struct PendingResult {
+    repo_id: String,
+    action: String,
+    status: String,
+    duration_ms: u64,
+    error: Option<String>,
+    pre_oid: Option<String>,
+    post_oid: Option<String>,
+}
+
+/// Build the row a repo's sync owes the audit trail.
+///
+/// Every terminal branch of `sync_repo_inner` calls this instead of writing,
+/// which is what lets the write itself happen on the coordinator — see the
+/// module docs on why no reference to a `Connection` can cross a thread.
+#[allow(clippy::too_many_arguments)]
+fn pending(
+    repo_id: &str,
+    action: &str,
+    status: &str,
+    duration_ms: u64,
+    error: Option<&str>,
+    pre_oid: &Option<String>,
+    post_oid: &Option<String>,
+) -> PendingResult {
+    PendingResult {
+        repo_id: repo_id.to_string(),
+        action: action.to_string(),
+        status: status.to_string(),
+        duration_ms,
+        error: error.map(str::to_string),
+        pre_oid: pre_oid.clone(),
+        post_oid: post_oid.clone(),
+    }
+}
+
 /// Write one row to `sync_results`.
+///
+/// **The only place the audit trail is written.** Not "the first of two" —
+/// the only one, on every path: the single-repo [`sync_repo`] and the fleet
+/// [`sync_all`] both come through here. Two writers is how an audit trail
+/// becomes two histories that disagree about the same run.
 ///
 /// The error is **returned, not discarded**. This used to be
 /// `let _ = conn.execute(...)`, and that one character was the whole bug:
@@ -1489,27 +1956,26 @@ pub fn run_exit_code(results: &[SyncResult]) -> i32 {
 ///
 /// Discarding an error from a write is only safe when the write is
 /// genuinely optional. This one is the audit trail.
-#[allow(clippy::too_many_arguments)]
-fn record_result(
-    conn: &Connection,
-    run_id: &str,
-    repo_id: &str,
-    action: &str,
-    status: &str,
-    duration_ms: u64,
-    error: Option<&str>,
-    pre_oid: &Option<String>,
-    post_oid: &Option<String>,
-) -> Result<()> {
+fn record_result(conn: &Connection, run_id: &str, row: PendingResult) -> Result<()> {
     conn.execute(
         "INSERT INTO sync_results (run_id, repo_id, action, status, duration_ms, error, pre_oid, post_oid)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![run_id, repo_id, action, status, duration_ms as i64, error, pre_oid, post_oid],
+        params![
+            run_id,
+            row.repo_id,
+            row.action,
+            row.status,
+            row.duration_ms as i64,
+            row.error,
+            row.pre_oid,
+            row.post_oid,
+        ],
     )
     .with_context(|| {
         format!(
-            "recording the {action}/{status} result for repo {repo_id} \
-             under run {run_id} — is the run row missing?"
+            "recording the {}/{} result for repo {} \
+             under run {run_id} — is the run row missing?",
+            row.action, row.status, row.repo_id
         )
     })?;
     Ok(())
@@ -2447,6 +2913,19 @@ mod unpushed_branch_tests {
         );
         assert_eq!(r.action, "skipped_unpushed");
         assert!(r.error.is_none(), "a skip carries no error: {r:?}");
+        // And the reason reaches a reader. It used to live only in the
+        // `sync_results` row, so the word `skipped_unpushed` was the whole
+        // answer a plain `ro sync` gave — and it reads as something went
+        // wrong, when the branch is simply new.
+        let reason = r
+            .reason
+            .as_deref()
+            .unwrap_or_else(|| panic!("no reason reached the reader: {r:?}"));
+        assert!(
+            reason.contains("never been pushed"),
+            "the reason must say the branch is new, not that something failed; \
+             got {reason:?}"
+        );
 
         // And it must not be counted as a failed sync in the table either.
         let failed: i64 = conn
@@ -3086,7 +3565,6 @@ mod dry_run_preview {
         );
     }
 
-    #[test]
     /// A repo the real run will refuse must not read as clean in the dry run.
     ///
     /// This is the "dry run says fine, real run refuses" case at its most
@@ -3291,6 +3769,14 @@ mod dry_run_preview {
         );
     }
 
+    /// A repo the real run cannot fetch must not read as a clean pull.
+    ///
+    /// This lost its `#[test]` in an edit and sat here complete and
+    /// unrun — a test that does not run is not a test, and the suite was
+    /// green over it. Restored rather than deleted: the body is the case
+    /// where the real run records an error and the dry run must not answer
+    /// `would_pull`, which is a promise about a remote that does not exist.
+    #[test]
     fn a_repo_the_real_run_cannot_fetch_is_not_reported_as_a_clean_pull() {
         let tmp = TempDir::new().unwrap();
         let conn = ro_state::open_memory().unwrap();
@@ -3488,6 +3974,7 @@ mod run_exit_code_tests {
             unmeasurable_reason: None,
             plan: None,
             plan_mismatch: None,
+            reason: None,
         }
     }
 
@@ -4068,12 +4555,12 @@ mod wedged_remote {
     /// below fails on a real number instead of hanging the suite forever.
     const BLACK_HOLE_SECS: u64 = 15;
 
-    struct BlackHoleServer {
+    pub(super) struct BlackHoleServer {
         port: u16,
     }
 
     impl BlackHoleServer {
-        fn start() -> Self {
+        pub(super) fn start() -> Self {
             let listener =
                 std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener is bindable");
             let port = listener
@@ -4097,7 +4584,7 @@ mod wedged_remote {
         /// A `git://` URL pointing at this listener. `git://` rather than
         /// `https://` because the fixture must not depend on a TLS stack, and
         /// because git's protocol handshake is exactly where it waits.
-        fn url(&self) -> String {
+        pub(super) fn url(&self) -> String {
             format!("git://127.0.0.1:{}/wedged.git", self.port)
         }
     }
@@ -4349,3 +4836,1159 @@ mod wedged_remote {
         );
     }
 }
+
+/// The fleet runs concurrently, and the audit trail stays in one piece.
+///
+/// `sync_all` was a plain `for` loop over the registry, which made the
+/// README's claim that `ro sync` is parallel false. These tests are what make
+/// it true — and, more importantly, what keep it true: a pool that returns
+/// results in completion order, or writes its own rows, or lets two repos
+/// share a worktree, is a pool that has to be unwound later.
+///
+/// # What is asserted, and what deliberately is not
+///
+/// **Not timing.** A test that asserts "it was faster" passes on a build that
+/// is merely less slow, and fails on a machine that is merely busy. What is
+/// asserted instead is *order of completion*: a shared counter the observer
+/// increments, read back after the run. Two repos that finished in the order
+/// they were started is a fact; "the wall clock went down" is a hope.
+///
+/// The one place a duration does appear is the wedged-remote test, and there
+/// it is a bound in the other direction — a remote that never answers must
+/// not be waited on — which is the assertion that cannot be satisfied by
+/// accident.
+///
+/// # Why the observer is in-process and not a `PATH` shim
+///
+/// The obvious instrument is a fake `git` on `PATH` that logs its own pid.
+/// It was tried, and it is the wrong tool here: `PATH` is process-global,
+/// the suite shares one process, and a shim installed for one test is
+/// visible to every fixture another test builds *while it is installed* —
+/// which is how a test that never touches `git` ends up failing on
+/// `cannot open /tmp/.tmpXXXX/git`. The testkit's `TestEnv` serialises the
+/// swap, but only for the duration of one call, and a fleet run is exactly
+/// the call that has to hold it.
+///
+/// So the observer is a thread-local counter the sync itself increments.
+/// It observes the real thing — how many git calls are in flight at once —
+/// without intercepting any of them.
+#[cfg(test)]
+mod parallel_fleet {
+    use super::*;
+    use super::tests::{commit_to_remote, init_bare_remote, run_git};
+    use super::{FleetObserver, sync_all_observed};
+    use tempfile::TempDir;
+
+
+    /// A fleet of `n` rows, each pointing at its own checkout of `remote`.
+    ///
+    /// Every repo is already cloned and in line, so a sync is a fetch and a
+    /// pull against a local bare remote — fast, and identical for all of them.
+    /// That is the point: the only thing that differs between them is *when*
+    /// they run.
+    ///
+    /// `git clone` and nothing hand-rolled. The sync decides "already up to
+    /// date" by comparing against `origin/<branch>`, and a fixture built with
+    /// `git init` + `git remote add` + `git fetch` does not have that ref —
+    /// so a hand-built fixture reports the repo as **unmeasurable**, the dry
+    /// run marks it failed, and every assertion about it is about the
+    /// fixture rather than about concurrency. A fixture that differs from a
+    /// real clone in a way the code reads proves nothing.
+    fn fleet(tmp: &TempDir, conn: &Connection, n: usize) -> Vec<String> {
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = format!("id-{i}");
+            let local = tmp.path().join("local").join(format!("repo{i}"));
+            std::fs::create_dir_all(&local).unwrap();
+            let clone = run_git(&local, &["clone", &remote.to_string_lossy(), "."]);
+            assert!(
+                clone.status.success(),
+                "fixture {i} must clone: {}",
+                String::from_utf8_lossy(&clone.stderr)
+            );
+            // The clone has to have landed on `main` for `origin/main` to be
+            // the ref the sync compares against. `init_bare_remote` makes the
+            // bare repo's branch `main`, and a clone follows the remote's HEAD
+            // — asserted rather than assumed, because a fixture that is
+            // quietly on `master` fails as "unmeasurable", which reads like
+            // a concurrency bug and is not one.
+            let branch = String::from_utf8_lossy(&run_git(&local, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+                .trim()
+                .to_string();
+            assert_eq!(
+                branch, "main",
+                "fixture {i} must be on main, like a real clone of this remote"
+            );
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    id,
+                    format!("repo{i}"),
+                    remote.to_string_lossy().to_string(),
+                    local.to_string_lossy().to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// A fleet of `n` rows that are **not cloned yet**, so each sync is a
+    /// clone. Used where the assertion is about the clone path specifically.
+    fn uncloned_fleet(tmp: &TempDir, conn: &Connection, n: usize) -> Vec<String> {
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = format!("id-{i}");
+            let local = tmp.path().join("local").join(format!("repo{i}"));
+            std::fs::create_dir_all(&local).unwrap();
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    id,
+                    format!("repo{i}"),
+                    remote.to_string_lossy().to_string(),
+                    local.to_string_lossy().to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// A fleet of `n` rows all naming **one** checkout.
+    ///
+    /// Legal — uniqueness is on `(host, owner, name)`, not on `local_path` —
+    /// and harmless while the run was a loop. Under a pool it is two `git
+    /// pull`s in one worktree, which is the failure mode the shared lock
+    /// exists to prevent.
+    fn shared_path_fleet(tmp: &TempDir, conn: &Connection, n: usize) -> Vec<String> {
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let shared = tmp.path().join("local").join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let clone = run_git(&shared, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(
+            clone.status.success(),
+            "the shared fixture must clone: {}",
+            String::from_utf8_lossy(&clone.stderr)
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = format!("id-{i}");
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    id,
+                    format!("shared{i}"),
+                    remote.to_string_lossy().to_string(),
+                    shared.to_string_lossy().to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// The repos a run actually touched, in the order the registry listed
+    /// them — which is the order `manage::list` returns, `ORDER BY owner,
+    /// name`.
+    fn registry_order(conn: &Connection) -> Vec<String> {
+        crate::manage::list(conn, None)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect()
+    }
+
+    /// Run a fleet with the concurrency observed, and hand the observer back
+    /// so the caller can read the counters.
+    ///
+    /// Returning them together is what keeps the observer's lifetime honest:
+    /// it cannot outlive the run it measured, and a test cannot read a
+    /// counter that belonged to some other test's fleet.
+    fn observed(
+        conn: &Connection,
+        parallel: usize,
+    ) -> (Vec<SyncResult>, FleetObserver) {
+        let observer = FleetObserver::watching();
+        let results = sync_all_observed(conn, &SyncOptions::default(), &[], parallel, &observer)
+            .expect("the fleet syncs");
+        (results, observer)
+    }
+
+    /// A fleet of repos syncs **concurrently**, not one at a time.
+    ///
+    /// Asserted on the shared counter's peak, not on the wall clock. A
+    /// sequential loop can only ever have one repo in flight, so a peak of 2
+    /// or more is a statement about concurrency that no amount of "the
+    /// machine was slow" can produce — which is the failure mode a timing
+    /// assertion has.
+    ///
+    /// The control is the test beside it: the same fleet at a bound of one
+    /// peaks at exactly 1. Between them the counter is shown to be capable
+    /// of reporting a serial run, so the parallel number means something.
+    #[test]
+    fn a_fleet_of_repos_syncs_concurrently() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = fleet(&tmp, &conn, 4);
+
+        let (results, observer) = observed(&conn, 4);
+        assert_eq!(results.len(), ids.len(), "every repo has a row");
+        for r in &results {
+            assert_eq!(
+                r.status, "success",
+                "a clean checkout against a local remote syncs: {r:?}"
+            );
+        }
+
+        assert_eq!(
+            observer.total(),
+            ids.len(),
+            "each repo was synced exactly once"
+        );
+        assert!(
+            observer.peak() >= 2,
+            "the fleet ran {} repos with a peak of {} in flight. A sequential \
+             loop cannot exceed 1, so this is the assertion that the pool \
+             exists — and it is a count, not a duration, so a slow machine \
+             cannot fake it either way.",
+            ids.len(),
+            observer.peak()
+        );
+    }
+
+    /// A loopback HTTP server that answers **401 to everything** and records
+    /// the `Authorization` header each request carried.
+    ///
+    /// The 401 is the point: an unauthenticated fetch **fails**, so "the
+    /// credential reached the remote" and "the fetch was answered" are the
+    /// same observation rather than two that can disagree.
+    struct DemandingRemote {
+        /// Kept alive: dropping the `TempDir` deletes the bare repo the
+        /// server is serving while a fetch may still be in flight.
+        _tmp: tempfile::TempDir,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DemandingRemote {
+        fn start() -> (Self, String) {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let tmp = tempfile::TempDir::new().unwrap();
+            let bare = tmp.path().join("remote.git");
+            std::fs::create_dir_all(&bare).unwrap();
+            run_git(&bare, &["init", "--bare", "-q", "--initial-branch=main"]);
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port is bindable");
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen_thread = seen.clone();
+            let stop_thread = stop.clone();
+            let _worker = std::thread::spawn(move || {
+                while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                            let mut chunk = [0u8; 8192];
+                            let Ok(n) = stream.read(&mut chunk) else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(&chunk[..n]).into_owned();
+                            let header = head
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                                .and_then(|l| l.split_once(':'))
+                                .map(|(_, v)| v.trim().to_string());
+                            seen_thread.lock().unwrap().push(header);
+                            let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+                            let _ = stream.flush();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            (
+                Self {
+                    _tmp: tmp,
+                    seen,
+                    stop,
+                },
+                format!("http://127.0.0.1:{port}"),
+            )
+        }
+
+        /// Every request the server answered, with the header it carried.
+        ///
+        /// Sets the stop flag first so the accept loop exits rather than
+        /// outliving the test and holding the port.
+        fn headers(&self) -> Vec<Option<String>> {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    /// `ro sync` fetches with the row's credential.
+    ///
+    /// The flag was validated, stored on the row, echoed by `ro list`, and
+    /// used by exactly one verb: `ro ship`. `sync_repo_inner` built
+    /// `FetchOpts::default()` — `host: None` — and handed `opts.run_opts()` to
+    /// `fetch_in`, which carries a **deadline** and no credential. So every
+    /// fetch a sync made went out anonymously, and a private repo enrolled
+    /// with `--credential` synced with `fatal: could not read Username` while
+    /// `ro ship` over the same row succeeded.
+    ///
+    /// Observed against a server that answers 401 to everything, so the
+    /// assertion is not "a header was configured" but "the header reached the
+    /// wire".
+    #[test]
+    fn sync_fetches_with_the_rows_credential() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        run_git(&work, &["init", "-q", "--initial-branch=main"]);
+        run_git(&work, &["config", "user.email", "t@e.com"]);
+        run_git(&work, &["config", "user.name", "T"]);
+        std::fs::write(work.join("a.txt"), "base\n").unwrap();
+        run_git(&work, &["add", "-A"]);
+        run_git(&work, &["commit", "-q", "-m", "base"]);
+
+        let (remote, url) = DemandingRemote::start();
+        run_git(&work, &["remote", "add", "origin", &format!("{url}/acme/api.git")]);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, credential_ref, added_at, updated_at)
+             VALUES ('r1', 'example.invalid', 'acme', 'api', ?1, ?2, 'env:RO_SYNC_CRED_TEST', ?3, ?3)",
+            params![
+                format!("{url}/acme/api.git"),
+                work.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("RO_SYNC_CRED_TEST", "ghp_sync_marker");
+        }
+        let results = sync_all_bounded(&conn, &SyncOptions::default(), &[], 1).unwrap();
+        unsafe {
+            std::env::remove_var("RO_SYNC_CRED_TEST");
+        }
+
+        let headers = remote.headers();
+        assert!(
+            !headers.is_empty(),
+            "the remote must have been asked for something, got nothing"
+        );
+        for header in &headers {
+            let header = header.as_deref().expect(
+                "a row with a credential must authenticate its sync fetch; the \
+                 request went out anonymously",
+            );
+            assert!(
+                // Base64 of `x-access-token:ghp_sync_marker`.
+                header.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX3N5bmNfbWFya2Vy"),
+                "the row's own credential must be on the wire, got: {header}"
+            );
+        }
+        // And the honest failure: the server refuses, so the row says so.
+        assert_eq!(
+            results[0].status, "error",
+            "a remote that answered 401 is an error row: {results:?}"
+        );
+    }
+
+    /// The pool is as wide as the number it records.
+    ///
+    /// The chunking this replaces computed `workers = min(parallel, n)` and
+    /// then spawned one thread per `repos.chunks(div_ceil(n, workers))` — so
+    /// the width was `ceil(n / ceil(n/p))`, not `min(p, n)`. For 12 repos at
+    /// `p = 8` that is **6**, while the `runs` row recorded `parallel=8`: a
+    /// number the user never chose, written into the audit trail, for a pool
+    /// half the width they asked for.
+    ///
+    /// `p = 3` over 7 repos is the smallest case where the two disagree: the
+    /// old shape gave `ceil(7 / ceil(7/3)) = ceil(7/3) = 3`… which happens
+    /// to match. `p = 4` over 9 is the first that differs: `ceil(9/3) = 3`
+    /// threads against a recorded `parallel=4`.
+    #[test]
+    fn the_pool_is_as_wide_as_the_number_it_records() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = fleet(&tmp, &conn, 9);
+
+        let (_results, observer) = observed(&conn, 4);
+        assert!(
+            observer.peak() >= 4,
+            "four workers were asked for over 9 repos and the peak was {}. \
+             Static chunking makes the width ceil(n / ceil(n/p)), which is \
+             not min(p, n) — the runs row then overstates the pool.",
+            observer.peak()
+        );
+        assert_eq!(observer.total(), ids.len(), "every repo still ran once");
+    }
+
+    /// A bound of one never has two repos in flight.
+    ///
+    /// The control for [`a_fleet_of_repos_syncs_concurrently`], and the
+    /// `core.parallel = 1` case in the same breath: the setting that says "one
+    /// at a time" has to mean it, or the setting is a suggestion.
+    #[test]
+    fn a_bound_of_one_never_has_two_repos_in_flight() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = fleet(&tmp, &conn, 4);
+
+        let (results, observer) = observed(&conn, 1);
+        assert_eq!(results.len(), ids.len(), "the whole fleet ran");
+        for r in &results {
+            assert_eq!(r.status, "success", "every repo synced: {r:?}");
+        }
+
+        assert_eq!(
+            observer.total(),
+            ids.len(),
+            "every repo still ran"
+        );
+        assert_eq!(
+            observer.peak(),
+            1,
+            "core.parallel = 1 means one repo at a time. This is also the \
+             control that shows the counter can report a serial run at all — \
+             without it, a peak of 2 elsewhere would only prove the counter \
+             counts."
+        );
+    }
+
+    /// A bound below the fleet size is honoured.
+    ///
+    /// Six repos at a bound of two: the peak must not exceed two, and every
+    /// repo must still run. A pool that ignores its bound is a pool that
+    /// opens every checkout at once, which is what the bound exists to stop.
+    #[test]
+    fn a_bound_below_the_fleet_size_is_honoured() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = fleet(&tmp, &conn, 6);
+
+        let (results, observer) = observed(&conn, 2);
+        assert_eq!(results.len(), ids.len(), "every repo ran");
+        for r in &results {
+            assert_eq!(r.status, "success", "every repo synced: {r:?}");
+        }
+
+        assert_eq!(observer.total(), ids.len(), "six syncs ran");
+        assert!(
+            observer.peak() <= 2,
+            "six repos at a bound of two reached a peak of {} in flight. The \
+             bound is not a suggestion: each worker holds a checkout open, and \
+             a fleet run that opens all of them at once starves itself.",
+            observer.peak()
+        );
+    }
+
+    /// Every repo in the fleet is synced exactly once.
+    ///
+    /// The count the brief asked for, read off the shared counter. This is
+    /// what catches a pool that drops a repo (too few) or runs one twice (too
+    /// many) — neither of which the result rows can see, because a dropped
+    /// repo still has a row if the pool wrote one for it.
+    #[test]
+    fn every_repo_in_the_fleet_is_synced_exactly_once() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let n = 5;
+        let ids = fleet(&tmp, &conn, n);
+
+        let (results, observer) = observed(&conn, 4);
+        assert_eq!(results.len(), ids.len(), "every repo has a row");
+
+        assert_eq!(
+            observer.total(),
+            n,
+            "each repo's sync ran exactly once — the pool dropped or \
+             duplicated one"
+        );
+        let mut seen = results.iter().map(|r| r.repo_id.clone()).collect::<Vec<_>>();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            n,
+            "one row per repo, no repo represented twice: {seen:?}"
+        );
+    }
+
+    /// Results come back in **registry order**, not completion order.
+    ///
+    /// The property that makes a parallel run diffable against a serial one.
+    /// A summary that reorders itself between two runs over the same fleet is
+    /// worse than a slow one: "what changed" stops being answerable.
+    #[test]
+    fn results_come_back_in_registry_order_not_completion_order() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = fleet(&tmp, &conn, 6);
+        let expected = registry_order(&conn);
+        assert_eq!(
+            expected, ids,
+            "the fixture is listed in the order it was inserted"
+        );
+
+        // A bound of 1 is the old sequential path, and it is the control: the
+        // order must be registry order there too, or the assertion below is
+        // not measuring what it claims to.
+        let serial = sync_all_bounded(&conn, &SyncOptions::default(), &[], 1).unwrap();
+        assert_eq!(
+            serial.iter().map(|r| r.repo_id.clone()).collect::<Vec<_>>(),
+            expected,
+            "a serial run is in registry order"
+        );
+
+        let parallel = sync_all_bounded(&conn, &SyncOptions::default(), &[], 4).unwrap();
+        assert_eq!(
+            parallel.iter().map(|r| r.repo_id.clone()).collect::<Vec<_>>(),
+            expected,
+            "a parallel run must be in registry order too — completion order \
+             would make the summary unreadable run to run"
+        );
+    }
+
+    /// The `runs` row is written exactly once, with the right exit code.
+    ///
+    /// `open_run` / `finalize_run` bracket the whole fleet. A pool that
+    /// opened a run per worker would leave N-1 of them unfinalised — "still
+    /// going" forever — and `ro status` reads `last_synced_at` off the
+    /// finished one.
+    #[test]
+    fn the_run_row_is_written_exactly_once_with_the_right_exit_code() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        fleet(&tmp, &conn, 5);
+
+        let results = sync_all_bounded(&conn, &SyncOptions::default(), &[], 4).unwrap();
+        assert_eq!(results.len(), 5, "the fleet ran");
+
+        let runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM runs WHERE command = 'sync'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            runs, 1,
+            "a fleet of five repos is one sync run, not five"
+        );
+
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE command = 'sync' AND ended_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(open, 0, "the run is finalised, not left 'still going'");
+
+        let (exit_code, rows): (i64, i64) = conn
+            .query_row(
+                "SELECT exit_code, (SELECT COUNT(*) FROM sync_results sr \
+                 WHERE sr.run_id = runs.id) \
+                 FROM runs WHERE command = 'sync' ORDER BY started_at DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            exit_code,
+            run_exit_code(&results) as i64,
+            "the run row's exit code is the verdict the CLI would print"
+        );
+        assert_eq!(
+            rows,
+            5,
+            "every repo in the fleet has a row under the one run"
+        );
+    }
+
+    /// Two repos sharing a path do not corrupt each other.
+    ///
+    /// `repos.local_path` is not unique, so a registry can hold two rows for
+    /// one checkout. That was serialised by the loop; under a pool it is two
+    /// `git pull`s racing on one `.git/index.lock`. The shared lock is what
+    /// restores the ordering.
+    #[test]
+    fn two_repos_sharing_a_path_do_not_corrupt_each_other() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = shared_path_fleet(&tmp, &conn, 3);
+
+        let results = sync_all_bounded(&conn, &SyncOptions::default(), &[], 3).unwrap();
+        assert_eq!(results.len(), 3, "all three rows ran");
+        for (id, r) in ids.iter().zip(&results) {
+            assert_eq!(
+                r.status, "success",
+                "repo {id} synced against the shared checkout: {r:?}"
+            );
+        }
+
+        // The checkout is still a repo, and still in line with the remote.
+        // A lost update here would show as a fetch that never happened, or a
+        // worktree left dirty by a pull that was interrupted.
+        let shared = tmp.path().join("local").join("shared");
+        let status = run_git(&shared, &["status", "--porcelain"]);
+        assert!(
+            status.stdout.is_empty(),
+            "the shared worktree is clean after all three rows synced: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+        let head = run_git(&shared, &["rev-parse", "HEAD"]);
+        let remote_head = run_git(&shared, &["rev-parse", "origin/main"]);
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            String::from_utf8_lossy(&remote_head.stdout).trim(),
+            "the shared checkout is in line with its remote"
+        );
+
+        // And the audit trail has one row per repo, not one per path — the
+        // lock serialises the work, it does not collapse the rows.
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3, "each of the three rows recorded its own result");
+    }
+
+    /// The audit row keeps the reason a repo was skipped, which the returned
+    /// result deliberately does not carry.
+    ///
+    /// `skipped_dirty` and `skipped_unpushed` put their explanation in the
+    /// row's `error` column and leave `SyncResult::error` empty — neither is
+    /// an error, and a caller reading `error` should not find one. Those are
+    /// the only two rows that are not derivable from the result they return.
+    ///
+    /// This test exists because the pool broke that and **nothing noticed**:
+    /// the coordinator was re-deriving every row from its result, which wrote
+    /// a `NULL` where the reason used to be — on exactly the two rows where
+    /// the reason is the whole point. A green suite, a quieter audit trail,
+    /// and no failure anywhere. The assertion is on the column, not on the
+    /// status, because the status was always right.
+    #[test]
+    fn a_skipped_row_keeps_its_reason_in_the_audit_trail() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let clone = run_git(&work, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(clone.status.success(), "the fixture clones");
+
+        // Uncommitted work, so the sync skips rather than clobbering it.
+        std::fs::write(work.join("dirty.txt"), "unsaved work\n").unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('r1', 'github.com', 'fleet', 'dirty', ?1, ?2, ?3, ?3)",
+            params![
+                remote.to_string_lossy().to_string(),
+                work.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .unwrap();
+
+        let results = sync_all_bounded(&conn, &SyncOptions::default(), &[], 1).unwrap();
+        assert_eq!(results[0].action, "skipped_dirty", "the repo is skipped");
+
+        // The reason reaches a **reader**, not only the database.
+        //
+        // The row has always carried it; the returned result did not, and
+        // every renderer — text, json, ndjson — reads the result. So a plain
+        // `ro sync` printed the word `skipped_dirty` and nothing else, while
+        // a query over `sync_results` showed "(use --autostash)". The action
+        // the user is told to take existed and was shown to nobody.
+        let reason = results[0]
+            .reason
+            .as_deref()
+            .unwrap_or_else(|| panic!("no reason reached the reader: {:?}", results[0]));
+        assert!(
+            reason.contains("--autostash"),
+            "the reason must name the flag that changes the outcome; got {reason:?}"
+        );
+        assert!(
+            results[0].error.is_none(),
+            "a skip is not an error; `error` must stay empty: {:?}",
+            results[0]
+        );
+
+        // The row is where the reason has always survived too. A reader of
+        // `ro status` or a query over `sync_results` sees this string and
+        // knows what to do about it.
+        let recorded: Option<String> = conn
+            .query_row(
+                "SELECT error FROM sync_results WHERE repo_id = 'r1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the row was written");
+        let recorded = recorded.unwrap_or_default();
+        assert!(
+            recorded.contains("uncommitted change") && recorded.contains("--autostash"),
+            "the audit row must keep the reason a repo was skipped — it is the \
+             only place that reason survives, and the result deliberately does \
+             not carry it. Got: {recorded:?}"
+        );
+    }
+
+    /// Two rows naming one checkout are **serialised**, not merely both
+    /// allowed to run.
+    ///
+    /// The test above asserts the outcome is right; this one asserts the
+    /// ordering, which is the thing the lock actually buys. Two `git pull`s in
+    /// one worktree usually *both succeed* — git's own index lock serialises
+    /// them at the last moment — so an outcome-only test passes on a build
+    /// with no lock at all. That is why this asserts on the observer: the
+    /// peak for a shared path must be 1, because the second row cannot start
+    /// until the first has released the lock.
+    #[test]
+    fn two_rows_sharing_a_path_are_serialised_not_merely_both_allowed() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = shared_path_fleet(&tmp, &conn, 2);
+
+        let (results, observer) = observed(&conn, 2);
+        assert_eq!(results.len(), ids.len(), "both rows ran");
+        for r in &results {
+            assert_eq!(r.status, "success", "both rows synced: {r:?}");
+        }
+
+        assert_eq!(
+            observer.total(),
+            ids.len(),
+            "both rows were synced"
+        );
+        assert_eq!(
+            observer.peak(),
+            1,
+            "two rows naming one checkout reached a peak of {} in flight. The \
+             shared lock is what makes them serial: without it, both start at \
+             once and the second waits on git's own index lock instead of on \
+             ro's, which is a race that usually wins and occasionally does not.",
+            observer.peak()
+        );
+    }
+
+    /// A fleet of repos that are not cloned yet clones them all.
+    ///
+    /// The clone path is the one where a pool pays most — a clone is the
+    /// sync's most expensive git call — and the one where a bug in the pool
+    /// would be most visible, because a half-written checkout poisons every
+    /// later run.
+    #[test]
+    fn a_fleet_of_missing_repos_is_cloned_concurrently() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = uncloned_fleet(&tmp, &conn, 4);
+
+        let results = sync_all_bounded(&conn, &SyncOptions::default(), &[], 4).unwrap();
+        assert_eq!(results.len(), 4, "every repo has a row");
+        for (id, r) in ids.iter().zip(&results) {
+            assert_eq!(r.action, "clone", "repo {id} was cloned: {r:?}");
+            assert_eq!(r.status, "success", "repo {id} cloned cleanly: {r:?}");
+            assert!(
+                r.post_oid.is_some(),
+                "a clone records the oid it landed: {r:?}"
+            );
+        }
+
+        // Each destination is a real checkout, not a directory with a
+        // partial `.git` — the state a clone killed mid-flight leaves behind,
+        // which every later "is this repo cloned?" check accepts as cloned.
+        for i in 0..4 {
+            let local = tmp.path().join("local").join(format!("repo{i}"));
+            let head = run_git(&local, &["rev-parse", "HEAD"]);
+            assert!(
+                head.status.success(),
+                "repo{i} is a real checkout after the clone: {}",
+                String::from_utf8_lossy(&head.stderr)
+            );
+        }
+    }
+
+    /// A dry run over a fleet records a row per repo and changes nothing.
+    ///
+    /// The dry run goes down the same path as the real one — same pool, same
+    /// order, same audit trail — because a preview that took a different path
+    /// than the run it previews would be a preview of something else.
+    #[test]
+    fn a_dry_run_over_a_fleet_records_every_repo_and_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = fleet(&tmp, &conn, 4);
+
+        let opts = SyncOptions {
+            dry_run: true,
+            ..Default::default()
+        };
+        let results = sync_all_bounded(&conn, &opts, &[], 4).unwrap();
+        assert_eq!(results.len(), ids.len(), "every repo has a row");
+        for r in &results {
+            assert_eq!(
+                r.status, STATUS_DRY_RUN,
+                "a dry run's row says dry_run: {r:?}"
+            );
+        }
+
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_results", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            rows,
+            ids.len() as i64,
+            "a dry run is recorded like any other run, so a script can read it"
+        );
+
+        // And it changed nothing: the checkout is exactly as it was.
+        let local = tmp.path().join("local").join("repo0");
+        let status = run_git(&local, &["status", "--porcelain"]);
+        assert!(
+            status.stdout.is_empty(),
+            "a dry run leaves the worktree alone: {}",
+            String::from_utf8_lossy(&status.stdout)
+        );
+    }
+
+    /// The bound is honoured: a fleet larger than the bound does not run all
+    /// of them at once.
+    ///
+    /// The bound exists because each worker holds a checkout open, and a fleet
+    /// run that opens all twenty at once starves itself. Asserted on the
+    /// number of git calls in flight rather than on the wall clock.
+    #[test]
+    fn the_bound_is_honoured_a_fleet_larger_than_the_bound_does_not_run_at_once() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let ids = fleet(&tmp, &conn, 6);
+
+        let (results, observer) = observed(&conn, 2);
+        assert_eq!(results.len(), ids.len(), "the whole fleet ran");
+        for r in &results {
+            assert_eq!(r.status, "success", "every repo synced: {r:?}");
+        }
+
+        assert_eq!(
+            observer.total(),
+            6,
+            "every repo in the fleet was synced"
+        );
+        assert!(
+            observer.peak() <= 2,
+            "six repos at a bound of two reached a peak of {} in flight. The \
+             bound is not a suggestion: each worker holds a checkout open, and \
+             a fleet run that opens all of them at once starves itself.",
+            observer.peak()
+        );
+    }
+
+    /// A repo that fails does not take the fleet down with it.
+    ///
+    /// The pool collects a row per repo rather than aborting on the first
+    /// error, which is what `--timeout` already depended on for the wedged
+    /// remote and what a fleet of twenty needs for every other kind of
+    /// failure.
+    #[test]
+    fn a_failing_repo_does_not_take_the_fleet_down() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // One repo whose origin is a URL that does not resolve to anything.
+        // It fails at the fetch, locally, with no network involved.
+        let broken = tmp.path().join("local").join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        let clone = run_git(&broken, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(clone.status.success(), "the fixture clones");
+        run_git(
+            &broken,
+            &["remote", "set-url", "origin", "https://127.0.0.1:1/nope.git"],
+        );
+
+        // And three healthy ones around it.
+        for (id, name, path) in [
+            ("id-broken", "aaa-broken", &broken),
+            ("id-ok1", "bbb-ok1", &tmp.path().join("local").join("ok1")),
+            ("id-ok2", "ccc-ok2", &tmp.path().join("local").join("ok2")),
+            ("id-ok3", "ddd-ok3", &tmp.path().join("local").join("ok3")),
+        ] {
+            if !path.join(".git").exists() {
+                std::fs::create_dir_all(path).unwrap();
+                let c = run_git(path, &["clone", &remote.to_string_lossy(), "."]);
+                assert!(c.status.success(), "{name} clones");
+            }
+            conn.execute(
+                "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+                 VALUES (?1, 'github.com', 'fleet', ?2, ?3, ?4, ?5, ?5)",
+                params![
+                    id,
+                    name,
+                    remote.to_string_lossy().to_string(),
+                    path.to_string_lossy().to_string(),
+                    now,
+                ],
+            )
+            .unwrap();
+        }
+
+        let results = sync_all_bounded(&conn, &SyncOptions::default(), &[], 4).unwrap();
+        assert_eq!(results.len(), 4, "the whole fleet has a row");
+
+        let broken_row = results
+            .iter()
+            .find(|r| r.repo_id == "id-broken")
+            .expect("the broken repo has a row");
+        assert_eq!(
+            broken_row.status, "error",
+            "a repo that cannot reach its origin is an error: {broken_row:?}"
+        );
+
+        // The three around it still ran. This is the assertion: a pool that
+        // aborted on the first error would have stopped at the broken repo,
+        // and the other three would have no rows at all.
+        for id in ["id-ok1", "id-ok2", "id-ok3"] {
+            let row = results
+                .iter()
+                .find(|r| r.repo_id == id)
+                .unwrap_or_else(|| panic!("{id} has a row"));
+            assert_eq!(
+                row.status, "success",
+                "{id} synced despite the broken repo: {row:?}"
+            );
+        }
+
+        // And the run's exit code says the fleet is not clean, which is the
+        // verdict a script reads.
+        assert_eq!(
+            run_exit_code(&results),
+            1,
+            "a fleet with a failing repo does not exit 0"
+        );
+    }
+
+    /// The predict-then-verify comparison runs on the fleet path too.
+    ///
+    /// The fleet used to call `sync_repo_inner` directly, skipping the
+    /// comparison `sync_repo` makes — so the invariant was checked on the
+    /// one-repo path and silently skipped on the twenty-repo path. This is
+    /// the test that caught that, and it stays because the two paths are one
+    /// function again and this is what proves it.
+    #[test]
+    fn the_fleet_compares_its_prediction_with_its_outcome() {
+        let tmp = TempDir::new().unwrap();
+        let conn = ro_state::open_memory().unwrap();
+        let black_hole = super::wedged_remote::BlackHoleServer::start();
+
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "base");
+
+        let wedged = tmp.path().join("local").join("wedged");
+        std::fs::create_dir_all(&wedged).unwrap();
+        let clone = run_git(&wedged, &["clone", &remote.to_string_lossy(), "."]);
+        assert!(clone.status.success(), "the fixture clones");
+        run_git(
+            &wedged,
+            &["remote", "set-url", "origin", &black_hole.url()],
+        );
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES ('id-wedged', 'github.com', 'fleet', 'wedged', ?1, ?2, ?3, ?3)",
+            params![
+                remote.to_string_lossy().to_string(),
+                wedged.to_string_lossy().to_string(),
+                now,
+            ],
+        )
+        .unwrap();
+
+        let results = sync_all_bounded(
+            &conn,
+            &SyncOptions {
+                timeout_secs: 3,
+                ..Default::default()
+            },
+            &[],
+            2,
+        )
+        .unwrap();
+        let row = results
+            .iter()
+            .find(|r| r.repo_id == "id-wedged")
+            .expect("the wedged repo has a row");
+
+        assert!(
+            row.plan_mismatch.is_some(),
+            "the fleet must compare its prediction with its outcome, exactly as \
+             the single-repo path does. Got {row:?}"
+        );
+    }
+}
+
+
+
+/// How many repo syncs are in flight right now, the most there have
+/// been, and how many ran in all.
+///
+/// This is the shared counter the brief asked for, and it is shared
+/// rather than per-thread because "in flight at the same time" is a fact
+/// about every thread at once: a per-thread counter reports 1 for a
+/// perfectly parallel pool, which is the wrong answer rather than a
+/// conservative one.
+///
+/// A **parameter**, not a `static`. The tests that read it run
+/// concurrently in one process, so a global would have each test's
+/// numbers overwritten by whichever sibling was running — a test that
+/// fails for a reason having nothing to do with the code.
+/// [`FleetObserver::none`] is what production passes, and it costs one
+/// `Option` test per repo.
+#[derive(Debug, Default)]
+struct FleetObserver {
+    counts: Option<std::sync::Arc<FleetCounts>>,
+}
+
+#[derive(Debug, Default)]
+struct FleetCounts {
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    total: std::sync::atomic::AtomicUsize,
+}
+
+impl FleetObserver {
+    /// A run nobody is watching.
+    fn none() -> Self {
+        Self { counts: None }
+    }
+
+    /// A run being watched. What the parallel-fleet tests install.
+    #[cfg(test)]
+    fn watching() -> Self {
+        Self {
+            counts: Some(std::sync::Arc::new(FleetCounts::default())),
+        }
+    }
+
+    /// Record one repo's sync starting, and return a guard that records
+    /// it ending.
+    fn enter(&self) -> FleetRun<'_> {
+        match &self.counts {
+            Some(counts) => {
+                let now =
+                    counts.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                counts.total.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                counts.peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                FleetRun {
+                    counts: Some(counts.clone()),
+                    _owner: std::marker::PhantomData,
+                }
+            }
+            None => FleetRun {
+                counts: None,
+                _owner: std::marker::PhantomData,
+            },
+        }
+    }
+
+    /// The most syncs ever in flight at the same instant. `0` when
+    /// nobody is watching.
+    #[cfg(test)]
+    fn peak(&self) -> usize {
+        self.counts
+            .as_ref()
+            .map(|c| c.peak.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+
+    /// How many syncs ran, however many at a time.
+    #[cfg(test)]
+    fn total(&self) -> usize {
+        self.counts
+            .as_ref()
+            .map(|c| c.total.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or(0)
+    }
+}
+
+/// One repo's sync, in flight. Counts itself down on drop.
+///
+/// A guard rather than an explicit call at the end, because `sync_one`
+/// has a dozen early returns and the one that forgets would leave the
+/// counter permanently raised — turning every later measurement into a
+/// fiction.
+struct FleetRun<'a> {
+    counts: Option<std::sync::Arc<FleetCounts>>,
+    _owner: std::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for FleetRun<'_> {
+    fn drop(&mut self) {
+        if let Some(counts) = &self.counts {
+            counts
+                .in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+

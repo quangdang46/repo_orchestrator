@@ -16,6 +16,69 @@ use ro_config::paths::ConfigPaths;
 use ro_core::CredentialRef;
 use ro_core::repo_spec::RepoSpec;
 
+/// The **scheme and host** a clone's credential is scoped to, from its URL.
+///
+/// The rule [`crate::sync`] and `ro ship` also apply, kept here because
+/// `ro add` is the one place a URL is read *before* any repository exists to
+/// read it from. A local path and an SSH remote answer `None`, which is the
+/// correct answer for both: the header is an HTTP mechanism and SSH
+/// authenticates with keys.
+///
+/// Case-insensitive on the scheme and lower-cased on the way out, so `HTTP://`
+/// scopes the same origin `http://` does rather than silently dropping the
+/// credential.
+pub fn extraheader_host(clone_url: &str) -> Option<String> {
+    let (scheme, rest) = clone_url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
+/// The environment a resolved credential is carried in, for one clone URL.
+///
+/// A named type rather than a tuple, because the tuple is two things a caller
+/// has to remember the order of, and one of them is a secret.
+///
+/// `None` reference is **not** an error: a repo whose SSH key is already
+/// correct, or whose remote is public, needs no configuration at all.
+#[derive(Debug, Default)]
+pub struct CredentialEnv {
+    /// The `GIT_CONFIG_*` pair for this invocation only.
+    pub env: Vec<(String, String)>,
+    /// The resolved secret, for a caller that needs it again.
+    pub secret: Option<ro_core::SecretString>,
+}
+
+pub fn credential_env(clone_url: &str, reference: Option<&str>) -> Result<CredentialEnv> {
+    let Some(reference) = reference else {
+        return Ok(CredentialEnv::default());
+    };
+    // Parsed before it is resolved, so a malformed reference is a clear error
+    // rather than a fall-back to the machine's own credential — which would
+    // be a request as the wrong person, silently.
+    let parsed: CredentialRef = reference
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid credential reference: {e}"))?;
+    let secret = ro_core::credential_resolve::resolve(&parsed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let env = match extraheader_host(clone_url) {
+        Some(host) => ro_git::mutation::extraheader_env(&host, &secret),
+        // A local path and an SSH remote have no HTTP origin to scope this
+        // to. The answer is no header at all rather than one aimed at a host
+        // nobody named.
+        None => Vec::new(),
+    };
+    Ok(CredentialEnv {
+        env,
+        secret: Some(secret),
+    })
+}
+
 /// A tracked repo as returned by list queries.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrackedRepo {
@@ -117,8 +180,11 @@ pub fn add(
     projects_dir: &Path,
     layout: &str,
 ) -> Result<TrackedRepo> {
-    let mut spec =
-        RepoSpec::parse(spec_str).map_err(|e| anyhow::anyhow!("invalid repo spec: {e}"))?;
+    // The error is passed through whole. `CoreError::InvalidRepoSpec` already
+    // says "invalid repo spec", so wrapping it again produced
+    // `invalid repo spec: invalid repo spec: invalid repo spec (consecutive
+    // slashes): …` — the phrase three times, and the actual reason last.
+    let mut spec = RepoSpec::parse(spec_str).map_err(|e| anyhow::anyhow!("{e}"))?;
     spec.owner = spec.owner.to_ascii_lowercase();
     spec.name = spec.name.to_ascii_lowercase();
 
@@ -208,6 +274,16 @@ pub enum AddSource {
 }
 
 /// Prefixes that mean "this is a remote spec, do not touch the filesystem".
+///
+/// Every form this list names is one [`RepoSpec::parse`] accepts, because
+/// this list is also what the "not a remote spec" message prints.
+///
+/// `http://` and `ssh://` were here with **no parser branch behind them** —
+/// both fell through to the bare `owner/repo` path, where the
+/// consecutive-slash guard fired and the user was told
+/// `invalid repo spec (consecutive slashes): http://github.com/o/6.git`. So
+/// the tool advertised two URL schemes and refused both. The parser now has
+/// branches for them and carries the written scheme into `clone_url`.
 const REMOTE_PREFIXES: &[&str] = &[
     "github.com/",
     "https://",
@@ -231,7 +307,7 @@ pub fn classify_add_input(input: &str) -> Result<AddSource> {
         .iter()
         .any(|p| value.to_ascii_lowercase().starts_with(p))
     {
-        let spec = RepoSpec::parse(value).map_err(|e| anyhow::anyhow!("invalid repo spec: {e}"))?;
+        let spec = RepoSpec::parse(value).map_err(|e| anyhow::anyhow!("{e}"))?;
         return Ok(AddSource::Remote(spec));
     }
 
@@ -367,8 +443,38 @@ pub fn add_from_input(
                 branch: opts.branch.clone(),
                 ..Default::default()
             };
-            let outcome = ro_git::mutation::clone(&spec.clone_url, &dest, &clone_opts)
-                .map_err(|e| anyhow::anyhow!("cloning {} failed: {e}", spec.clone_url))?;
+            // The credential travels with the clone.
+            //
+            // `--credential` was validated and then written on the row, and
+            // the clone it was given for went out anonymously: `clone()` ran
+            // with `RunOpts::none()`, `CloneOpts` had nowhere to put a host,
+            // and the reference had no reader until the first sync. A private
+            // repository therefore could not be enrolled by URL at all — the
+            // clone failed at `fatal: could not read Username` and no row was
+            // registered, so the one case the flag exists for was the one case
+            // it could not serve.
+            //
+            // Resolved **before** the clone and not after, so a bad reference
+            // is reported without a network round trip and without a row that
+            // holds a secret nobody can use.
+            let credential = match &opts.credential_ref {
+                None => None,
+                Some(reference) => {
+                    let parsed: CredentialRef = reference.parse()?;
+                    Some(
+                        ro_core::credential_resolve::resolve(&parsed)
+                            .map_err(|e| anyhow::anyhow!("credential: {e}"))?,
+                    )
+                }
+            };
+            let outcome = ro_git::mutation::clone_with_credential(
+                &spec.clone_url,
+                &dest,
+                &clone_opts,
+                extraheader_host(&spec.clone_url).as_deref(),
+                credential.as_ref(),
+            )
+            .map_err(|e| anyhow::anyhow!("cloning {} failed: {e}", spec.clone_url))?;
 
             // `clone` reports a non-zero git exit in the outcome rather than as
             // an Err — it did run, and the process it ran produced a result.

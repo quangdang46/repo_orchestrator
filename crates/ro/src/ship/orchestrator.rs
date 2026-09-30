@@ -133,7 +133,18 @@ fn guards(plan: &RepoPlan, repo: &std::path::Path, opts: &RunOptions) -> Option<
     // what appears in `git branch` next month, so a tool that invents one is
     // deciding something with a blast radius on the user's behalf.
     let protected_base = ro_git::primitives::is_protected_branch(&plan.base_branch);
-    if protected_base && plan.onto.is_none() {
+    // One normalisation, used by **both** checks below. An `--onto` that is
+    // empty or all whitespace is no `--onto` at all — every writer filters it
+    // — so it must not read as "the user aimed somewhere else" and let a
+    // protected checkout through. Reading the raw field here and the trimmed
+    // one three lines down is how `--onto ' main '` came to pass a guard that
+    // `push_refspec` then did not.
+    let onto = plan
+        .onto
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    if protected_base && onto.is_none() {
         return Some(RepoOutcome::Refused {
             branch: plan.base_branch.clone(),
             reason: format!(
@@ -144,7 +155,14 @@ fn guards(plan: &RepoPlan, repo: &std::path::Path, opts: &RunOptions) -> Option<
             ),
         });
     }
-    if let Some(onto) = plan.onto.as_deref() {
+    // Trimmed **here**, at the guard, and not only at the writers. Every
+    // writer of `onto` trims — `push_refspec`, `onto_created_warning`,
+    // `base_for`, `written_branch` — so the guard was the one place the
+    // value was read raw, and the check and the write disagreed about what
+    // the branch was called. `--onto ' main '` therefore passed the
+    // protection and pushed onto `refs/heads/main`, which is the exact
+    // bypass FEATURES.md promises the guard closes.
+    if let Some(onto) = onto {
         if ro_git::primitives::is_protected_branch(onto) {
             return Some(RepoOutcome::Refused {
                 branch: onto.to_string(),
@@ -154,6 +172,15 @@ fn guards(plan: &RepoPlan, repo: &std::path::Path, opts: &RunOptions) -> Option<
                      standing on, so --onto cannot be used to bypass it. \
                      Choose an unprotected destination, or push there yourself."
                 ),
+            });
+        }
+        // A name git itself would refuse is refused here, with a reason that
+        // names the flag, rather than at the push as a bare non-fast-forward
+        // or as a branch invented from half a refspec.
+        if let Err(why) = validate_onto(onto) {
+            return Some(RepoOutcome::Refused {
+                branch: onto.to_string(),
+                reason: why,
             });
         }
     }
@@ -238,8 +265,25 @@ pub enum RepoOutcome {
         branch: String,
         reason: String,
     },
+    /// The work reached the remote.
+    ///
+    /// `warnings` carries what the user has to be told **about the write** —
+    /// a fact that is true of the ref that was just pushed and not of the
+    /// run in general. It lives on the outcome rather than beside it
+    /// because the summary row renders the outcome: a warning printed
+    /// somewhere else in the run is a warning a script reading `json` never
+    /// sees, and `--onto` naming a branch the remote does not have is
+    /// precisely the thing a script is most likely to act on unobserved.
+    ///
+    /// Empty for every outcome but this one, and that is the scope
+    /// deliberately: the only write ro makes without being asked is
+    /// creating the branch `--onto` named, so it is the only one that can
+    /// surprise. A push that went to a branch the remote already had
+    /// surprises nobody, and a push that failed published nothing to warn
+    /// about.
     Pushed {
         oid: String,
+        warnings: Vec<String>,
     },
     Failed {
         error: String,
@@ -277,6 +321,20 @@ impl RepoOutcome {
         )
     }
 
+    /// What the user has to be told about this outcome.
+    ///
+    /// Empty for almost every outcome, and that is the point: a warning
+    /// that fires on a clean run is a warning nobody reads. A borrowed
+    /// slice rather than a `Vec`, so a caller cannot empty the warning by
+    /// taking it — the row and the text table are two renderings of one
+    /// fact, and a `take()` between them would make them disagree.
+    pub fn warnings(&self) -> &[String] {
+        match self {
+            RepoOutcome::Pushed { warnings, .. } => warnings,
+            _ => &[],
+        }
+    }
+
     /// One line for the summary table.
     pub fn render(&self) -> String {
         match self {
@@ -294,7 +352,7 @@ impl RepoOutcome {
             // reason.
             RepoOutcome::Refused { reason, .. } => format!("refused: {reason}"),
             RepoOutcome::HandedOver { detail } => format!("needs you: {detail}"),
-            RepoOutcome::Pushed { oid } => format!("pushed {oid}"),
+            RepoOutcome::Pushed { oid, .. } => format!("pushed {oid}"),
             RepoOutcome::Failed { error, class } => format!("failed ({class}): {error}"),
         }
     }
@@ -477,8 +535,37 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     //     onto a base it never fetched, reported success, and printed
     //     nothing of git's `fatal:`. FEATURES.md's "fetch, rebase, commit,
     //     push" was not what happened.
+    //
+    //     The credential is resolved **here**, before the first network call,
+    //     and threaded into the fetch. It used to be resolved at the push
+    //     alone, so a private HTTPS repo — the only case where a per-row
+    //     credential is needed at all — fetched anonymously, failed at the
+    //     fetch with `fatal: Authentication failed`, and never reached the push
+    //     that did carry the token. Resolving once up front also means a
+    //     bad reference is reported before any work is committed, rather
+    //     than after.
+    let credential = match resolve_credential(plan.credential_ref.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            return RepoOutcome::Failed {
+                error: format!("credential: {e}"),
+                class: ro_core::FailureClass::MissingProvider,
+            };
+        }
+    };
     if opts.how_far.fetches() {
-        match ro_git::mutation::fetch(repo, &ro_git::mutation::FetchOpts::default()) {
+        match ro_git::mutation::fetch_with_credential(
+            repo,
+            &ro_git::mutation::FetchOpts {
+                // `None` for a local path or an SSH remote, which is correct:
+                // the header is an HTTP mechanism and SSH authenticates with
+                // keys. Inventing a host for it would only aim the token at
+                // nothing — or, worse, at github.com.
+                host: plan.host_for_extraheader(),
+                ..Default::default()
+            },
+            credential.as_ref(),
+        ) {
             Ok(r) if r.ok() => {}
             Ok(r) => {
                 return RepoOutcome::Failed {
@@ -516,7 +603,12 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     // ignored, which is what used to happen: the base was read from
     // `origin/HEAD` no matter what the user typed.
     if opts.how_far.rebases() {
-        match rebase_onto_remote_base(repo, plan.onto.as_deref()) {
+        match rebase_onto_remote_base(
+            repo,
+            plan.onto.as_deref(),
+            plan.host_for_extraheader().as_deref(),
+            credential.as_ref(),
+        ) {
             Ok(RebaseState::Rebased) | Ok(RebaseState::NoRemote) => {}
             // (c3) A conflict is a **stage**, not a dead end — and the
             // base travels with it, because the stage is about *that*
@@ -701,15 +793,24 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     // No protection check here: it ran in `guards`, before the engine, and
     // this point is after the commit. A refusal that arrives after the
     // work is already on disk is not a refusal.
-    let secret = match resolve_credential(plan.credential_ref.as_deref()) {
-        Ok(s) => s,
-        Err(e) => {
-            return RepoOutcome::Failed {
-                error: format!("credential: {e}"),
-                class: ro_core::FailureClass::MissingProvider,
-            };
-        }
-    };
+    //
+    // The secret is the one resolved at (c), not a second lookup: two
+    // resolutions of one reference is two answers waiting to disagree, and
+    // a credential that changed between them is a push as an account the
+    // fetch never saw.
+    //
+    // The `--onto` warning is computed **before** the push, which is the
+    // only moment the answer is both true and useful. A successful push
+    // updates `refs/remotes/origin/<onto>` in this very repository, so the
+    // same check afterwards answers "the remote has it" about a branch
+    // this run invented and the warning never fires. Before the push the
+    // tracking refs are as fresh as the fetch above made them — the same
+    // state `base_for` decided the rebase base from, so the two answers
+    // agree.
+    //
+    // Attached only on success, so a push that failed published nothing and
+    // says nothing about publishing.
+    let onto_warning = onto_created_warning(repo, plan.onto.as_deref());
 
     let push = ro_git::mutation::push_with_credential(
         repo,
@@ -723,11 +824,14 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             host: plan.host_for_extraheader(),
             ..Default::default()
         },
-        secret.as_ref(),
+        credential.as_ref(),
     );
 
     match push {
-        Ok(r) if r.ok() => RepoOutcome::Pushed { oid },
+        Ok(r) if r.ok() => RepoOutcome::Pushed {
+            oid,
+            warnings: onto_warning,
+        },
         Ok(r) => RepoOutcome::Failed {
             error: format!("push failed: {}", r.stderr.trim()),
                 class: ro_core::FailureClass::MissingProvider,
@@ -739,34 +843,137 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     }
 }
 
+/// What the user has to be told about a push that is about to **create**
+/// the branch it lands on.
+///
+/// `--onto` naming a branch the remote does not have is not an error — it
+/// is the first push, and the flag is the documented way to aim work at a
+/// branch that does not exist yet. It is also the one ship flag that can
+/// write anywhere on the remote with no gate: `--onto` to a protected
+/// branch is refused, but `--onto` to a branch nobody has heard of is
+/// accepted, and the push that follows **publishes** it. The help says
+/// only "The branch the work should land on, when it is not the current
+/// one", so a user who typed `--onto` and got a published branch they
+/// never asked for was told nothing until they looked at the remote.
+///
+/// Warned about, not refused. Refusing would break the legitimate case
+/// above, and the branch is created by the user's own flag either way —
+/// the difference is only whether they knew it was going to happen.
+///
+/// The negative control is the point: a branch the remote already had is
+/// not a surprise, and without this early return the warning fires on
+/// every `--onto` run and stops being read.
+fn onto_created_warning(repo: &Path, onto: Option<&str>) -> Vec<String> {
+    let Some(onto) = onto.map(str::trim).filter(|b| !b.is_empty()) else {
+        return Vec::new();
+    };
+    // A branch the remote already had is not a surprise, and it is the
+    // negative control the whole warning rests on: without this early return
+    // the warning fires on every `--onto` run and stops being read.
+    if remote_branch_exists(repo, onto) {
+        return Vec::new();
+    }
+    vec![format!(
+        "--onto {onto} names a branch the remote does not have. ro created \
+         it and pushed to it: {onto} is now a published branch, visible to \
+         anyone who can see this repository. If that was not the branch you \
+         meant, delete it (`git push origin --delete {onto}`) and re-run \
+         with the right name."
+    )]
+}
+
 impl RepoPlan {
-    /// Which host the extraheader is scoped to.
-    ///
-    /// A local path has no host, and a credential scoped to
-    /// `github.com` must not be offered to one.
-    /// The **scheme and host** the credential's extraheader is scoped to.
-    ///
-    /// Scheme included, and that is the whole point: the header used to be
-    /// assembled as `http.https://{host}/`, so a plain-HTTP remote had its
-    /// credential scoped to a URL that is never requested. The header was
-    /// dropped, git fell back to the machine's credential helper, and the
-    /// push either failed or succeeded as the *wrong account* — plus a modal
-    /// dialog on the user's screen.
-    ///
-    /// A non-HTTP remote (SSH) returns `None` rather than a fake origin: SSH
-    /// authenticates with keys, not this header, so there is nothing to
-    /// scope and a made-up host would only send the token somewhere it has
-    /// no business going.
+    /// Which host the extraheader is scoped to, from this row's clone URL.
     fn host_for_extraheader(&self) -> Option<String> {
-        let (scheme, rest) = self.clone_url.split_once("://")?;
-        if !matches!(scheme, "http" | "https") {
-            return None;
-        }
-        let host = rest.split('/').next().unwrap_or_default();
-        if host.is_empty() {
-            return None;
-        }
-        Some(format!("{scheme}://{host}"))
+        extraheader_host(&self.clone_url)
+    }
+}
+
+/// The **scheme and host** the credential's extraheader is scoped to, from a
+/// clone URL.
+///
+/// A local path has no host, and a credential scoped to `github.com` must not
+/// be offered to one.
+///
+/// Scheme included, and that is the whole point: the header used to be
+/// assembled as `http.https://{host}/`, so a plain-HTTP remote had its
+/// credential scoped to a URL that is never requested. The header was
+/// dropped, git fell back to the machine's credential helper, and the request
+/// either failed or succeeded as the *wrong account* — plus a modal dialog on
+/// the user's screen.
+///
+/// A non-HTTP remote (SSH) returns `None` rather than a fake origin: SSH
+/// authenticates with keys, not this header, so there is nothing to scope and
+/// a made-up host would only send the token somewhere it has no business going.
+///
+/// A free function rather than a method on `RepoPlan` because it is a rule
+/// about a **URL**, and the rebase step's fetch needs the same rule for the
+/// same row without a `RepoPlan` in hand. Two spellings of this is how the
+/// fetch ends up scoped somewhere the push is not.
+fn extraheader_host(clone_url: &str) -> Option<String> {
+    let (scheme, rest) = clone_url.split_once("://")?;
+    // Case-insensitively, and emitted **lower-cased**. A URL scheme is
+    // case-insensitive by RFC 3986, so `HTTP://host/…` names the same origin
+    // as `http://host/…` — but this matched `scheme` exactly, so an uppercase
+    // scheme returned `None`, no header was scoped, and the row's credential
+    // was dropped before git's own refusal of `remote-HTTP` was ever reached.
+    // The error the user saw then named neither the scheme nor the
+    // credential, which is the part that costs them the hour.
+    let scheme = scheme.to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return None;
+    }
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{host}"))
+}
+
+/// Is this a value that can name a **branch**?
+///
+/// `git check-ref-format --branch` is the authority, but two things are
+/// refused before it is asked, because both are the shape that turns one flag
+/// into two different refspecs:
+///
+///  * anything containing `:`, which git splits at the first colon into a
+///    source and a destination — `--onto 'feat:refs/heads/evil'` silently
+///    dropped the destination and pushed to `feat`
+///  * anything starting with `refs/`, which git will happily create as a
+///    branch *literally named* `refs/heads/refs/heads/feat`
+///
+/// `Some(err)` is the reason to show, phrased for someone who typed this.
+fn validate_onto(onto: &str) -> Result<(), String> {
+    if onto.contains(':') {
+        return Err(format!(
+            "--onto {onto:?} looks like a refspec, not a branch name. \
+             git splits it at the first `:`, so the part after the colon would \
+             be discarded and the push would land somewhere you did not name. \
+             Pass the branch on its own, e.g. --onto feat/x."
+        ));
+    }
+    if onto.starts_with("refs/") {
+        return Err(format!(
+            "--onto {onto:?} is a fully-qualified ref, not a branch name. \
+             ro would create a branch literally called {onto:?}. \
+             Pass the branch on its own, e.g. --onto {}.",
+            onto.trim_start_matches("refs/heads/")
+        ));
+    }
+    let out = std::process::Command::new("git")
+        .args(["check-ref-format", "--branch", onto])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output();
+    // An unreadable answer is `Ok`: this gate exists to refuse names git
+    // itself would refuse, and refusing every `--onto` on a machine where
+    // `git` cannot be spawned would be a far worse failure.
+    match out {
+        Ok(o) if !o.status.success() => Err(format!(
+            "--onto {onto:?} is not a valid branch name. \
+             `git check-ref-format --branch` rejects it."
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -1251,24 +1458,35 @@ fn base_for(repo: &Path, onto: Option<&str>) -> Option<String> {
     }
 }
 
-/// Does the remote have this branch? The exit code is the answer.
+/// Does the **remote** have this branch?
 ///
-/// `symbolic_ref` is the wrong tool here: `origin/main` is a *branch*, and
-/// git answers "is this a symbolic ref" for it with "no", which would make
-/// every branch look absent.
+/// Two questions have been asked here under this name, and the wrong one is
+/// the dangerous one. `git show-ref --verify refs/remotes/origin/<branch>`
+/// reads the **local remote-tracking refs**, so on any clone that is not a
+/// full clone — `--single-branch`, `--depth`, or merely stale — the answer
+/// was "no" for a branch the remote has had since before the clone was made.
+/// Both callers then act on that answer: `base_for` rebases onto the wrong
+/// base and the push is rejected non-fast-forward, and the "remote does not
+/// have it" warning fires on a branch that was **overwritten** rather than
+/// created, advising `git push origin --delete <branch>` on somebody else's
+/// work.
+///
+/// `ls-remote --heads` asks the remote. It is one more round trip on a
+/// network the caller is already using, and it is the only question whose
+/// answer is about the remote.
+///
+/// A remote that cannot be reached answers `false`. That is the old answer,
+/// and it is the conservative one for the warning — claiming a branch was
+/// created when the remote was unreachable would be the claim that cannot be
+/// walked back.
 fn remote_branch_exists(repo: &Path, branch: &str) -> bool {
     std::process::Command::new("git")
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{branch}"),
-        ])
+        .args(["ls-remote", "--heads", "origin", &format!("refs/heads/{branch}")])
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
         .output()
-        .map(|o| o.status.success())
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
 }
 
@@ -1317,12 +1535,28 @@ fn head_is_on_remote(repo: &Path, branch: &str) -> bool {
 fn rebase_onto_remote_base(
     repo: &Path,
     onto: Option<&str>,
+    host: Option<&str>,
+    credential: Option<&SecretString>,
 ) -> Result<RebaseState, RebaseError> {
     // Fetch first, always. Rebasing onto a stale
     // `refs/remotes/origin/HEAD` reorders the branch onto a base the
     // remote has already moved past, which is the one ordering mistake
     // that makes a rebase look like it worked.
-    let _ = ro_git::mutation::fetch(repo, &ro_git::mutation::FetchOpts::default());
+    //
+    // The credential travels with it, for the reason the fetch in `run_one`
+    // does: this fetch used to go out anonymously too, so a private repo
+    // failed here and the rebase never ran. The result is deliberately
+    // ignored — a fetch that cannot authenticate is not a reason to skip
+    // the rebase, and the push that follows reports the real failure —
+    // but the header has to be on the request.
+    let _ = ro_git::mutation::fetch_with_credential(
+        repo,
+        &ro_git::mutation::FetchOpts {
+            host: host.map(str::to_string),
+            ..Default::default()
+        },
+        credential,
+    );
 
     let Some(base) = base_for(repo, onto) else {
         return Ok(RebaseState::NoRemote);
@@ -1342,6 +1576,26 @@ fn rebase_onto_remote_base(
         })?;
 
     if out.status.success() {
+        // **The exit code is not the outcome.** `git rebase --autostash`
+        // returns 0 when the rebase itself succeeds and the *pop* that
+        // follows conflicts — verified against the real git, not assumed:
+        // stderr says "Applying autostash resulted in conflicts." and the
+        // status is 0. So the arm below, which only read stderr when
+        // `!out.status.success()`, never saw it, returned `Rebased`, and the
+        // engine then committed a tree full of conflict markers and the push
+        // published them as a clean `pushed`. The user's work was not lost —
+        // it was in `stash@{0}` — but the row said `pushed` and the remote
+        // held markers.
+        //
+        // The question is asked of the **tree**, not of the streams, and it is
+        // the same question `ro_git::mutation::pull_in` asks for the same
+        // flag: `git rebase --autostash` and `git pull --autostash` share the
+        // contract, so they share the fix.
+        let unmerged =
+            ro_git::mutation::unmerged_paths(repo, &ro_git::mutation::RunOpts::none());
+        if !unmerged.is_empty() {
+            return Err(RebaseError::Conflicted { base });
+        }
         return Ok(RebaseState::Rebased);
     }
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1587,6 +1841,78 @@ mod rebase_tests {
     use super::tests_support::*;
     use super::*;
 
+    /// A conflicting `--autostash` pop is a **conflict**, not a rebase.
+    ///
+    /// `git rebase --autostash` exits 0 when the rebase succeeds and the
+    /// *pop* that follows conflicts — verified against the real git, not
+    /// assumed. `rebase_onto_remote_base` read the exit code and only looked
+    /// at stderr when it was non-zero, so the `CONFLICT` string it matched for
+    /// was never reached, the function returned `Rebased`, and the engine then
+    /// committed a tree full of conflict markers and the push published them
+    /// as a clean `pushed`. The user's work was not lost — it was in
+    /// `stash@{0}` — but the row said `pushed` and the remote held markers.
+    #[test]
+    fn a_conflicting_autostash_pop_is_a_conflict_not_a_clean_rebase() {
+        let f = Fixture::new();
+        // Both sides start from a shared tree containing `shared.txt`.
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("shared.txt", "base version\n");
+        run_git(f.repo(), &["add", "-A"]);
+        run_git(f.repo(), &["commit", "-q", "-m", "add shared"]);
+        run_git(f.repo(), &["push", "-q", "origin", "HEAD:main"]);
+
+        // The local side now has an **uncommitted** edit of that file…
+        f.write_local("shared.txt", "local version\n");
+        // …and the remote changes it too. So `git rebase --autostash` stashes
+        // the local edit, the rebase itself is a no-op (work is already on
+        // `origin/main`), and the POP conflicts — the exact case git exits 0
+        // for. Tracked on both sides on purpose: an untracked file is not
+        // stashed by `--autostash` and git refuses the checkout instead.
+        f.force_remote_file("shared.txt", "remote version\n");
+        run_git(f.repo(), &["fetch", "-q", "origin"]);
+
+        let state = rebase_onto_remote_base(f.repo(), None, None, None);
+
+        match state {
+            Err(RebaseError::Conflicted { .. }) => {}
+            other => panic!(
+                "a conflicting autostash pop must be a conflict, not a rebase; \
+                 got {other:?}"
+            ),
+        }
+        // And the tree really does hold conflict markers — the
+        // classification is not being made on a tree that happens to be
+        // clean. This is the content the push used to publish as `pushed`.
+        let tree = std::fs::read_to_string(f.repo().join("shared.txt")).unwrap_or_default();
+        assert!(
+            tree.contains("<<<<<<<") && tree.contains(">>>>>>>"),
+            "the worktree must hold conflict markers, or nothing was at stake; got: {tree:?}"
+        );
+    }
+
+    /// The negative control: a clean pop is a rebase.
+    ///
+    /// Without this, the test above would pass for a function that reported
+    /// `Conflicted` for every rebase.
+    #[test]
+    fn a_clean_autostash_pop_is_a_rebase() {
+        let f = Fixture::new();
+        f.write_local("feature.txt", "work in progress\n");
+        f.other_clone_commits("remote moved on");
+        run_git(f.repo(), &["fetch", "-q", "origin"]);
+
+        let state = rebase_onto_remote_base(f.repo(), None, None, None);
+        assert!(
+            matches!(state, Ok(RebaseState::Rebased)),
+            "a clean pop must be a rebase; got {state:?}"
+        );
+        assert!(
+            !f.local_porcelain().contains("UU"),
+            "no conflict markers may be left behind: {}",
+            f.local_porcelain()
+        );
+    }
+
     /// The rebase happens **before** the engine, so the tree comes back
     /// already on the remote's base and the push is a fast-forward.
     ///
@@ -1603,7 +1929,7 @@ mod rebase_tests {
         // normally invoked in.
         f.write_local("feature.txt", "work in progress\n");
 
-        let state = rebase_onto_remote_base(f.repo(), None).expect("the rebase runs");
+        let state = rebase_onto_remote_base(f.repo(), None, None, None).expect("the rebase runs");
         assert!(
             matches!(state, RebaseState::Rebased),
             "a dirty tree on a moved remote must rebase, got {state:?}"
@@ -1630,7 +1956,7 @@ mod rebase_tests {
         // Nothing local is dirty.
         assert!(f.local_porcelain().trim().is_empty());
 
-        let state = rebase_onto_remote_base(f.repo(), None).expect("the rebase runs");
+        let state = rebase_onto_remote_base(f.repo(), None, None, None).expect("the rebase runs");
         assert!(matches!(state, RebaseState::Rebased), "got {state:?}");
         assert!(f.local_contains("remote moved on"));
     }
@@ -1639,7 +1965,7 @@ mod rebase_tests {
     #[test]
     fn an_already_current_branch_is_up_to_date() {
         let f = Fixture::new();
-        let state = rebase_onto_remote_base(f.repo(), None).expect("the rebase runs");
+        let state = rebase_onto_remote_base(f.repo(), None, None, None).expect("the rebase runs");
         assert!(
             matches!(state, RebaseState::Rebased | RebaseState::NoRemote),
             "a fresh fixture must not fail, got {state:?}"
@@ -1657,7 +1983,7 @@ mod rebase_tests {
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "-q", "-b", "main"]);
         assert_eq!(
-            rebase_onto_remote_base(&repo, None).expect("must not fail"),
+            rebase_onto_remote_base(&repo, None, None, None).expect("must not fail"),
             RebaseState::NoRemote,
             "a local-only repo has no base to rebase onto, and that is a fact"
         );
@@ -1677,7 +2003,7 @@ mod rebase_tests {
         f.force_remote_file("shared.txt", "remote version\n");
         f.write_local("shared.txt", "local version\n");
 
-        let err = rebase_onto_remote_base(f.repo(), None).expect_err("must fail loudly");
+        let err = rebase_onto_remote_base(f.repo(), None, None, None).expect_err("must fail loudly");
         let msg = err.to_string();
         assert!(
             msg.contains("rebase --abort") || msg.contains("rebase --continue"),
@@ -1875,6 +2201,17 @@ pub(crate) mod tests_support {
             );
         }
 
+        /// Is the checkout dirty? A precondition assertion needs a question
+        /// that is about the *worktree*, not about a lock file.
+        pub fn local_is_dirty(&self) -> bool {
+            let out = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&self.local)
+                .output()
+                .expect("git runs");
+            !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        }
+
         pub fn local_porcelain(&self) -> String {
             String::from_utf8_lossy(
                 &std::process::Command::new("git")
@@ -1929,6 +2266,7 @@ pub(crate) mod tests_support {
 mod protected_tests {
     use super::tests_support::*;
     use super::*;
+    use tempfile::TempDir;
 
     /// `--amend` on a HEAD the remote has already seen is **refused**.
     ///
@@ -2308,6 +2646,429 @@ mod protected_tests {
         }
     }
 
+    /// A real HTTP git remote that demands a credential, and reports the
+    /// `Authorization` header it was actually handed.
+    ///
+    /// **Why a server and not a `git` shim.** The obvious fixture is a shim
+    /// on `PATH` that records the env it was given, and it is the wrong one
+    /// here: `PATH` is process-global, and only the tests that *install* a
+    /// shim take the testkit lock — every other test in this binary runs
+    /// `git` by bare name and is not holding it. So while a shim is first on
+    /// `PATH`, a test on another thread can resolve `git` to that script and
+    /// then have the directory deleted underneath it, which fails as
+    /// `cannot open /tmp/.tmpXXXX/bin/git: No such file` in a test that has
+    /// nothing to do with credentials. Leaking the directory stops the
+    /// not-found and leaves a different race — a concurrent test runs the
+    /// shim, which `exec`s the real git for everything that is not a fetch —
+    /// and that one is not benign: it makes the *fixture* the thing under
+    /// test, so the assertion reads whatever the other thread's fetch
+    /// happened to carry.
+    ///
+    /// A loopback server has no process-global state at all. The header is
+    /// read off the wire, which is the same evidence the original refutation
+    /// used, and the server is bound to an ephemeral port so two of them can
+    /// run at once.
+    struct DemandingRemote {
+        /// Kept alive: dropping the `TempDir` would delete the bare repo the
+        /// server is about while a fetch is still in flight.
+        _tmp: TempDir,
+        /// One entry per request, appended as it arrives.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        /// Set to ask the accept loop to stop, so the thread joins instead of
+        /// outliving the test and holding the port.
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DemandingRemote {
+        /// A bare repo on loopback that answers every request with 401 and
+        /// records the `Authorization` header it was given.
+        ///
+        /// The 401 is the point: a fetch that is not authenticated **fails**,
+        /// so "the credential reached the remote" and "the fetch succeeded"
+        /// are the same observation rather than two that can disagree.
+        ///
+        /// The listener stays open for the whole test rather than answering
+        /// once. `ro ship` fetches twice — the explicit fetch and the one
+        /// inside the rebase — and both have to be observed; a one-shot
+        /// server would answer the first and leave the second to a connection
+        /// that is refused, which is a *different* failure and reads as one.
+        fn start() -> (Self, String) {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+
+            let tmp = TempDir::new().unwrap();
+            let bare = tmp.path().join("remote.git");
+            std::fs::create_dir_all(&bare).unwrap();
+            run_git(&bare, &["init", "--bare", "-q", "--initial-branch=main"]);
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port is bindable");
+            listener
+                .set_nonblocking(true)
+                .expect("the listener can poll instead of blocking");
+            let port = listener
+                .local_addr()
+                .expect("the socket is bound")
+                .port();
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen_thread = seen.clone();
+            let stop_thread = stop.clone();
+            let worker = std::thread::spawn(move || {
+                while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                            let mut chunk = [0u8; 8192];
+                            // The request head is the whole of what is under
+                            // test; a request body, if one follows, is not.
+                            let Ok(n) = stream.read(&mut chunk) else { continue };
+                            let head = String::from_utf8_lossy(&chunk[..n]).into_owned();
+                            let header = head
+                                .lines()
+                                .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                                .and_then(|l| l.split_once(':'))
+                                .map(|(_, v)| v.trim().to_string());
+                            seen_thread
+                                .lock()
+                                .expect("the lock is poison-free")
+                                .push(header);
+                            let _ = stream
+                                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+                            let _ = stream.flush();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+
+            let remote = Self {
+                _tmp: tmp,
+                seen,
+                stop,
+            };
+            let url = format!("http://127.0.0.1:{port}");
+            // `worker` is detached: `Drop` sets `stop` and joins it, so the
+            // accept loop ends and the port is released with the `Self`.
+            std::mem::forget(worker);
+            (remote, url)
+        }
+
+        /// Every `Authorization` header the remote was handed, in order.
+        fn headers(&self) -> Vec<Option<String>> {
+            self.seen.lock().expect("the lock is poison-free").clone()
+        }
+    }
+
+    impl Drop for DemandingRemote {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The fetch a `ro ship` runs carries the row's credential.
+    ///
+    /// **This is the bug.** The credential was resolved at the push and
+    /// nowhere else, so a private HTTPS repo — the one case that needs a
+    /// per-row credential at all — fetched anonymously, failed at the fetch,
+    /// and never reached the push that did carry the token. A refutation run
+    /// against a real HTTP remote with header capture saw exactly this: two
+    /// `git-upload-pack` requests with no `Authorization`, two
+    /// `git-receive-pack` requests with one.
+    ///
+    /// The remote is a real HTTP server on loopback, so the header is read
+    /// off the wire rather than out of a child's environment — see
+    /// [`DemandingRemote`] for why a `git` shim cannot be used here.
+    ///
+    /// Ship, not Push: `HowFar::fetches()` is Ship alone, so this would
+    /// never run a fetch at all.
+    #[test]
+    fn the_ship_fetch_carries_the_rows_credential() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feat/cred"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feat/cred"]);
+        f.write_local("f.txt", "work\n");
+
+        let (remote, url) = DemandingRemote::start();
+
+        // The row names the demanding remote, so the fetch has to authenticate
+        // or fail. The local origin is untouched: the fetch goes to `url`,
+        // and the rebase's fetch goes there too.
+        let mut plan = plan_on(&f, "feat/cred", None);
+        plan.clone_url = format!("{url}/acme/api.git");
+        plan.credential_ref = Some("env:RO_SHIP_FETCH_CREDENTIAL_TEST".to_string());
+        // The remote is a bare repo with no refs, so `origin/HEAD` is dangling
+        // and the rebase has nothing to land on. Without this the run stops
+        // at `NoRemote` and never makes the second fetch — the one inside the
+        // rebase, which had the same hole.
+        run_git(f.repo(), &["remote", "set-url", "origin", &plan.clone_url]);
+
+        let mut opts = opts_for(&f);
+        opts.how_far = HowFar::Ship;
+        let outcome = unsafe {
+            ro_testkit::TestEnv::new()
+                .var("RO_SHIP_FETCH_CREDENTIAL_TEST", "ghp_ship_fetch_marker")
+                .run(|| run_one(&plan, &opts))
+        };
+
+        // The remote demands a credential and the fetch carries one, so the
+        // fetch is refused by the remote rather than by ro — and that is the
+        // honest outcome: the header reached the wire, which is what this
+        // test exists to prove. What must NOT happen is a silent success.
+        let headers = remote.headers();
+        assert!(
+            !headers.is_empty(),
+            "the remote must have been asked for something, got nothing"
+        );
+        for header in &headers {
+            let header = header.as_deref().expect(
+                "every request to a remote that demands a credential must be authenticated",
+            );
+            assert!(
+                header.starts_with("basic "),
+                "the header must be a basic Authorization, got: {header}"
+            );
+            // Base64, because that is what an Authorization header carries —
+            // and because a failure message that printed the token in the
+            // clear would put a credential in the test log.
+            assert!(
+                header.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX3NoaXBfZmV0Y2hfbWFya2Vy"),
+                "the row's own credential must be the one on the wire, got: {header}"
+            );
+        }
+        // And the run did not report a success it did not have.
+        assert!(
+            !matches!(outcome, RepoOutcome::Pushed { .. }),
+            "a remote that refused the fetch must not be reported as pushed, got {outcome:?}"
+        );
+    }
+
+    /// A fetch with no credential fails **honestly** rather than reporting
+    /// success.
+    ///
+    /// The other half of the same rule, and the reason the positive test
+    /// above is not self-deceiving: a remote that demands a credential and a
+    /// row that has none must produce a run that says so. The failure used to
+    /// be invisible here — the fetch went out anonymously, the remote
+    /// refused it, and the run reported whatever the push did.
+    #[test]
+    fn a_fetch_with_no_credential_fails_honestly() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feat/nocred"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feat/nocred"]);
+        f.write_local("f.txt", "work\n");
+
+        let (remote, url) = DemandingRemote::start();
+
+        let mut plan = plan_on(&f, "feat/nocred", None);
+        plan.clone_url = format!("{url}/acme/api.git");
+        plan.credential_ref = None;
+        // Same reason as the positive test: the fetch has to go to the
+        // demanding remote, not to the fixture's local origin.
+        run_git(f.repo(), &["remote", "set-url", "origin", &plan.clone_url]);
+
+        let mut opts = opts_for(&f);
+        opts.how_far = HowFar::Ship;
+        let outcome = run_one(&plan, &opts);
+
+        let headers = remote.headers();
+        assert!(
+            !headers.is_empty(),
+            "the remote must have been asked for something, got nothing"
+        );
+        for header in &headers {
+            assert!(
+                header.is_none(),
+                "a row with no credential must send no Authorization at all, got: {header:?}"
+            );
+        }
+        match &outcome {
+            RepoOutcome::Failed { error, .. } => {
+                assert!(
+                    error.contains("fetch failed"),
+                    "the failure must name the fetch, got: {error}"
+                );
+            }
+            other => panic!("an unauthenticated fetch must be a failure, got {other:?}"),
+        }
+    }
+
+    /// A plain-HTTP remote still gets its credential on the fetch, scoped to
+    /// the scheme actually requested.
+    ///
+    /// A header scoped to `https://` is silently dropped by a remote asked
+    /// over `http://`, and the fetch then falls back to the machine's
+    /// credential helper — which is a fetch as the wrong account, or a modal
+    /// dialog on the user's screen. The scope is asserted at
+    /// [`the_extraheader_scope_is_the_scheme_and_host_or_nothing`]; this is
+    /// the end-to-end half, that a plain-HTTP row reaches the wire at all.
+    #[test]
+    fn a_plain_http_row_still_gets_its_credential_on_the_fetch() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feat/plain"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feat/plain"]);
+        f.write_local("f.txt", "work\n");
+
+        let (remote, url) = DemandingRemote::start();
+
+        let mut plan = plan_on(&f, "feat/plain", None);
+        plan.clone_url = format!("{url}/acme/api.git");
+        plan.credential_ref = Some("env:RO_SHIP_FETCH_CREDENTIAL_TEST".to_string());
+        run_git(f.repo(), &["remote", "set-url", "origin", &plan.clone_url]);
+
+        let mut opts = opts_for(&f);
+        opts.how_far = HowFar::Ship;
+        let outcome = unsafe {
+            ro_testkit::TestEnv::new()
+                .var("RO_SHIP_FETCH_CREDENTIAL_TEST", "ghp_plain_http_marker")
+                .run(|| run_one(&plan, &opts))
+        };
+
+        let headers = remote.headers();
+        assert!(
+            !headers.is_empty(),
+            "the remote must have been asked for something, got nothing"
+        );
+        for header in &headers {
+            let header = header.as_deref().expect(
+                "a plain-HTTP row with a credential must authenticate its fetch",
+            );
+            assert!(
+                // Base64 of `x-access-token:ghp_plain_http_marker`.
+                header.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX3BsYWluX2h0dHBfbWFya2Vy"),
+                "the row's own credential must be on the wire, got: {header}"
+            );
+        }
+        assert!(
+            !matches!(outcome, RepoOutcome::Pushed { .. }),
+            "a remote that refused the fetch must not be reported as pushed, got {outcome:?}"
+        );
+    }
+
+    /// The fetch **inside the rebase** carries the credential too.
+    ///
+    /// `rebase_onto_remote_base` fetches before every rebase, and it fetched
+    /// anonymously for the same reason the ship fetch did — a second call site
+    /// for the same hole, where a fix that only reached the first one would
+    /// look complete. Called directly rather than through `run_one`, because
+    /// `run_one`'s own fetch is refused by this remote and the run stops
+    /// before the rebase is reached; what is under test is the fetch inside
+    /// `rebase_onto_remote_base` and the two arguments it is handed.
+    #[test]
+    fn the_rebase_fetch_carries_the_credential_too() {
+        let f = Fixture::new();
+        let (remote, url) = DemandingRemote::start();
+        let clone_url = format!("{url}/acme/api.git");
+        run_git(f.repo(), &["remote", "set-url", "origin", &clone_url]);
+
+        let token = SecretString::new("ghp_rebase_fetch_marker");
+        let host = extraheader_host(&clone_url).expect("an http clone url names a host");
+
+        // The outcome is not the point. The fetch inside it always runs, and
+        // its result is deliberately ignored, so a remote that cannot be
+        // authenticated is not by itself a reason to skip the rebase.
+        let _ = rebase_onto_remote_base(f.repo(), None, Some(&host), Some(&token));
+
+        let headers = remote.headers();
+        assert!(
+            !headers.is_empty(),
+            "the rebase must have fetched, got no request at all"
+        );
+        for header in &headers {
+            let header = header.as_deref().expect(
+                "the rebase's fetch must authenticate against a remote that demands it",
+            );
+            // Base64 of `x-access-token:ghp_rebase_fetch_marker`.
+            assert!(
+                header.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX3JlYmFzZV9mZXRjaF9tYXJrZXI="),
+                "the rebase's fetch must carry the row's own credential, got: {header}"
+            );
+        }
+    }
+
+    /// The scope rule itself, so a change to it is caught here rather than by
+    /// a token reaching a host the row never named.
+    ///
+    /// **The SSH answer is the important one.** A non-HTTP remote returns
+    /// `None` and that `None` is load-bearing: it is what stops a header
+    /// being invented for a transport that has no use for one, which is the
+    /// same wrong-account leak the extraheader exists to prevent. It is
+    /// asserted here rather than against a live remote because an SSH fetch
+    /// cannot be driven against a loopback HTTP server — the half that *can*
+    /// be observed end to end is that `ro_git` turns a `None` host into no
+    /// header at all, in
+    /// `a_fetch_to_an_ssh_remote_gets_no_fabricated_header`.
+    #[test]
+    fn the_scope_rule_is_the_scheme_and_host_or_nothing() {
+        assert_eq!(
+            extraheader_host("https://github.com/acme/api.git"),
+            Some("https://github.com".to_string())
+        );
+        assert_eq!(
+            extraheader_host("http://127.0.0.1:8080/acme/api.git"),
+            Some("http://127.0.0.1:8080".to_string())
+        );
+        assert_eq!(extraheader_host("git@github.com:acme/api.git"), None);
+        assert_eq!(
+            extraheader_host("ssh://git@github.com:2222/acme/api.git"),
+            None
+        );
+        assert_eq!(extraheader_host("/srv/repos/api.git"), None);
+        assert_eq!(extraheader_host("https:///acme/api.git"), None);
+    }
+
+    /// A row whose credential cannot be resolved is refused **before** the
+    /// work is committed, not after.
+    ///
+    /// The lookup moved up so the fetch could carry the token, and that move
+    /// is the improvement: the run used to burn an engine pass, write a
+    /// commit, and only then discover the credential it had been resolving
+    /// all along was unusable.
+    #[test]
+    fn an_unresolvable_credential_is_refused_before_anything_is_written() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feat/nocred"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feat/nocred"]);
+        f.write_local("f.txt", "work\n");
+
+        let mut plan = plan_on(&f, "feat/nocred", None);
+        plan.clone_url = "https://github.com/acme/api.git".to_string();
+        // An unset variable, under the testkit lock so nothing else can be
+        // reading it mid-run.
+        plan.credential_ref = Some("env:RO_SHIP_UNSET_CREDENTIAL_FOR_TEST".to_string());
+
+        let mut opts = opts_for(&f);
+        opts.how_far = HowFar::Ship;
+        let outcome = unsafe {
+            ro_testkit::TestEnv::new()
+                .var("RO_SHIP_UNSET_CREDENTIAL_FOR_TEST", "")
+                .run(|| run_one(&plan, &opts))
+        };
+
+        match &outcome {
+            RepoOutcome::Failed { error,
+                class: ro_core::FailureClass::MissingProvider,
+            } => {
+                assert!(
+                    error.contains("credential"),
+                    "the failure must name the credential, got: {error}"
+                );
+            }
+            other => panic!("an unresolvable credential must be a failure, got {other:?}"),
+        }
+        assert!(
+            !f.local_contains("work"),
+            "nothing may be committed when the credential cannot be resolved"
+        );
+        assert!(
+            !f.remote_has("feat/nocred-uncommitted"),
+            "nothing may be pushed when the credential cannot be resolved"
+        );
+    }
+
     /// A plan pointed at a feature branch pushes normally.
     #[test]
     fn a_feature_branch_pushes_normally() {
@@ -2389,21 +3150,60 @@ fn push_destination(refspec: &str) -> String {
 /// cannot be asked is not a reason to strand work.
 fn has_commits_to_push(repo: &Path, refspec: &str, head_before: Option<&str>) -> bool {
     let dest = push_destination(refspec);
-    // No local branch named for the destination means this is the first
-    // push of it, which creates it.
-    if !ro_git::primitives::branch_exists(repo, &dest) {
-        return true;
-    }
-    // A local branch with no upstream tracking has nothing to compare
-    // against. Say there is work: the push that follows resolves the
-    // truth, and inventing a skip from an unreadable comparison is how
-    // work ends up stranded.
-    let Some(upstream) = current_branch_upstream(repo) else {
+    // No local branch named for the destination. That used to mean "this is
+    // the first push of it, which creates it" — and on a **clean** tree with
+    // nothing to commit, it created a remote branch and moved the checkout's
+    // upstream to it. `ro ship --onto ghost` with no work published `ghost`
+    // and repointed `branch.main.merge` at `refs/heads/ghost`; the warning
+    // made it look deliberate, but nothing in that run asked for a branch to
+    // be invented.
+    //
+    // The question is whether **this run** has anything to send, and
+    // `head_before` is read **after** the rebase and before the engine, so
+    // `moved` is "the engine committed something". It is not "the rebase
+    // rewrote the branch": a rebase that moves HEAD onto a base it was
+    // already level with writes nothing, and a rebase that is genuinely
+    // ahead is one the `--onto` user asked for. What must not happen is a
+    // branch created out of a tree with no work in it.
+    //
+    // An absent `head_before` is *unknown*, not *no*.
+    let Some(before) = head_before else {
+        // Nothing to compare against. Say there is work: inventing a skip
+        // from an unreadable comparison is how work ends up stranded.
         return true;
     };
-    match ro_git::read::ahead_behind(repo, &format!("refs/remotes/origin/{upstream}")) {
-        Ok(ab) => ab.ahead > 0 || head_before != ro_git::read::head_oid(repo).ok().flatten().as_deref(),
-        Err(_) => true,
+    let moved = ro_git::read::head_oid(repo).ok().flatten().as_deref() != Some(before);
+    // A local branch with no upstream tracking has nothing to compare
+    // against, as does a remote-tracking ref that cannot be read. Say there
+    // is work in both: the push that follows resolves the truth, and
+    // inventing a skip from an unreadable comparison is how work ends up
+    // stranded.
+    let local_has = ro_git::primitives::branch_exists(repo, &dest);
+    let remote_has = remote_branch_exists(repo, &dest);
+    match (local_has, remote_has) {
+        (true, true) => {
+            let Some(upstream) = current_branch_upstream(repo) else {
+                return true;
+            };
+            match ro_git::read::ahead_behind(repo, &format!("refs/remotes/origin/{upstream}")) {
+                Ok(ab) => ab.ahead > 0 || moved,
+                Err(_) => true,
+            }
+        }
+        // A destination neither side has is a branch this run **creates** —
+        // and only out of a HEAD that moved here. Both halves matter: the
+        // first one alone published a branch off `main` for a run with no
+        // work in it at all.
+        (false, false) => moved,
+        // Undecidable, and deliberately so: the branch exists on one side
+        // only, so there is no ref to compare against. A rebase the caller
+        // resolved with `--resolve` lands here — the resolved commit is HEAD,
+        // `head_before` was read after it, and nothing about this repo says
+        // it should be pushed. Saying "there is work" and letting the push
+        // resolve the truth is the same answer the old code gave, and
+        // inventing a skip out of an unreadable comparison is how work ends
+        // up stranded.
+        _ => true,
     }
 }
 
@@ -2568,7 +3368,7 @@ mod onto_tests {
         let f = Fixture::new();
         release_line_moves_on(&f);
 
-        let state = rebase_onto_remote_base(f.repo(), Some("release"))
+        let state = rebase_onto_remote_base(f.repo(), Some("release"), None, None)
             .expect("the rebase onto a named branch runs");
         assert!(matches!(state, RebaseState::Rebased), "got {state:?}");
         // The commit that exists **only** on `release`. Asserting on one
@@ -2604,6 +3404,143 @@ mod onto_tests {
             f.remote_has("brand-new"),
             "the named branch must exist after the run: {:?}",
             f.remote_subjects()
+        );
+    }
+
+    /// **The warning.** `--onto` at a branch the remote has never heard of
+    /// publishes that branch, and the user is told so.
+    ///
+    /// Nothing in the help says the flag invents a branch. `--onto` is the
+    /// one ship flag with no gate on where it writes — `--onto main` is
+    /// refused, but `--onto anything-at-all` is accepted and creates a
+    /// branch that is then visible to anyone who can see the repository.
+    /// The three things a user needs are all in the message: that the
+    /// branch was not there, that ro made it, and that it is now public.
+    #[test]
+    fn onto_a_branch_the_remote_lacks_warns_that_it_will_be_published() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("f.txt", "work\n");
+
+        let plan = plan_on(&f, "work", Some("brand-new"));
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        let warnings = outcome.warnings();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "publishing a new branch is worth exactly one warning, got {warnings:?}"
+        );
+        let warning = &warnings[0];
+        assert!(
+            warning.contains("brand-new"),
+            "the warning must name the branch, got: {warning}"
+        );
+        assert!(
+            warning.contains("does not have") && warning.contains("created"),
+            "it must say the branch was not there and ro made it, got: {warning}"
+        );
+        assert!(
+            warning.contains("published") && warning.contains("visible to"),
+            "and that the branch is now public — a typo here is a leaked \
+             ref, not a private mistake, got: {warning}"
+        );
+
+        // The fact the warning is about: the branch really is on the
+        // remote, so this is not a warning about a branch that was never
+        // created.
+        assert!(
+            f.remote_has("brand-new"),
+            "the branch must exist, or the warning is lying: {:?}",
+            f.remote_subjects()
+        );
+    }
+
+    /// **The negative control**, and the reason the test above is not
+    /// vacuous: `--onto` at a branch the remote already has says nothing.
+    ///
+    /// A warning that fires on every `--onto` run is a warning nobody
+    /// reads, and the run above would pass unchanged on a build that
+    /// warned unconditionally. Without this, "we warn" and "we warn
+    /// always" are the same test result.
+    #[test]
+    fn onto_a_branch_the_remote_already_has_does_not_warn() {
+        let f = Fixture::new();
+        release_line_moves_on(&f);
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("f.txt", "work\n");
+
+        let plan = plan_on(&f, "work", Some("release"));
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        assert!(
+            matches!(outcome, RepoOutcome::Pushed { .. }),
+            "pushing to an existing branch must still work, got {outcome:?}"
+        );
+        assert!(
+            f.remote_has("release"),
+            "the branch must be the one it already was: {:?}",
+            f.remote_subjects()
+        );
+        assert!(
+            outcome.warnings().is_empty(),
+            "a branch the remote already had is not a surprise; got {:?}",
+            outcome.warnings()
+        );
+    }
+
+    /// The warning is about publishing a branch, so a run that **refused**
+    /// has published nothing to warn about.
+    ///
+    /// Ordering matters and is the part worth pinning: the protected check
+    /// runs before the push, so a refused `--onto` never reaches the code
+    /// that asks "did we just create this?". A warning attached to a
+    /// refusal would tell a user their branch was published when the run
+    /// did nothing at all.
+    #[test]
+    fn a_refused_onto_does_not_warn_about_publishing() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("f.txt", "work\n");
+
+        let plan = plan_on(&f, "work", Some("main"));
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        assert!(
+            matches!(outcome, RepoOutcome::Refused { .. }),
+            "--onto main must still be refused, got {outcome:?}"
+        );
+        assert!(
+            outcome.warnings().is_empty(),
+            "a refused run published nothing; got {:?}",
+            outcome.warnings()
+        );
+    }
+
+    /// A run with no `--onto` never invents a branch, whatever its branch
+    /// is. The second half of the negative control: the warning is about
+    /// the flag, not about "the checkout is on a branch the remote lacks".
+    #[test]
+    fn a_plain_push_never_warns_about_creating_a_branch() {
+        let f = Fixture::new();
+        // A branch that exists **only locally**: no push under it has
+        // happened, so `origin/work` is absent. This is the case a check
+        // written against the local ref store would misfire on.
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("f.txt", "work\n");
+
+        let plan = plan_on(&f, "work", None);
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        assert!(
+            matches!(outcome, RepoOutcome::Pushed { .. }),
+            "a plain push must work, got {outcome:?}"
+        );
+        assert!(
+            outcome.warnings().is_empty(),
+            "without --onto the destination is the branch the work was made \
+             on, which is not a branch being invented; got {:?}",
+            outcome.warnings()
         );
     }
 
@@ -2653,6 +3590,275 @@ mod onto_tests {
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .any(|l| l.trim() == subject)
+    }
+
+    // ── The guard the writers disagreed with ──────────────────────────
+    //
+    // Every writer of `onto` trims — `push_refspec`, `onto_created_warning`,
+    // `base_for`, `written_branch` — and the protected-branch guard did not.
+    // So `--onto ' main '` passed the check and then wrote to
+    // `refs/heads/main`, advancing a protected branch with a `wip on work`
+    // commit, exit 0. FEATURES.md promises "`--onto` naming a protected
+    // branch is refused too"; that promise did not survive whitespace.
+
+    #[test]
+    fn onto_a_protected_branch_padded_with_whitespace_is_still_refused() {
+        for padded in [" main ", "\tmain\n", "  main"] {
+            let f = Fixture::new();
+            run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+            f.write_local("f.txt", "work\n");
+            run_git(f.repo(), &["add", "-A"]);
+            run_git(f.repo(), &["commit", "-q", "-m", "the work"]);
+
+            let plan = plan_on(&f, "work", Some(padded));
+            let outcome = run_one(&plan, &opts_for(&f));
+
+            assert!(
+                matches!(outcome, RepoOutcome::Refused { .. }),
+                "--onto {padded:?} must be refused exactly like `--onto main`; \
+                 got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_padded_protected_name_does_not_advance_the_protected_branch() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("f.txt", "work\n");
+        run_git(f.repo(), &["add", "-A"]);
+        run_git(f.repo(), &["commit", "-q", "-m", "the work"]);
+
+        assert!(
+            !remote_log_contains(&f, "main", "the work"),
+            "the fixture must start clean"
+        );
+
+        let plan = plan_on(&f, "work", Some(" main "));
+        let _ = run_one(&plan, &opts_for(&f));
+
+        assert!(
+            !remote_log_contains(&f, "main", "the work"),
+            "refs/heads/main must not have advanced: {:?}",
+            f.remote_refs()
+        );
+    }
+
+    // ── `--onto` as a branch name ───────────────────────────────────────
+    //
+    // `--onto` was never validated as a branch name, so three shapes of the
+    // same bug got through: a refspec was split at the colon and half of it
+    // discarded, a fully-qualified ref invented a branch literally named
+    // `refs/heads/refs/heads/feat`, and the row's warning then advised
+    // deleting a branch that does not exist.
+
+    #[test]
+    fn onto_a_refspec_is_refused_rather_than_split_at_the_colon() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("f.txt", "work\n");
+        run_git(f.repo(), &["add", "-A"]);
+        run_git(f.repo(), &["commit", "-q", "-m", "the work"]);
+
+        let plan = plan_on(&f, "work", Some("feat:refs/heads/evil"));
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        match outcome {
+            RepoOutcome::Refused { reason, .. } => assert!(
+                reason.contains("refspec"),
+                "the refusal must name the refspec as the problem: {reason}"
+            ),
+            other => panic!("a refspec must not be pushed; got {other:?}"),
+        }
+        assert!(
+            !f.remote_has("evil") && !f.remote_has("feat"),
+            "neither half of the refspec may be created: {:?}",
+            f.remote_refs()
+        );
+    }
+
+    #[test]
+    fn onto_a_fully_qualified_ref_is_refused_rather_than_nested() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        f.write_local("f.txt", "work\n");
+        run_git(f.repo(), &["add", "-A"]);
+        run_git(f.repo(), &["commit", "-q", "-m", "the work"]);
+
+        let plan = plan_on(&f, "work", Some("refs/heads/feat"));
+        let outcome = run_one(&plan, &opts_for(&f));
+
+        assert!(
+            matches!(outcome, RepoOutcome::Refused { .. }),
+            "a fully-qualified ref is not a branch name; got {outcome:?}"
+        );
+        assert!(
+            !f.remote_refs().iter().any(|r| r.contains("refs/heads/refs")),
+            "no branch may be invented from a ref: {:?}",
+            f.remote_refs()
+        );
+    }
+
+    // ── The "remote does not have it" warning asks the remote ────────────
+    //
+    // `remote_branch_exists` read `refs/remotes/origin/<branch>`, which is
+    // the *local* remote-tracking ref. On any clone that is not a full clone
+    // the answer was "no" for a branch the remote has had for ever — so the
+    // warning claimed ro created a branch it had in fact **overwritten**,
+    // and advised `git push origin --delete <branch>` on a colleague's work.
+
+    #[test]
+    fn a_branch_the_remote_has_since_before_the_clone_does_not_warn() {
+        let f = Fixture::new();
+        run_git(
+            f.other(),
+            &["push", "-q", "origin", "HEAD:refs/heads/ancient"],
+        );
+        let root = f.repo().parent().unwrap().to_path_buf();
+        let shallow = root.join("shallow");
+        run_git(
+            root.as_path(),
+            &[
+                "clone",
+                "-q",
+                "--single-branch",
+                f.remote_path().to_string_lossy().as_ref(),
+                "shallow",
+            ],
+        );
+        run_git(&shallow, &["remote", "set-head", "origin", "-a"]);
+
+        let tracked = std::process::Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", "refs/remotes/origin/ancient"])
+            .current_dir(&shallow)
+            .output()
+            .expect("git runs");
+        assert!(
+            !tracked.status.success(),
+            "the fixture must have no tracking ref for `ancient`, or it \
+             proves nothing about the local-tracking-ref question"
+        );
+        assert!(
+            super::remote_branch_exists(&shallow, "ancient"),
+            "the remote DOES have `ancient`; asking the tracking refs answers no"
+        );
+
+        let warnings = super::onto_created_warning(&shallow, Some("ancient"));
+        assert!(
+            warnings.is_empty(),
+            "the remote HAS `ancient`; a warning here tells the user to \
+             delete a branch somebody else created: {warnings:?}"
+        );
+    }
+
+    // ── A run with nothing to commit creates no branch ───────────────────
+    //
+    // `has_commits_to_push` answered `true` for any branch the local side
+    // did not have, so a clean tree still pushed, `--onto ghost` created a
+    // remote branch off `main`, and the checkout's upstream was repointed
+    // from `origin/main` to `origin/ghost`.
+
+    #[test]
+    fn onto_with_nothing_to_commit_creates_no_branch() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "work"]);
+        assert!(
+            !f.local_is_dirty(),
+            "the fixture must start clean, or this proves nothing"
+        );
+
+        let plan = plan_on(&f, "work", Some("ghost"));
+        let mut opts = opts_for(&f);
+        // **Outside** the checkout. `RunOptions::state_dir` documents that a
+        // lock inside the worktree makes `git status` report the tool's own
+        // file as uncommitted work; putting it here would make this test
+        // about the lock rather than about the branch.
+        opts.state_dir = f.repo().parent().unwrap().join("state");
+        let outcome = run_one(&plan, &opts);
+
+        assert!(
+            !matches!(outcome, RepoOutcome::Pushed { .. }),
+            "there was nothing to push; a `pushed` row over a clean tree is \
+             the bug: {outcome:?}"
+        );
+        assert!(
+            !f.remote_has("ghost"),
+            "no branch may be invented from nothing: {:?}",
+            f.remote_refs()
+        );
+        let upstream = std::process::Command::new("git")
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{u}",
+            ])
+            .current_dir(f.repo())
+            .output()
+            .expect("git runs");
+        assert!(
+            !String::from_utf8_lossy(&upstream.stdout).contains("ghost"),
+            "the checkout's upstream must not be repointed: {}",
+            String::from_utf8_lossy(&upstream.stdout)
+        );
+    }
+}
+
+#[cfg(test)]
+mod extraheader_host_tests {
+    use super::extraheader_host;
+
+    /// A URL scheme is case-insensitive, so the scoping rule must be too.
+    ///
+    /// `HTTP://host/…` names the same origin as `http://host/…`, but the
+    /// scheme was matched exactly, so an uppercase one returned `None`: no
+    /// header was scoped, the row's credential was dropped, and the user saw
+    /// git's `remote-HTTP is not a git command` — which names neither the
+    /// scheme nor the credential, and is the message you get when you have
+    /// run out of ideas.
+    #[test]
+    fn the_scheme_is_matched_case_insensitively_and_emitted_lower_cased() {
+        for spelling in ["HTTP://example.invalid/o/r.git", "Http://example.invalid/o/r.git"] {
+            assert_eq!(
+                extraheader_host(spelling).as_deref(),
+                Some("http://example.invalid"),
+                "the scheme is case-insensitive by RFC 3986; {spelling:?} names \
+                 the same origin as the lowercase spelling"
+            );
+        }
+        assert_eq!(
+            extraheader_host("HTTPS://example.invalid/o/r.git").as_deref(),
+            Some("https://example.invalid")
+        );
+    }
+
+    /// The negative control, and the property a case-insensitive match must
+    /// not break: a non-HTTP remote still gets no header at all.
+    #[test]
+    fn a_non_http_remote_still_gets_no_header() {
+        for url in [
+            "git@example.invalid:o/r.git",
+            "ssh://git@example.invalid/o/r.git",
+            "/srv/local/repo.git",
+            "example.invalid/o/r.git",
+            "https://",
+        ] {
+            assert_eq!(
+                extraheader_host(url),
+                None,
+                "{url:?} has no HTTP origin to scope a credential to"
+            );
+        }
+    }
+
+    /// The port is part of the host, and two rows on the same host name and
+    /// different ports are two different servers.
+    #[test]
+    fn the_port_is_part_of_the_scoped_host() {
+        assert_eq!(
+            extraheader_host("http://127.0.0.1:39229/team/api.git").as_deref(),
+            Some("http://127.0.0.1:39229")
+        );
     }
 }
 

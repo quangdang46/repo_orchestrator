@@ -30,6 +30,22 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
         );
     }
 
+    // `[agent].engine` was the one key `ro config set` wrote without checking.
+    // Every sibling — `core.layout`, `github.auth`, `core.parallel`,
+    // `core.timeout_secs` — is refused at write time, so `ro config set
+    // 'agent.engine="bogus"'` exited 0, printed `Set agent.engine = "bogus"`,
+    // and wrote it. The cost was deferred to the next fleet run, which died
+    // for **every** repo: `ro commit --dry-run` → exit 70, `error planning
+    // o/30: unknown engine "bogus"`. A typo in a flag value is reported at the
+    // flag; a typo in a config value must be reported at the config.
+    if let Some(engine) = cfg.agent.engine.as_deref() {
+        if !["claude", "codex", "git"].contains(&engine) {
+            bail!(
+                "agent.engine: '{engine}' is not valid (expected: claude | codex | git)"
+            );
+        }
+    }
+
     // Everything else this used to validate is gone with its table:
     // `git.update_strategy`, `jobs.*`, `checkpoint.*` and `safety.*`.
     //
@@ -70,6 +86,30 @@ mod tests {
     }
 
     #[test]
+    /// `[agent].engine` is the one key `ro config set` used to write without
+    /// checking. Every sibling is refused at write time, so a typo here was
+    /// accepted at exit 0 and then failed the **next fleet run**, once per
+    /// repo: `error planning o/30: unknown engine "bogus"`.
+    #[test]
+    fn an_unknown_agent_engine_is_rejected() {
+        let mut cfg = AppConfig::default();
+        cfg.agent.engine = Some("bogus".into());
+        validate(&cfg).expect_err("an unknown engine must fail validation");
+
+        for good in ["claude", "codex", "git"] {
+            let mut cfg = AppConfig::default();
+            cfg.agent.engine = Some(good.into());
+            validate(&cfg).unwrap_or_else(|e| panic!("{good} must validate: {e}"));
+        }
+    }
+
+    /// The negative control: `None` is "use the default", not "a bad value".
+    #[test]
+    fn an_unset_agent_engine_is_valid() {
+        let cfg = AppConfig::default();
+        validate(&cfg).expect("the shipped default validates");
+    }
+
     fn zero_parallel_rejected() {
         let mut cfg = AppConfig::default();
         cfg.core.parallel = 0;

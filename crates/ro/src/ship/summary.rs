@@ -81,6 +81,14 @@ impl Summary {
                     "account": r.account,
                     "outcome": r.outcome.render(),
                     "failed": r.outcome.is_failure(),
+                    // An array, never a bare string, so a consumer can
+                    // iterate it without a type check per row. Empty for
+                    // every row that has nothing to say, which is nearly
+                    // all of them: a warning that is always present is a
+                    // field nobody reads. Read off the outcome rather than
+                    // a second copy on the row, so the table a person reads
+                    // and the object a script reads cannot disagree.
+                    "warnings": r.outcome.warnings(),
                 })
             })
             .collect();
@@ -195,6 +203,14 @@ impl Summary {
                 r.engine,
                 r.outcome.render()
             );
+            // Under the row it belongs to, indented past the columns, so
+            // it reads as a note about that repo and not as a line of its
+            // own. A warning printed once at the end of the table would be
+            // unattributable in a fleet run: twenty rows and one warning
+            // says nothing about which of the twenty it is about.
+            for warning in r.outcome.warnings() {
+                let _ = writeln!(out, "    warning: {warning}");
+            }
         }
         // Skips are counted and named. The exit code deliberately does not
         // turn on them — see `RepoOutcome::is_failure` — but "0 failed" over
@@ -233,12 +249,17 @@ mod tests {
         }
     }
 
+    /// A push with nothing to warn about, which is nearly every push.
+    fn pushed(oid: &str) -> RepoOutcome {
+        RepoOutcome::Pushed {
+            oid: oid.into(),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn a_clean_run_exits_zero() {
-        let s = Summary::new(vec![
-            row("acme/a", RepoOutcome::Pushed { oid: "aaa".into() }),
-            row("acme/b", RepoOutcome::Pushed { oid: "bbb".into() }),
-        ]);
+        let s = Summary::new(vec![row("acme/a", pushed("aaa")), row("acme/b", pushed("bbb"))]);
         assert_eq!(s.counts(), (2, 0));
         assert_eq!(s.pushed(), 2);
     }
@@ -248,7 +269,7 @@ mod tests {
     #[test]
     fn one_failure_among_successes_exits_one() {
         let s = Summary::new(vec![
-            row("acme/a", RepoOutcome::Pushed { oid: "aaa".into() }),
+            row("acme/a", pushed("aaa")),
             row(
                 "acme/bad",
                 RepoOutcome::Failed {
@@ -256,7 +277,7 @@ mod tests {
                     class: ro_core::FailureClass::MissingProvider,
                 },
             ),
-            row("acme/c", RepoOutcome::Pushed { oid: "ccc".into() }),
+            row("acme/c", pushed("ccc")),
         ]);
         assert_eq!(
             s.counts(),
@@ -317,6 +338,121 @@ mod tests {
     fn an_empty_selection_says_so() {
         assert!(Summary::default().render().contains("no repos selected"));
         assert_eq!(Summary::default().counts(), (0, 0));
+    }
+
+    /// A warning reaches the **text** surface, under the row it is about.
+    ///
+    /// The table is what a person reads, and a warning that exists only in
+    /// the JSON is a warning a person never sees. It is printed under its
+    /// row rather than collected at the end, because in a fleet run a
+    /// warning at the foot of the table is unattributable: twenty rows and
+    /// one warning says nothing about which of the twenty it concerns.
+    #[test]
+    fn a_warning_is_printed_under_the_row_it_belongs_to() {
+        let r = row(
+            "acme/a",
+            RepoOutcome::Pushed {
+                oid: "aaa".into(),
+                warnings: vec![
+                    "--onto new: the remote does not have it. ro created it.".into()
+                ],
+            },
+        );
+        let text = Summary::new(vec![r]).render();
+
+        let row_line = text
+            .lines()
+            .position(|l| l.contains("acme/a"))
+            .expect("the row is printed");
+        let warning_line = text
+            .lines()
+            .position(|l| l.contains("warning: --onto new"))
+            .expect("the warning is printed");
+        assert_eq!(
+            warning_line,
+            row_line + 1,
+            "the warning must sit directly under its row, got:\n{text}"
+        );
+    }
+
+    /// And the **json** surface, which is the consumer most likely to act
+    /// on a run it was not watching.
+    ///
+    /// An array, never a bare string: a consumer has to iterate it, and a
+    /// type check per row is how a reader starts guessing. Empty for a row
+    /// with nothing to say, which is nearly all of them.
+    #[test]
+    fn a_warning_reaches_the_json_row() {
+        let r = row(
+            "acme/a",
+            RepoOutcome::Pushed {
+                oid: "aaa".into(),
+                warnings: vec!["--onto new: the remote does not have it.".into()],
+            },
+        );
+        let json = Summary::new(vec![r]).render_json(OutputFormat::Json);
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&json).expect("the json parses");
+        let row = &doc["repos"][0];
+        let warnings = row["warnings"]
+            .as_array()
+            .expect("warnings is an array, not a bare string");
+        assert_eq!(warnings.len(), 1, "got: {json}");
+        assert!(
+            warnings[0].as_str().unwrap().contains("--onto new"),
+            "the warning must be the row's own, got: {json}"
+        );
+    }
+
+    /// The same row in `ndjson`, which is the format a streaming consumer
+    /// reads. A warning that reaches `json` but not `ndjson` is a warning
+    /// that reaches the reader who was not watching.
+    #[test]
+    fn a_warning_reaches_the_ndjson_row() {
+        let r = row(
+            "acme/a",
+            RepoOutcome::Pushed {
+                oid: "aaa".into(),
+                warnings: vec!["--onto new: the remote does not have it.".into()],
+            },
+        );
+        let ndjson = Summary::new(vec![r]).render_json(OutputFormat::Ndjson);
+
+        let line = ndjson
+            .lines()
+            .find(|l| l.contains("\"label\":\"acme/a\""))
+            .expect("the row is one line of ndjson");
+        let v: serde_json::Value = serde_json::from_str(line).expect("the line parses");
+        let warnings = v["warnings"].as_array().expect("warnings is an array");
+        assert_eq!(warnings.len(), 1, "got: {line}");
+        assert!(
+            warnings[0].as_str().unwrap().contains("--onto new"),
+            "the warning must be on the row, got: {line}"
+        );
+    }
+
+    /// A clean row carries an empty array, not a missing field.
+    ///
+    /// A consumer that has to distinguish "no warnings" from "this build
+    /// has no warnings field" is a consumer that guesses, and the guess is
+    /// usually "no warnings" — which is the wrong answer on the run that
+    /// published a branch.
+    #[test]
+    fn a_row_with_nothing_to_say_carries_an_empty_warnings_array() {
+        let json = Summary::new(vec![row(
+            "acme/a",
+            RepoOutcome::Pushed {
+                oid: "aaa".into(),
+                warnings: Vec::new(),
+            },
+        )])
+        .render_json(OutputFormat::Json);
+        let doc: serde_json::Value = serde_json::from_str(&json).expect("the json parses");
+        let warnings = doc["repos"][0]["warnings"]
+            .as_array()
+            .expect("warnings is present and an array");
+        assert!(warnings.is_empty(), "got: {json}");
     }
 }
 

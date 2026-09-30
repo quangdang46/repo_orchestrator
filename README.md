@@ -398,8 +398,14 @@ ro config set 'agent.engine="codex"'
 
 `[identity]` and `[agent]` are the tables that do something. `[core]`'s
 `layout`, `parallel`, `projects_dir` and `timeout_secs` and `[github]`'s
-`host` and `auth` are accepted and printed but read by nothing — see
-FEATURES.md.
+`host` and `auth` are all read: `layout` decides where a clone lands,
+`parallel` bounds a fleet sync, `projects_dir` is where clones go,
+`timeout_secs` is the per-git deadline, and `host`/`auth` decide which API
+a credential is offered to. `ro config set` validates every one of them at
+write time — `core.layout="bogus"`, `github.auth="bogus"`,
+`core.parallel=0` and `agent.engine="bogus"` are all refused — so a value
+that would only fail at run time, once per repo per run, is caught at the
+flag.
 
 ### Checksum verification failed
 

@@ -52,6 +52,26 @@ pub struct FetchOpts {
     pub prune: bool,
     pub tags: bool,
     pub depth: Option<u32>,
+    /// Which host the `extraheader` is scoped to. `None` means **no
+    /// credential mechanism**, and that is load-bearing for the same
+    /// reason it is on [`PushOpts::host`]: the header is an HTTP mechanism
+    /// and SSH authenticates with keys.
+    ///
+    /// Both fields here exist because `fetch` used to run with
+    /// `RunOpts::none()` — no credential, no wrapper — while the push on
+    /// the same row carried one. A private HTTPS remote is the only case
+    /// where a per-row credential is needed at all, and that is exactly
+    /// where the fetch went out anonymously and the run died before
+    /// reaching the push that did carry the token.
+    pub host: Option<String>,
+    /// Which binary to spawn. `None` means `git`.
+    ///
+    /// The same seam as [`PushOpts::program`], and for the same reason: a
+    /// test of "did the credential reach the fetch" has to be able to put
+    /// a reporting shim where the real `git` would be, or it is only
+    /// reading the code.
+    #[serde(skip)]
+    pub program: Option<String>,
 }
 
 /// Options for `pull`.
@@ -105,6 +125,14 @@ pub struct CloneOpts {
     pub depth: Option<u32>,
     pub branch: Option<String>,
     pub recurse_submodules: bool,
+    /// Which binary to spawn. `None` means `git`.
+    ///
+    /// The same seam as [`PushOpts::program`] and [`FetchOpts::program`],
+    /// present so a test of "did the credential reach the clone" can put a
+    /// reporting shim where the real `git` would be. Without it the only way
+    /// to test this is to read the code.
+    #[serde(skip)]
+    pub program: Option<String>,
 }
 
 /// Outcome of a clone.
@@ -455,7 +483,46 @@ fn spawn_with_timeout(
 
 /// Fetch refs from a remote.
 pub fn fetch(repo: &Path, opts: &FetchOpts) -> Result<GitCommandResult> {
-    fetch_in(repo, opts, &RunOpts::none())
+    fetch_with_credential(repo, opts, None)
+}
+
+/// [`fetch`], optionally authenticating with a resolved credential for this
+/// invocation only.
+///
+/// The pair this sits beside — `fetch_with_credential` and
+/// `push_with_credential` — is one decision made twice, and getting it wrong
+/// on one side is invisible: a `ro ship` of a **private** repo failed at the
+/// fetch with `fatal: Authentication failed`, having pushed nothing, while the
+/// push two hundred lines later was handed a token and would have worked. The
+/// only case that needs a credential is the only case where the fetch was
+/// anonymous.
+///
+/// The secret stays an argument rather than a field on `FetchOpts` for the
+/// reason it is an argument on `push_with_credential`: these structs derive
+/// `Serialize`, and a secret that can be serialized into a report is a secret
+/// that eventually is.
+///
+/// `None` is not "empty credential" — it is **no credential mechanism**, and
+/// the answer is no header at all rather than a blank `Authorization` sent to
+/// a remote that will reject it.
+pub fn fetch_with_credential(
+    repo: &Path,
+    opts: &FetchOpts,
+    token: Option<&SecretString>,
+) -> Result<GitCommandResult> {
+    // `None` host means "this remote has no credential mechanism", and the
+    // answer is **no header at all** — not a header aimed at a host the
+    // caller never named. Same rule, same reason, same shape as the push.
+    let env = match (token, opts.host.as_deref()) {
+        (Some(t), Some(host)) => extraheader_env(host, t),
+        _ => Vec::new(),
+    };
+    let run_opts = RunOpts {
+        env: &env,
+        timeout: None,
+        program: opts.program.as_deref(),
+    };
+    fetch_in(repo, opts, &run_opts)
 }
 
 /// [`fetch`], handed the caller's per-invocation settings.
@@ -476,6 +543,12 @@ pub fn fetch(repo: &Path, opts: &FetchOpts) -> Result<GitCommandResult> {
 /// have meant a mechanical edit to every call site to pass an argument none of
 /// them have any use for, which is how a deadline requirement decays into a
 /// default nobody notices.
+///
+/// **`run` is the whole environment here.** `FetchOpts::host` and
+/// `FetchOpts::program` are read by [`fetch_with_credential`], which composes
+/// them into a `RunOpts` before calling this; a caller that brings its own
+/// `RunOpts` is bringing its own env and its own binary, and mixing the two
+/// sources is how "which credential went to which host" becomes unanswerable.
 pub fn fetch_in(repo: &Path, opts: &FetchOpts, run: &RunOpts<'_>) -> Result<GitCommandResult> {
     let mut args: Vec<String> = vec!["fetch".to_string()];
     if opts.prune {
@@ -642,7 +715,7 @@ pub fn pull_in(repo: &Path, opts: &PullOpts, run: &RunOpts<'_>) -> Result<PullOu
 /// --autostash` returns 0 either way. A `UU` entry is a file holding
 /// conflict markers; an `AU`/`UA` is a file one side added and the other
 /// changed. Both are a pop that did not finish.
-fn unmerged_paths(repo: &Path, run: &RunOpts<'_>) -> Vec<String> {
+pub fn unmerged_paths(repo: &Path, run: &RunOpts<'_>) -> Vec<String> {
     // `run_in` rather than a bare `Command`, so this read carries the caller's
     // deadline: a tree read that cannot answer must not be the thing that
     // keeps a fleet run from finishing. It also means the read goes out with
@@ -762,6 +835,38 @@ pub fn clone(url: &str, dest: &Path, opts: &CloneOpts) -> Result<CloneOutcome> {
     clone_in(url, dest, opts, &RunOpts::none())
 }
 
+/// [`clone`], optionally authenticating with a resolved credential for this
+/// invocation only.
+///
+/// The same pair as [`fetch_with_credential`] and [`push_with_credential`],
+/// and for the same reason: `ro add <url> --credential` validated the
+/// reference, stored it on the row, and then cloned **anonymously**, so a
+/// private repository could not be enrolled by URL at all — the clone failed
+/// with `fatal: could not read Username` and no row was registered. The flag
+/// was accepted, echoed, and unused for the one operation it was given for.
+///
+/// `None` is not "empty credential": it is **no credential mechanism**, and
+/// the answer is no header at all rather than a blank `Authorization` sent to
+/// a remote that will reject it.
+pub fn clone_with_credential(
+    url: &str,
+    dest: &Path,
+    opts: &CloneOpts,
+    host: Option<&str>,
+    token: Option<&SecretString>,
+) -> Result<CloneOutcome> {
+    let env = match (token, host) {
+        (Some(t), Some(host)) => extraheader_env(host, t),
+        _ => Vec::new(),
+    };
+    let run_opts = RunOpts {
+        env: &env,
+        timeout: None,
+        program: opts.program.as_deref(),
+    };
+    clone_in(url, dest, opts, &run_opts)
+}
+
 /// [`clone`], handed the caller's per-invocation settings.
 ///
 /// A clone is the run's most expensive git call and the only one that can
@@ -879,7 +984,11 @@ pub fn commit(repo: &Path, files: &[PathBuf], message: &str) -> Result<String> {
 /// premise is that a credential in the wrong place leaks should not be the one
 /// putting it there. `RunOpts` already exists to carry per-invocation
 /// environment, which is why this is not a `-c` argument.
-fn extraheader_env(origin: &str, token: &SecretString) -> Vec<(String, String)> {
+///
+/// `pub` because a caller that composes **its own** `RunOpts` — a fleet sync,
+/// which carries a deadline as well as a credential — has to be able to build
+/// the same env rather than a second, subtly different spelling of it.
+pub fn extraheader_env(origin: &str, token: &SecretString) -> Vec<(String, String)> {
     // GitHub's documented form for a token over HTTPS. The password half is
     // the token; the username is a fixed marker, not a login.
     let credentials = format!("x-access-token:{}", token.expose());
@@ -1693,6 +1802,229 @@ echo PROBE_ARGS=%*
                 .contains("GIT_CONFIG_KEY_0=http.http://127.0.0.1:8080/.extraheader"),
             "the header must be scoped to the host actually requested, stdout: {:?}",
             pushed.stdout
+        );
+    }
+
+    // The fetch half of the same rule. Every assertion above is about a
+    // `push`, and the fetch used to be the one network call in a `ro ship`
+    // that went out with `RunOpts::none()` — so a private HTTPS repo, the
+    // only case where a per-row credential is needed at all, failed at the
+    // fetch and never reached the push that did carry the token. These five
+    // are the fetch's own, because a push test cannot see a fetch that
+    // never happened.
+
+    /// A fetch with a resolved credential hands it to the child, scoped to
+    /// the host the caller named.
+    ///
+    /// The shim is the whole point: asserting that `fetch_with_credential`
+    /// *built* the right environment proves nothing, and the failure being
+    /// designed against is a credential that is resolved and then dropped on
+    /// the way to the child. What the shim prints is what the child was
+    /// actually handed.
+    #[test]
+    fn a_fetch_with_a_credential_hands_it_to_the_child() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let shim_str = shim.to_str().expect("a UTF-8 shim path").to_string();
+
+        let token = SecretString::new("ghp_fetch_marker");
+        let fetched = fetch_with_credential(
+            &repo,
+            &FetchOpts {
+                host: Some("https://github.com".into()),
+                program: Some(shim_str),
+                ..Default::default()
+            },
+            Some(&token),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            fetched.stdout.contains("PROBE_ARGS="),
+            "the shim must be the binary that ran, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            fetched.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "a fetch with a credential must carry a header, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            fetched
+                .stdout
+                .contains("GIT_CONFIG_KEY_0=http.https://github.com/.extraheader"),
+            "the header must be scoped to the host actually requested, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            fetched.stdout.contains("AUTHORIZATION: basic "),
+            "the header must be an Authorization header, stdout: {:?}",
+            fetched.stdout
+        );
+        // The token itself, so the test fails if the value is ever dropped
+        // rather than only if the key is. Base64, because that is what the
+        // header carries — the plaintext would be a leak in the log.
+        assert!(
+            fetched.stdout.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX2ZldGNoX21hcmtlcg=="),
+            "the resolved secret must reach the child, stdout: {:?}",
+            fetched.stdout
+        );
+    }
+
+    /// The fetch's own version of `no_credential_means_no_header`.
+    ///
+    /// A fetch with no credential is the ordinary case — a public repo, a
+    /// machine whose SSH key is already right — and it must not send a blank
+    /// `Authorization` that a remote will answer with a 401.
+    #[test]
+    fn a_fetch_with_no_credential_sends_no_header() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let shim_str = shim.to_str().expect("a UTF-8 shim path").to_string();
+
+        let fetched = fetch_with_credential(
+            &repo,
+            &FetchOpts {
+                host: Some("https://github.com".into()),
+                program: Some(shim_str),
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("the shim runs");
+
+        assert!(
+            fetched.stdout.contains("PROBE_ARGS="),
+            "the shim must be the binary that ran, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            !fetched.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "with no credential there must be no extraheader at all, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            !fetched.stdout.contains("AUTHORIZATION"),
+            "no authorization header may be fabricated without a credential, stdout: {:?}",
+            fetched.stdout
+        );
+    }
+
+    /// An SSH remote gets **no** header from a fetch either, even with a
+    /// credential resolved — the fetch's own version of the wrong-account
+    /// bug, where a token from any row was aimed at `github.com` and handed
+    /// to a transport that must not have it.
+    #[test]
+    fn a_fetch_to_an_ssh_remote_gets_no_fabricated_header() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let shim_str = shim.to_str().expect("a UTF-8 shim path").to_string();
+
+        let token = SecretString::new("ghp_ssh_fetch_marker");
+        let fetched = fetch_with_credential(
+            &repo,
+            &FetchOpts {
+                host: None,
+                program: Some(shim_str),
+                ..Default::default()
+            },
+            Some(&token),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            fetched.stdout.contains("PROBE_ARGS="),
+            "the shim must be the binary that ran, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            !fetched.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "an SSH remote must not receive an extraheader, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            !fetched.stdout.contains("AUTHORIZATION"),
+            "no authorization header may be fabricated for a non-HTTP remote, stdout: {:?}",
+            fetched.stdout
+        );
+    }
+
+    /// A plain-HTTP remote still gets its credential from a fetch.
+    ///
+    /// The scheme is part of the scope on purpose: a header scoped to
+    /// `https://` is silently dropped by a remote requested over `http://`,
+    /// and the fetch then falls back to the machine's credential helper —
+    /// which is a fetch as the wrong account, or a modal dialog on the
+    /// user's screen.
+    #[test]
+    fn a_fetch_to_a_plain_http_remote_gets_its_scoped_header() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let shim_str = shim.to_str().expect("a UTF-8 shim path").to_string();
+
+        let token = SecretString::new("ghp_plain_http_fetch_marker");
+        let fetched = fetch_with_credential(
+            &repo,
+            &FetchOpts {
+                host: Some("http://127.0.0.1:8080".into()),
+                program: Some(shim_str),
+                ..Default::default()
+            },
+            Some(&token),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            fetched.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "an HTTP remote must still receive a header, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            fetched
+                .stdout
+                .contains("GIT_CONFIG_KEY_0=http.http://127.0.0.1:8080/.extraheader"),
+            "the header must be scoped to the host actually requested, stdout: {:?}",
+            fetched.stdout
+        );
+    }
+
+    /// The two-spell shape is the whole API, and the short one is the one
+    /// every existing caller uses — so it has to be the anonymous fetch it
+    /// always was, not a fetch that grew a credential nobody asked for.
+    #[test]
+    fn the_short_fetch_still_runs_anonymously() {
+        let tmp = TempDir::new().unwrap();
+        let shim = env_reporting_shim(&tmp.path().join("bin"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let shim_str = shim.to_str().expect("a UTF-8 shim path").to_string();
+
+        let fetched = fetch(
+            &repo,
+            &FetchOpts {
+                program: Some(shim_str),
+                ..Default::default()
+            },
+        )
+        .expect("the shim runs");
+
+        assert!(
+            fetched.stdout.contains("PROBE_ARGS="),
+            "the shim must be the binary that ran, stdout: {:?}",
+            fetched.stdout
+        );
+        assert!(
+            !fetched.stdout.contains("GIT_CONFIG_COUNT=1"),
+            "`fetch` must not invent a credential, stdout: {:?}",
+            fetched.stdout
         );
     }
 

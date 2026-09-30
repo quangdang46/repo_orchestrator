@@ -2690,6 +2690,7 @@ dependencies = [
  "ro-sweep",
  "ro-sync",
  "ro-testkit",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

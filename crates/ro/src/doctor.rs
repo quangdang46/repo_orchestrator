@@ -387,6 +387,38 @@ fn resolve_row_credential(
     })
 }
 
+/// Is this remote one the permissions probe can actually ask?
+///
+/// `false` for a host that is neither the public GitHub nor the configured
+/// `github.host`. A row on such a remote is not probed, because the check
+/// cannot validate a credential for a remote it does not talk to — see the
+/// call site.
+///
+/// The host is read out of the **port** as well as the name, because a test
+/// and a GitHub Enterprise both live on `example.com:PORT` and a name-only
+/// comparison would probe every one of them.
+fn probes_github_api(remote: &str, base_uri: Option<&str>) -> bool {
+    let Some((_, host)) = remote.split_once("://") else {
+        return true;
+    };
+    // The public API is always one of these two; `github.host` adds the
+    // Enterprise case on top.
+    if matches!(host, "github.com" | "api.github.com") {
+        return true;
+    }
+    match base_uri {
+        Some(h) => {
+            let configured = h
+                .split("://")
+                .last()
+                .unwrap_or(h)
+                .trim_end_matches('/');
+            host == configured
+        }
+        None => false,
+    }
+}
+
 /// Probe write access for every tracked repo.
 ///
 /// One [`CheckResult`] per repo rather than a single rolled-up verdict,
@@ -452,6 +484,35 @@ fn check_repo_write_access(
         // string that belongs in a listing, not in a sentence about a URL.
         let slug = format!("{}/{}", repo.owner, repo.name);
         let name = format!("repo:{slug}");
+
+        // A row whose remote is **not** the GitHub API this check talks to is
+        // not probed at all.
+        //
+        // The check asks "will a push to this repo be refused?", and the only
+        // thing it can ask is the GitHub permissions API. For a repo on a
+        // self-hosted HTTP remote the row's credential is perfectly valid for
+        // that remote — `ro ship` over the same row authenticates and pushes —
+        // and completely meaningless to the API, which answers 401. So the
+        // check reported a **permanent** "token rejected by GitHub (HTTP 401)"
+        // for a working token, on every run, with no way for the user to
+        // clear it. The git server saw zero requests from doctor.
+        //
+        // Skipped, not failed, and it says why: the honest answer is "this
+        // check does not apply to this row", which is a fact about the check
+        // rather than about the credential.
+        if let Some(remote) = ro_sync::manage::extraheader_host(&repo.clone_url)
+            && !probes_github_api(&remote, base_uri)
+        {
+            results.push(CheckResult::ok(
+                &name,
+                Severity::Optional,
+                format!(
+                    "write: not checked — this repo's remote is {remote}, not the GitHub API, \
+                     so its credential cannot be validated here",
+                ),
+            ));
+            continue;
+        }
 
         // The credential this row will actually be pushed with. A row that
         // names one is probed with it; a row that does not falls back to

@@ -80,6 +80,112 @@ fn schema_emits_valid_json_with_an_identity() {
     );
 }
 
+/// The root's own args are part of the machine-readable surface.
+///
+/// `--config-dir`, `--state-dir` and `--non-interactive` are `global = true`,
+/// so clap stores them on the root command and accepts them on every
+/// subcommand. A consumer that only read `commands[]` could not discover a
+/// single one of them — which is exactly why they went undocumented for so
+/// long. This asserts the root's args are present and named, so the omission
+/// cannot come back silently.
+#[test]
+fn schema_exposes_the_root_commands_own_args() {
+    let s = schema();
+    let root_args = s["args"]
+        .as_array()
+        .expect("schema should carry the root command's own args");
+
+    let longs: Vec<&str> = root_args
+        .iter()
+        .filter_map(|a| a["long"].as_str())
+        .collect();
+
+    for flag in ["--config-dir", "--state-dir", "--non-interactive"] {
+        assert!(
+            longs.contains(&flag),
+            "the schema's root args should include {flag}. It is `global = true`, \
+             so it is accepted on every subcommand but lives on the root — a \
+             consumer reading only `commands[]` cannot see it.\n\
+             root args: {longs:?}"
+        );
+    }
+}
+
+/// `values` is published only for an arg that actually takes a value.
+///
+/// clap's model gives a `SetTrue` flag possible values — `--non-interactive`
+/// reports `["true", "false"]` — but the flag consumes no operand. Publishing
+/// that list told a consumer to build `--non-interactive=true`, which the
+/// binary rejects with "unexpected value ... no more were expected". A
+/// machine-readable reference that advertises an invocation the binary refuses
+/// is the same defect class as a flag with no help text.
+#[test]
+fn schema_publishes_values_only_for_args_that_take_a_value() {
+    let s = schema();
+
+    fn check(command: &Value, path: &str, problems: &mut Vec<String>) {
+        for a in command["args"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            let name = a["long"].as_str().unwrap_or_else(|| {
+                a["name"].as_str().unwrap_or("<unnamed>")
+            });
+            // The schema publishes `takes_value`, so the assertion can be
+            // made about the RIGHT thing rather than inferred.
+            //
+            // The test previously asserted the opposite — "nothing publishes
+            // values" — which is false for every `--format` and `--strategy`
+            // in the tool, and would have failed the moment the traversal was
+            // fixed to actually reach them. `--format` genuinely takes a
+            // value: `ro list --format` with no operand is a usage error
+            // naming the three permitted values, so publishing them is
+            // exactly what a consumer needs.
+            let takes = a["takes_value"].as_bool().unwrap_or(false);
+            if takes && a.get("values").is_none() && a.get("enumerated").is_some() {
+                problems.push(format!("{path} {name} takes a value but publishes none"));
+            }
+            if !takes && a.get("values").is_some() {
+                problems.push(format!(
+                    "{path} {name} publishes a values list but takes no operand, so a \
+                     consumer would build `--{name}=…`, which the binary rejects"
+                ));
+            }
+        }
+        for sub in command["subcommands"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+            let name = sub["name"].as_str().unwrap_or("?");
+            check(sub, &format!("{path} {name}"), problems);
+        }
+    }
+
+    let mut problems = Vec::new();
+    // The root hangs its children off `commands`, not `subcommands` — and
+    // this used to call `check` on the root, which reads `subcommands`, finds
+    // nothing, and so visited only the three global args. The test passed
+    // while covering 3 of 89: a green suite that is not running the test it
+    // claims to run, which is worse than no test because it counts as
+    // coverage it did not provide.
+    //
+    // So the root's own args are checked directly, and each child is walked
+    // through `check`, which descends `subcommands` from there on.
+    check(&s, "ro", &mut problems);
+    for sub in s["commands"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+    {
+        let name = sub["name"].as_str().unwrap_or("?");
+        check(sub, &format!("ro {name}"), &mut problems);
+    }
+
+    assert!(
+        problems.is_empty(),
+        "a value list and a takes_value flag that disagree:\n  {}\n\
+         A `SetTrue` flag has possible values in clap's model, but it consumes \
+         no value — `--non-interactive=true` is a usage error. An arg that \
+         does consume a value must publish the values it accepts, or a \
+         consumer cannot tell what to pass it.",
+        problems.join("\n  ")
+    );
+}
+
 #[test]
 fn schema_contains_every_expected_command() {
     let s = schema();

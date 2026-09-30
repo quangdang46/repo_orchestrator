@@ -30,15 +30,32 @@ use crate::ship::summary::OutputFormat;
 #[derive(Debug, Parser)]
 #[command(name = "ro", about = "GitHub-first repo orchestration CLI", version, long_about = None)]
 struct Cli {
-    /// Override the config directory (default: $XDG_CONFIG_HOME/ro)
+    /// Where ro keeps its config: config.toml and the tracked-repo registry.
+    ///
+    /// Accepted before or after the subcommand, because it is `global`. The
+    /// default is `$XDG_CONFIG_HOME/ro`, falling back to `~/.config/ro`.
+    /// Overriding only this directory leaves the state directory alone, so the
+    /// two can point at different installs.
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
 
-    /// Override the state directory (default: $XDG_STATE_HOME/ro)
+    /// Where ro keeps durable state: the state.db registry and per-run logs.
+    ///
+    /// Accepted before or after the subcommand, because it is `global`. The
+    /// default is `$XDG_STATE_HOME/ro`, falling back to `~/.local/state/ro`.
+    /// Overriding only this directory also moves the disposable cache to
+    /// `<state-dir>/cache`, so the cache never sits beside a different
+    /// installation's durable state.
     #[arg(long, global = true)]
     state_dir: Option<PathBuf>,
 
-    /// Never prompt for confirmation
+    /// Skip the confirmation prompt and act without asking.
+    ///
+    /// Takes no value: `--non-interactive`, never `--non-interactive=true`.
+    /// Today it gates exactly one prompt — the "Type 'y' to delete it" consent
+    /// before `ro remove --delete` destroys a working copy. Without it, that
+    /// prompt is refused when stdin is not a terminal, so a CI run must pass
+    /// this flag rather than pipe an answer in.
     #[arg(long, global = true)]
     non_interactive: bool,
 
@@ -848,7 +865,15 @@ fn schema_json() -> serde_json::Value {
         if let Some(h) = a.get_help() {
             o.insert("help".into(), h.to_string().into());
         }
-        if !a.get_possible_values().is_empty() {
+        // `values` is only meaningful for an arg that takes a value. A
+        // `SetTrue` flag has possible values in clap's model — `--non-interactive`
+        // reports `["true", "false"]` — but the flag consumes no operand, so
+        // publishing the list told a consumer to build `--non-interactive=true`,
+        // which clap rejects as "unexpected value ... no more were expected".
+        // A machine-readable reference that advertises an invocation the binary
+        // refuses is the same defect class as a flag with no help text, so the
+        // list is gated on the arg actually taking a value.
+        if !a.get_possible_values().is_empty() && a.get_action().takes_values() {
             o.insert(
                 "values".into(),
                 a.get_possible_values()
@@ -858,6 +883,14 @@ fn schema_json() -> serde_json::Value {
                     .into(),
             );
         }
+        // `takes_value`, so a consumer can tell an arg that consumes an
+        // operand from a `SetTrue` flag without guessing from the presence of
+        // a `values` list. Without it the two are distinguishable only when
+        // the arg has possible values at all, and `--message <MSG>` consumes
+        // an operand with no list — so a consumer building an invocation had
+        // no published fact to consult. The schema is the tool's machine
+        // contract; what it leaves out is a fact the binary knows.
+        o.insert("takes_value".into(), a.get_action().takes_values().into());
         serde_json::Value::Object(o)
     }
 
@@ -914,7 +947,22 @@ fn schema_json() -> serde_json::Value {
     serde_json::Value::Object(o)
 }
 
-/// Resolve multi-repo targets from --repos/--filter/--all flags.
+/// An unknown repo name on `tag` / `untag` / `tags` is a **usage** error.
+///
+/// `ro_sync::tags::repo_id` returns a plain `anyhow::Context` error, so the
+/// top-level handler downcast to `FatalError`, found none, and reported
+/// `EX_FATAL` — a mistyped repo name reported as a broken install, on three
+/// verbs, where every sibling verb (`ro status nosuchrepo`) reports `EX_USAGE`.
+/// That is the exact confusion `exit.rs` documents the 64/70 split as
+/// existing to prevent.
+fn usage_for_tag_verb(e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<exit::FatalError>().is_some() {
+        return e;
+    }
+    exit::FatalError::usage(format!("{e:#}")).into()
+}
+
+/// Resolve multi-repo targets from --pattern/--filter/--all flags.
 fn run() -> Result<()> {
     use ro_sync::manage;
     use ro_sync::status;
@@ -1620,7 +1668,15 @@ fn run() -> Result<()> {
             prune,
         } => {
             if clone_only && pull_only {
-                anyhow::bail!("--clone-only and --pull-only cannot be used together");
+                // `FatalError::usage`, not `bail!`. Two mutually exclusive flags
+                // on the command line is the canonical usage error, and a
+                // bare `bail!` is caught by the top-level handler, which has
+                // nothing to downcast to and reports `EX_FATAL` — so a
+                // mistyped command line read as a broken install.
+                return Err(exit::FatalError::usage(
+                    "--clone-only and --pull-only cannot be used together",
+                )
+                .into());
             }
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
@@ -1706,19 +1762,39 @@ fn run() -> Result<()> {
                 }
                 targets.iter().map(|t| t.repo_id.clone()).collect()
             };
+            // `core.timeout_secs` is the shipped default, and the flag
+            // outranks it. The shipped default happens to also be 30, so
+            // hardcoding `unwrap_or(30)` was invisible until a user raised or
+            // lowered the key — at which point the per-git deadline they
+            // configured was silently not applied and a hung remote ran to
+            // git's own limits.
             let opts = sync::SyncOptions {
                 strategy,
                 autostash,
-                timeout_secs: timeout.unwrap_or(30),
+                timeout_secs: timeout.unwrap_or(config.core.timeout_secs),
                 dry_run,
                 clone_only,
                 pull_only,
                 prune,
             };
             let repo_labels = repo_labels_by_id(&conn);
-            let results = sync::sync_all(&conn, &opts, &selected).context("syncing repos")?;
+            // `core.parallel` threaded through the seam that exists for exactly
+            // this. `sync_all` hardcodes `default_parallel()` — the compiled-in
+            // 8 — so the key was accepted, echoed by `ro config`, and ignored,
+            // and the `runs` row recorded `parallel=8` for a run the user had
+            // asked to make one repo at a time.
+            let results = sync::sync_all_bounded(
+                &conn,
+                &opts,
+                &selected,
+                config.core.parallel.max(1) as usize,
+            )
+            .context("syncing repos")?;
             for r in &results {
                 match format {
+                    // `json` is a document and is printed once, after the
+                    // loop — see below. Nothing in this match handles it.
+                    OutputFormat::Json => {}
                     OutputFormat::Text => {
                         let label = repo_labels
                             .get(&r.repo_id)
@@ -1734,11 +1810,23 @@ fn run() -> Result<()> {
                         // and nothing else — dropping the very text the
                         // autostash fix was written to surface, which names
                         // `git stash list`, where the stash is, and how to
-                        // bring the work back. `skipped_dirty`'s "(use
-                        // --autostash)" was lost the same way, so a user who
-                        // ran the obvious command got the status word and no
-                        // explanation of it.
-                        match r.error.as_deref().filter(|_| r.status != "success") {
+                        // bring the work back.
+                        //
+                        // `reason` is the other half. `skipped_dirty` and
+                        // `skipped_unpushed` are skips, not errors, so their
+                        // explanation rides on `reason` rather than on
+                        // `error` — and the line below used to read `error`
+                        // only, which meant `skipped_dirty` reached the user
+                        // as the bare word and `(use --autostash)` reached
+                        // the database and nobody else. A reader of the
+                        // default line is exactly the reader the word was
+                        // addressed to.
+                        let why = r
+                            .error
+                            .as_deref()
+                            .or(r.reason.as_deref())
+                            .filter(|_| r.status != "success");
+                        match why {
                             Some(why) => {
                                 println!("{label} action={} status={} — {why}", r.action, r.status)
                             }
@@ -1759,17 +1847,25 @@ fn run() -> Result<()> {
                             println!("{label} plan-mismatch: {why}");
                         }
                     }
-                    OutputFormat::Json => {
-                        let rows: Vec<String> = results
-                            .iter()
-                            .map(|r| serde_json::to_string(r))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        println!("[{}]", rows.join(","));
-                    }
                     OutputFormat::Ndjson => {
                         println!("{}", serde_json::to_string(r)?);
                     }
                 }
+            }
+            // `json` is a **document**, so it is printed once, after the
+            // loop. It used to sit inside `for r in &results` and re-serialise
+            // and re-print the ENTIRE fleet once per repo, so N repos produced
+            // N concatenated copies of the whole array — 13 repos gave 13
+            // arrays and 64,701 bytes, and `json.load()` raised "Extra data:
+            // line 2 column 1". The identical bug was already found and fixed
+            // for `ro list` above, with a comment naming that exact error;
+            // the fix was not carried across to sync.
+            if let OutputFormat::Json = format {
+                let rows: Vec<String> = results
+                    .iter()
+                    .map(|r| serde_json::to_string(r))
+                    .collect::<Result<Vec<_>, _>>()?;
+                println!("[{}]", rows.join(","));
             }
 
             // The run-level verdict has to reach the shell.
@@ -1960,7 +2056,7 @@ fn run() -> Result<()> {
         Commands::Tag { repo, tags } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-            let added = ro_sync::tags::add(&conn, &repo, &tags)?;
+            let added = ro_sync::tags::add(&conn, &repo, &tags).map_err(usage_for_tag_verb)?;
             let now = ro_sync::tags::of(&conn, &repo)?;
             if added == 0 {
                 println!("{repo}: already tagged ({})", now.join(", "));
@@ -1972,7 +2068,7 @@ fn run() -> Result<()> {
         Commands::Untag { repo, tags } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
-            let removed = ro_sync::tags::remove(&conn, &repo, &tags)?;
+            let removed = ro_sync::tags::remove(&conn, &repo, &tags).map_err(usage_for_tag_verb)?;
             let now = ro_sync::tags::of(&conn, &repo)?;
             if removed == 0 {
                 println!("{repo}: no such tag ({})", now.join(", "));
@@ -1986,7 +2082,7 @@ fn run() -> Result<()> {
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
             match repo {
                 Some(key) => {
-                    for t in ro_sync::tags::of(&conn, &key)? {
+                    for t in ro_sync::tags::of(&conn, &key).map_err(usage_for_tag_verb)? {
                         println!("{t}");
                     }
                 }
@@ -2036,9 +2132,9 @@ fn run() -> Result<()> {
                     println!("{toml_str}");
                 }
                 Some(ConfigCommands::Set { pair }) => {
-                    let (key, value) = pair
-                        .split_once('=')
-                        .ok_or_else(|| anyhow::anyhow!("expected KEY=VALUE format"))?;
+                    let (key, value) = pair.split_once('=').ok_or_else(|| {
+                        exit::FatalError::usage("expected KEY=VALUE format")
+                    })?;
                     let key = key.trim();
                     let value = value.trim();
 

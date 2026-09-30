@@ -29,6 +29,92 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use tempfile::TempDir;
 
+/// A loopback HTTP git remote that answers **401 to every request** and
+/// records the `Authorization` header each one carried.
+///
+/// The 401 is the point: an unauthenticated clone **fails**, so "the
+/// credential reached the remote" and "the clone was answered" are the same
+/// observation rather than two that can disagree. A server that accepted
+/// everything would pass a clone that went out anonymously.
+struct DemandingRemote {
+    /// Kept alive: dropping the `TempDir` deletes the bare repo the server is
+    /// serving while a clone may still be in flight.
+    _root: TempDir,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DemandingRemote {
+    fn start() -> (Self, String) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let root = TempDir::new().unwrap();
+        let bare = root.path().join("remote.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        let out = std::process::Command::new(ro_testkit::git_path())
+            .args(["init", "--bare", "-q", "--initial-branch=main"])
+            .current_dir(&bare)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "the bare remote is creatable: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port is bindable");
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_thread = seen.clone();
+        let stop_thread = stop.clone();
+        std::thread::spawn(move || {
+            while !stop_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                        let mut chunk = [0u8; 8192];
+                        let Ok(n) = stream.read(&mut chunk) else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&chunk[..n]).into_owned();
+                        let header = head
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                            .and_then(|l| l.split_once(':'))
+                            .map(|(_, v)| v.trim().to_string());
+                        seen_thread.lock().unwrap().push(header);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+                        );
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (
+            Self {
+                _root: root,
+                seen,
+                stop,
+            },
+            format!("http://127.0.0.1:{port}"),
+        )
+    }
+
+    /// Every request the server answered, with the header it carried.
+    fn headers(&self) -> Vec<Option<String>> {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.seen.lock().unwrap().clone()
+    }
+}
+
 /// A bare repository standing in for `github.com/acme/api`, plus the git
 /// config that redirects the GitHub URL at it.
 ///
@@ -508,5 +594,91 @@ fn a_cloned_repo_passes_the_delete_gate() {
         !std::path::Path::new(path).exists(),
         "a repo `ro` cloned from a spec is the one case the delete gate is \
          for; it must be deletable"
+    );
+}
+
+// ── The enrolment clone carries the credential ──────────────────────────
+//
+// `ro add <url> --credential` validated the reference, stored it on the row,
+// and then cloned **anonymously**: `clone()` ran with `RunOpts::none()`,
+// `CloneOpts` had nowhere to put a host, and the reference had no reader
+// until the first sync. So a private repository could not be enrolled by URL
+// at all — the clone failed at `fatal: could not read Username` and no row
+// was registered. The flag was accepted, echoed, and unused for the one
+// operation it was given for.
+
+/// A private repo on a loopback HTTP remote is enrolled by URL with a
+/// credential.
+#[test]
+fn a_private_repo_is_enrolled_by_url_with_its_credential() {
+    let t = Test::new();
+    t.cmd().arg("init").assert().success();
+
+    let (remote, url) = DemandingRemote::start();
+    let spec = format!("{url}/acme/api.git");
+
+    let out = t
+        .cmd()
+        .args(["add", &spec, "--credential", "env:RO_ADD_CRED_TEST"])
+        .env("RO_ADD_CRED_TEST", "ghp_add_marker")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .output()
+        .expect("ro add runs");
+
+    // The claim under test is **the credential reaches the wire**, not that
+    // this stub can serve a clone: it answers 401 to everything, by design,
+    // so an unauthenticated clone and an authenticated one both end in a
+    // refusal. What distinguishes them is the header.
+    let headers = remote.headers();
+    assert!(
+        !headers.is_empty(),
+        "the remote must have been asked for something, got nothing"
+    );
+    for header in &headers {
+        let header = header.as_deref().expect(
+            "a row with a credential must authenticate its enrolment clone; \
+             the request went out anonymously",
+        );
+        assert!(
+            // Base64 of `x-access-token:ghp_add_marker`.
+            header.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX2FkZF9tYXJrZXI"),
+            "the credential must be on the wire, got: {header}"
+        );
+    }
+    let _ = out;
+}
+
+/// The negative control: the same repo with no credential is refused, and
+/// no row is written.
+#[test]
+fn a_private_repo_without_a_credential_is_refused_and_registers_nothing() {
+    let t = Test::new();
+    t.cmd().arg("init").assert().success();
+
+    let (remote, url) = DemandingRemote::start();
+    let spec = format!("{url}/acme/api.git");
+
+    let out = t
+        .cmd()
+        .args(["add", &spec])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .output()
+        .expect("ro add runs");
+
+    assert!(
+        !out.status.success(),
+        "an anonymous clone of a private repo must fail; got {}",
+        out.status
+    );
+    assert!(
+        remote.headers().iter().any(|h| h.is_none()),
+        "the request must have gone out with no Authorization header"
+    );
+    assert!(
+        t.rows().is_empty(),
+        "a failed clone registers no row: {:?}",
+        t.rows()
     );
 }

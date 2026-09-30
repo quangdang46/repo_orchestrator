@@ -180,7 +180,16 @@ pub fn run_verb(
             eprintln!("no repos matched the names, pattern or filter given; nothing was run.");
             std::process::exit(crate::exit::EX_USAGE as i32);
         }
-        eprintln!("no repos matched. Use --all, or a --repos pattern.");
+        // Neither flag is the remedy here. `--all` is the flag the user just
+        // typed — reaching this branch means it was absent or produced
+        // nothing — and `--repos` is not a flag on any verb: clap rejects it
+        // with "unexpected argument". The comment twelve lines above records
+        // that suggesting `--all` for a command that already contained it was
+        // fixed once; it came back, and `--repos` came with it.
+        eprintln!(
+            "no repos are tracked. Enrol one with `ro add <owner/repo>`, \
+             or check the registry path with `ro list`."
+        );
         std::process::exit(0);
     }
 

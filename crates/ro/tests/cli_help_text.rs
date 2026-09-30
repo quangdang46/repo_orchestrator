@@ -13,6 +13,14 @@
 //! asserting on. `ro schema` already flattens the same tree for consumers;
 //! this asserts the property the flattening exists to serve.
 //!
+//! The walk starts at the **root** and covers the root's own args as well as
+//! every subcommand's. It did not, for a long time, and that gap is what let
+//! `--config-dir`, `--state-dir` and `--non-interactive` go undocumented for
+//! so long: they are `global = true`, so they live on the root command, and a
+//! walk that only iterated `commands[]` never reached them. They are the three
+//! flags a person reads first and the three that decide where ro writes, so
+//! the root is walked deliberately rather than by accident.
+//!
 //! Hidden flags are exempt. They are compatibility spellings — `ro sweep
 //! commit-sweep`, `ro health` — kept for one release so a script does not
 //! break, and documenting them in `--help` would advertise the very spelling
@@ -75,13 +83,35 @@ fn walk(command: &Value, path: &str, out: &mut Vec<(String, String, Option<Strin
     }
 }
 
+/// Every arg of the whole CLI: the root's own args, then every command's.
+///
+/// The root's args are the `global` ones — `--config-dir`, `--state-dir`,
+/// `--non-interactive` — which clap accepts on every subcommand but stores on
+/// the root. They are collected under the program name so a failure names
+/// `ro --config-dir` rather than a bare `--config-dir` that could belong to
+/// any command.
+///
+/// The root is walked explicitly rather than by calling `walk(s, ..)`, and
+/// that is not a style choice. The root hangs its children off **`commands`**;
+/// every other command hangs its children off **`subcommands`**. Handing the
+/// root to `walk` therefore finds no `subcommands` key, silently returns
+/// just the root's three args, and produces a test that looks like it is
+/// guarding the whole CLI while covering almost none of it — the exact
+/// failure mode this file exists to prevent, reintroduced through the back
+/// door.
+fn all_args(s: &Value) -> Vec<(String, String, Option<String>)> {
+    let mut out = Vec::new();
+    walk(s, "", &mut out);
+    for command in s["commands"].as_array().expect("commands is an array") {
+        walk(command, "", &mut out);
+    }
+    out
+}
+
 #[test]
 fn every_flag_on_every_verb_has_help_text() {
     let s = schema();
-    let mut all = Vec::new();
-    for command in s["commands"].as_array().expect("commands is an array") {
-        walk(command, "", &mut all);
-    }
+    let all = all_args(&s);
 
     let mut missing: Vec<String> = all
         .iter()
@@ -103,6 +133,88 @@ fn every_flag_on_every_verb_has_help_text() {
     );
 }
 
+/// The root's own args are reachable, and every one of them is described.
+///
+/// This is the assertion that would have caught the three global flags while
+/// they were still undocumented. It is deliberately a **separate** test from
+/// the walk above rather than only a line inside it: the walk proves every
+/// arg it can *see* has help, and this proves the walk can *see* the root's.
+/// A guard that silently stops covering the root looks exactly like a guard
+/// that is passing.
+#[test]
+fn the_root_command_own_args_are_reachable_and_documented() {
+    let s = schema();
+
+    let root_args = s["args"]
+        .as_array()
+        .expect("the schema should carry the root command's own args");
+
+    assert!(
+        !root_args.is_empty(),
+        "the schema has no top-level `args`. The three global flags \
+         (--config-dir, --state-dir, --non-interactive) are `global = true`, so \
+         they live on the root and every walk that starts at `commands[]` \
+         misses them. A global flag losing its help would not fail this suite."
+    );
+
+    let mut missing: Vec<String> = root_args
+        .iter()
+        .filter(|a| {
+            let name = a["name"].as_str().unwrap_or_default();
+            let help = a["help"].as_str().unwrap_or_default();
+            name.is_empty() || help.trim().is_empty()
+        })
+        .map(|a| a["long"].as_str().unwrap_or("<no long form>").to_string())
+        .collect();
+    missing.sort();
+
+    assert!(
+        missing.is_empty(),
+        "these global flags have no help text, so nobody can find out what they \
+         do:\n  {}\nThey are the flags a person reads first, and the ones that \
+         decide where ro writes. Write a real description for each.",
+        missing.join("\n  ")
+    );
+}
+
+/// The three globals, named, with a minimum length that rules out a stub.
+///
+/// The walk proves *some* help exists. This proves the three flags a person
+/// actually reaches for carry a description long enough to be one — a single
+/// word like "config" satisfies "non-empty" while telling a reader nothing.
+#[test]
+fn the_three_global_flags_are_described_in_full() {
+    let s = schema();
+    let root_args = s["args"]
+        .as_array()
+        .expect("the schema should carry the root command's own args");
+
+    // The arg ids, not the invocable long forms. Matching on the id keeps this
+    // independent of clap's naming convention between `--state-dir` and
+    // `state_dir`.
+    for id in ["config_dir", "state_dir", "non_interactive"] {
+        let help = root_args
+            .iter()
+            .find(|a| a["name"] == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "--{id} is a global flag but is missing from the schema's root \
+                     args. It is declared with `global = true` on the `Cli` struct, \
+                     so it should appear at the top level."
+                )
+            })["help"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(
+            help.trim().len() >= 40,
+            "--{id} has a stub description: {help:?}\n\
+             It should say what the flag changes and what the default is — a \
+             reader decides where ro writes based on this line."
+        );
+    }
+}
+
 /// The three that were found empty, named.
 ///
 /// The walk above is the guard against the class returning; this is the guard
@@ -111,10 +223,7 @@ fn every_flag_on_every_verb_has_help_text() {
 #[test]
 fn the_three_flags_that_shipped_empty_are_documented() {
     let s = schema();
-    let mut all = Vec::new();
-    for command in s["commands"].as_array().expect("commands is an array") {
-        walk(command, "", &mut all);
-    }
+    let all = all_args(&s);
 
     // `engine_bin` is the arg id; the flag a user types is `--engine-bin`.
     // Matching on the id is what makes this test independent of clap's

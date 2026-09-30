@@ -207,6 +207,10 @@ pub fn status_repo_with(
 
     let (owner, name, tracked_branch, local_path) = row;
     let path = std::path::PathBuf::from(&local_path);
+    // The URL the credential is scoped to. Read here rather than inside the
+    // `if fetch_first` block so the row shape above stays the single place
+    // this query is written.
+    let mut clone_url = String::new();
 
     // The optional fetch, taken **before** the branch is read, because the
     // branch the row is on determines which remote-tracking ref is compared
@@ -221,7 +225,61 @@ pub fn status_repo_with(
     // `fetch_error` so it is not mistaken for a successful measurement.
     let mut fetch_error = None;
     if fetch_first {
-        match ro_git::mutation::fetch(&path, &ro_git::mutation::FetchOpts::default()) {
+        // The row's credential, scoped to the row's own host.
+        //
+        // `ro status --fetch` fetched **anonymously**: `fetch()` runs with
+        // `RunOpts::none()`, `FetchOpts::default()` has `host: None`, and
+        // nothing on this path resolved the row's `credential_ref`. So the
+        // flag — whose whole purpose is to measure against the freshest ref
+        // the remote has — measured against a stale one for every private
+        // repo, and reported numbers it had not earned. `ro sync` and `ro
+        // ship` both carry the token; `ro status` was the third verb that
+        // talks to the remote and the one that did not.
+        //
+        // The reference is read from the row and the per-repo file with the
+        // same precedence `ro sync` uses, so the two verbs cannot disagree
+        // about which token a repo is using.
+        let credential_ref = {
+            let mut reference: Option<String> = None;
+            let mut stmt = conn
+                .prepare("SELECT credential_ref, clone_url FROM repos WHERE id = ?1")
+                .with_context(|| format!("repo with id={repo_id} not found"))?;
+            let mut rows = stmt.query([repo_id])?;
+            if let Some(row) = rows.next()? {
+                reference = row.get::<_, Option<String>>(0)?;
+                clone_url = row.get::<_, String>(1)?;
+            }
+            if let Some(l) = ro_config::local::RepoLocalConfig::load(&path)
+                .ok()
+                .flatten()
+            {
+                let mut discard_a = None;
+                let mut discard_b = None;
+                let mut discard_c = None;
+                l.apply_to(&mut discard_a, &mut reference, &mut discard_b, &mut discard_c);
+            }
+            reference
+        };
+        // A reference that cannot be resolved is reported in `fetch_error`
+        // rather than raised: `ro status` over twenty repos is still nineteen
+        // good rows, and this is the row's problem, not the listing's.
+        let credential_env =
+            match crate::manage::credential_env(&clone_url, credential_ref.as_deref()) {
+                Ok(c) => c.env,
+                Err(e) => {
+                    fetch_error = Some(format!("{e}; the fetch went out anonymously"));
+                    Vec::new()
+                }
+            };
+        let fetch_run = ro_git::mutation::RunOpts {
+            env: &credential_env,
+            ..ro_git::mutation::RunOpts::none()
+        };
+        match ro_git::mutation::fetch_in(
+            &path,
+            &ro_git::mutation::FetchOpts::default(),
+            &fetch_run,
+        ) {
             // `fetch` returns `Ok` for a git that *ran and failed*:
             // `run_in` reports the exit status in the outcome rather than as
             // an error, and only a spawn failure is an `Err`. Checking

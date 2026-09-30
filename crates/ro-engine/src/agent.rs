@@ -833,27 +833,58 @@ fn stranded(repo_root: &std::path::Path, after: Option<&str>) -> Stranded {
         // ask about.
         return Stranded::Unknown;
     };
+    // The **remote's** refs, not the local remote-tracking refs.
+    //
+    // `git branch -r --contains` only ever lists refs under `refs/remotes/`,
+    // and a push the agent made **by URL** (`git push $URL HEAD:refs/heads/x`)
+    // creates no tracking ref at all. So the commit was on the remote and the
+    // row said both "unreachable from any remote" and "stranded locally" —
+    // the exact contradiction the message at the call site was written to
+    // stop, fixed for the named-remote case and unfixed for the URL case.
+    //
+    // `ls-remote` asks the remote. A remote that cannot be reached is
+    // **unknown**, not empty: "we could not ask" is not the same claim as
+    // "nothing is there", and reporting the second is how work that is
+    // published gets described as lost.
     let out = std::process::Command::new("git")
-        .args(["branch", "-r", "--contains", tip])
+        .args(["ls-remote", "--heads"])
         .current_dir(repo_root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("LC_ALL", "C")
         .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let text = String::from_utf8_lossy(&o.stdout);
-            let reachable = text.lines().any(|l| {
-                let l = l.trim();
-                !l.is_empty() && !l.starts_with("HEAD")
-            });
-            if reachable {
-                Stranded::Published
-            } else {
-                Stranded::Stranded
-            }
-        }
-        _ => Stranded::Unknown,
+    let Ok(o) = out else {
+        return Stranded::Unknown;
+    };
+    if !o.status.success() {
+        return Stranded::Unknown;
     }
+    // `ls-remote` reports the *tip* of every branch, not the history. A
+    // commit that is an ancestor of a branch tip is still published, so the
+    // comparison is "is the tip an ancestor of ours", which is the same
+    // relation `git merge-base --is-ancestor` answers. Doing it per candidate
+    // costs one cheap local process per branch and asks the question the
+    // verdict actually turns on.
+    for line in String::from_utf8_lossy(&o.stdout).lines() {
+        let Some((oid, _ref)) = line.split_once('\t') else {
+            continue;
+        };
+        let oids = oid.trim();
+        if oids.is_empty() {
+            continue;
+        }
+        let contains = std::process::Command::new("git")
+            .args(["merge-base", "--is-ancestor", tip, oids])
+            .current_dir(repo_root)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output();
+        if let Ok(c) = contains
+            && c.status.success()
+        {
+            return Stranded::Published;
+        }
+    }
+    Stranded::Stranded
 }
 
 /// The subject `--message` asked for, if it is one.
@@ -1751,6 +1782,34 @@ mod tests {
     // harness import it directly.
     use ro_testkit::TestEnv;
 
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new(ro_testkit::git_path())
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("LC_ALL", "C")
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn head_oid(repo: &std::path::Path) -> Option<String> {
+        let out = std::process::Command::new(ro_testkit::git_path())
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            None
+        }
+    }
+
     /// The load-bearing line, asserted on the literal string so a
     /// regression is caught at the source rather than in a behavioural
     /// test a sufficiently literal agent could route around.
@@ -1774,6 +1833,74 @@ mod tests {
         assert!(
             lower.contains("do not modify git config"),
             "and the config request must be stated too"
+        );
+    }
+
+    /// A commit the agent pushed **by URL** is published.
+    ///
+    /// `stranded` asked `git branch -r --contains <tip>`, which only ever
+    /// lists refs under `refs/remotes/`. A push by URL
+    /// (`git push $URL HEAD:refs/heads/x`) creates no tracking ref at all,
+    /// so the commit was on the remote and the row said both "unreachable
+    /// from any remote" and "stranded locally" — the exact contradiction the
+    /// message at the call site was written to stop, fixed for the
+    /// named-remote case and unfixed for the URL case.
+    #[test]
+    fn a_commit_published_by_url_is_not_stranded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let bare = root.join("remote.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&bare, &["init", "--bare", "-q", "--initial-branch=main"]);
+
+        let work = root.join("work");
+        run_git(&root, &["clone", "-q", &bare.to_string_lossy(), "work"]);
+        run_git(&work, &["config", "user.email", "agent@example.com"]);
+        run_git(&work, &["config", "user.name", "Agent"]);
+        run_git(&work, &["checkout", "-q", "-b", "agent-work"]);
+        std::fs::write(work.join("a.txt"), "agent work\n").unwrap();
+        run_git(&work, &["add", "-A"]);
+        run_git(&work, &["commit", "-q", "-m", "agent commit"]);
+        // By URL, so no `refs/remotes/origin/...` ref is created.
+        run_git(
+            &work,
+            &["push", "-q", &bare.to_string_lossy(), "HEAD:refs/heads/agent-published"],
+        );
+
+        let tip = head_oid(&work).expect("HEAD resolves");
+        assert!(
+            !work.join(".git/refs/remotes/origin/agent-published").exists(),
+            "the fixture must have no tracking ref, or it proves nothing"
+        );
+        assert!(
+            matches!(stranded(&work, Some(&tip)), Stranded::Published),
+            "the commit IS on the remote; `git branch -r --contains` cannot see it"
+        );
+    }
+
+    /// The positive control: a commit that is genuinely local is stranded.
+    ///
+    /// Without this, the test above would pass for a function that answered
+    /// `Published` for everything.
+    #[test]
+    fn a_commit_that_was_never_pushed_is_stranded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let bare = root.join("remote.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&bare, &["init", "--bare", "-q", "--initial-branch=main"]);
+        let work = root.join("work");
+        run_git(&root, &["clone", "-q", &bare.to_string_lossy(), "work"]);
+        run_git(&work, &["config", "user.email", "agent@example.com"]);
+        run_git(&work, &["config", "user.name", "Agent"]);
+        std::fs::write(work.join("a.txt"), "local only\n").unwrap();
+        run_git(&work, &["add", "-A"]);
+        run_git(&work, &["commit", "-q", "-m", "local only"]);
+
+        let tip = head_oid(&work).expect("HEAD resolves");
+        assert!(
+            matches!(stranded(&work, Some(&tip)), Stranded::Stranded),
+            "a commit that was never pushed is stranded"
         );
     }
 

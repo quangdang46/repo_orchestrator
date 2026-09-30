@@ -53,6 +53,10 @@ tempfile.workspace = true
 # `ro schema` and needs the JSON it emits.
 serde_json.workspace = true
 ro-testkit = { path = "../ro-testkit" }
+# The `runs` audit row is the only place a fleet run's width and deadline are
+# recorded, so a test that claims `core.parallel` is honoured has to read it
+# rather than take the exit code's word for it.
+rusqlite.workspace = true
 
 [features]
 # Re-export of `ro-core`'s `keychain`, so the default build reads a

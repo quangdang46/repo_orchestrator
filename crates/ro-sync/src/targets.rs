@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use globset::Glob;
 use std::path::{Path, PathBuf};
 
-/// What a `--repos` pattern or `--filter` selected.
+/// What a `--pattern` glob or `--filter` selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// `owner/name`, for display.
@@ -45,7 +45,7 @@ pub fn resolve_targets(
     // all while reporting a cheerful empty run.
     //
     // Compiled **once, and an error is an error**. The previous version
-    // fell back to `*` on a bad pattern, so `--repos owner/*-typo`
+    // fell back to `*` on a bad pattern, so `--pattern 'owner/*-typo'`
     // silently selected every repo in the fleet and the run reported
     // success on twenty repositories nobody asked about.
     let tokens: Vec<(String, Option<globset::GlobMatcher>)> = match pattern {
@@ -53,7 +53,12 @@ pub fn resolve_targets(
             .split_whitespace()
             .map(|t| {
                 Glob::new(t)
-                    .with_context(|| format!("--repos {t:?} is not a valid glob"))
+                    // `--pattern`, the flag this value actually arrived on.
+                    // It said `--repos`, which no verb has: `ro commit --repos`
+                    // is rejected by clap as an unexpected argument, and the
+                    // schema's 36 long flags do not contain it. A user whose
+                    // glob has a typo was told to fix a flag they never typed.
+                    .with_context(|| format!("--pattern {t:?} is not a valid glob"))
                     .map(|g| (t.to_string(), Some(g.compile_matcher())))
             })
             .collect::<Result<Vec<_>>>()?,
