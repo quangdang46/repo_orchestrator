@@ -154,14 +154,37 @@ impl Summary {
         self.rows.iter().filter(|r| r.outcome.is_failure()).count()
     }
 
-    /// How many committed.
+    /// How many repos the engine actually committed for.
+    ///
+    /// A `Pushed` row counts **only** when the engine committed in this run.
+    /// It used to count every push, on the reasoning that a push implies a
+    /// commit — and that is true of the ordinary path, where the engine
+    /// commits and ro then pushes what it wrote. It is false of three
+    /// ordinary paths, none of them rare:
+    ///
+    ///  * a clean worktree, where the engine had nothing to group;
+    ///  * a worktree whose every change the engine judged ephemeral, so it
+    ///    declined all of them and left the work uncommitted;
+    ///  * a branch the remote did not have, which the run created and
+    ///    pushed at a commit that was already there.
+    ///
+    /// In the second case the count read `1 committed, 1 pushed, 0 failed`
+    /// with the user's work still uncommitted in the worktree — a green
+    /// summary over work that did not land, which is the one thing a summary
+    /// line must never be. Counting a push as a commit is what made that
+    /// possible, so the two are now separate claims and the push carries
+    /// which one it is.
     pub fn committed(&self) -> usize {
         self.rows
             .iter()
             .filter(|r| {
                 matches!(
                     r.outcome,
-                    RepoOutcome::Committed { .. } | RepoOutcome::Pushed { .. }
+                    RepoOutcome::Committed { .. }
+                        | RepoOutcome::Pushed {
+                            engine_committed: true,
+                            ..
+                        }
                 )
             })
             .count()
@@ -250,10 +273,27 @@ mod tests {
     }
 
     /// A push with nothing to warn about, which is nearly every push.
+    ///
+    /// `engine_committed: true` — the ordinary path, where the engine
+    /// grouped the changes and ro pushed what it wrote. The
+    /// push-without-a-commit case has its own constructor below, because
+    /// sharing this one is what let the two be counted as the same thing.
     fn pushed(oid: &str) -> RepoOutcome {
         RepoOutcome::Pushed {
             oid: oid.into(),
             warnings: Vec::new(),
+            engine_committed: true,
+        }
+    }
+
+    /// A push that carried no new commit: the engine declined everything, or
+    /// there was nothing to group, or the branch simply did not exist on the
+    /// remote yet.
+    fn pushed_without_a_commit(oid: &str) -> RepoOutcome {
+        RepoOutcome::Pushed {
+            oid: oid.into(),
+            warnings: Vec::new(),
+            engine_committed: false,
         }
     }
 
@@ -265,6 +305,64 @@ mod tests {
         ]);
         assert_eq!(s.counts(), (2, 0));
         assert_eq!(s.pushed(), 2);
+        assert_eq!(
+            s.committed(),
+            2,
+            "the ordinary path — the engine committed, ro pushed what it wrote — \
+             is still a commit"
+        );
+    }
+
+    /// A push that carried no commit is a push, not a commit.
+    ///
+    /// Found by running the tool rather than reading it. `ro ship` against a
+    /// worktree whose every change the engine judged ephemeral — a scratch
+    /// note, a build directory — leaves that work **uncommitted** and then
+    /// prints:
+    ///
+    /// ```text
+    /// 1 committed, 1 pushed, 0 failed.
+    /// ```
+    ///
+    /// Both counts were true of the push and the first was false of the run.
+    /// The user reads a green summary over work that did not land, and the
+    /// only evidence against it is a file still sitting in the worktree — the
+    /// one thing a summary line exists to spare them from checking.
+    ///
+    /// The same shape arrives two other ordinary ways, and both were counted
+    /// as commits for the same reason: a clean worktree, where the engine had
+    /// nothing to group; and a branch the remote did not have, which the run
+    /// created and pushed at a commit that was already there.
+    #[test]
+    fn a_push_without_a_commit_is_not_counted_as_one() {
+        let s = Summary::new(vec![
+            row("acme/scratch", pushed_without_a_commit("aaa")),
+            row("acme/real", pushed("bbb")),
+        ]);
+        assert_eq!(s.pushed(), 2, "both rows really did reach the remote");
+        assert_eq!(
+            s.committed(),
+            1,
+            "only the row whose engine committed counts. Reporting 2 here is \
+             the bug: it tells the user the scratch repo's work is on the \
+             remote when it is still in the worktree."
+        );
+        let text = s.render();
+        assert!(
+            text.contains("1 committed, 2 pushed"),
+            "the headline must not claim a commit that never happened, got: {text}"
+        );
+    }
+
+    /// The JSON carries the same claim, because a script reading `json` is
+    /// the reader least likely to be watching the worktree.
+    #[test]
+    fn the_json_count_does_not_inflate_commits_either() {
+        let json = Summary::new(vec![row("acme/scratch", pushed_without_a_commit("aaa"))])
+            .render_json(OutputFormat::Json);
+        let doc: serde_json::Value = serde_json::from_str(&json).expect("the json parses");
+        assert_eq!(doc["summary"]["committed"], 0, "got: {json}");
+        assert_eq!(doc["summary"]["pushed"], 1, "got: {json}");
     }
 
     /// The bead's test. One failing repo must not report success, or the
@@ -357,6 +455,7 @@ mod tests {
             RepoOutcome::Pushed {
                 oid: "aaa".into(),
                 warnings: vec!["--onto new: the remote does not have it. ro created it.".into()],
+                engine_committed: true,
             },
         );
         let text = Summary::new(vec![r]).render();
@@ -389,6 +488,7 @@ mod tests {
             RepoOutcome::Pushed {
                 oid: "aaa".into(),
                 warnings: vec!["--onto new: the remote does not have it.".into()],
+                engine_committed: true,
             },
         );
         let json = Summary::new(vec![r]).render_json(OutputFormat::Json);
@@ -415,6 +515,7 @@ mod tests {
             RepoOutcome::Pushed {
                 oid: "aaa".into(),
                 warnings: vec!["--onto new: the remote does not have it.".into()],
+                engine_committed: true,
             },
         );
         let ndjson = Summary::new(vec![r]).render_json(OutputFormat::Ndjson);
@@ -445,6 +546,7 @@ mod tests {
             RepoOutcome::Pushed {
                 oid: "aaa".into(),
                 warnings: Vec::new(),
+                engine_committed: true,
             },
         )])
         .render_json(OutputFormat::Json);

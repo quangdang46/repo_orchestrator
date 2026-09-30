@@ -284,6 +284,25 @@ pub enum RepoOutcome {
     Pushed {
         oid: String,
         warnings: Vec<String>,
+        /// Did the **engine** write a commit during this run?
+        ///
+        /// A push does not imply a commit, and conflating the two is how a
+        /// run that changed nothing gets a green light. Three ordinary
+        /// situations reach a push without the engine committing:
+        ///
+        ///  * the worktree was already clean, so the engine had nothing to
+        ///    group and said so;
+        ///  * every change was one the engine judged ephemeral — a build
+        ///    directory, a scratch note — and it declined all of them;
+        ///  * the branch did not exist on the remote, so the run created it
+        ///    and pushed the commit that was already there.
+        ///
+        /// All three push something real, so `pushed()` counts them. None of
+        /// them is a commit, and a summary that reports "1 committed" for
+        /// them tells the user their work is on the remote when the work is
+        /// still sitting in the worktree. This is the field that keeps the
+        /// two counts honest.
+        engine_committed: bool,
     },
     Failed {
         error: String,
@@ -695,9 +714,19 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     // push of a branch that never existed remotely.
     let push_target = push_refspec(plan);
 
+    // Whether the *engine* wrote a commit, as opposed to the run merely
+    // reaching a push. Set only on the `Committed` arm below and carried to
+    // the `Pushed` outcome, because "the work reached the remote" and "the
+    // work was committed" are different claims and a run summary that
+    // merges them reports commits that never happened.
+    let mut engine_committed = false;
+
     let oid = match plan.engine.checkpoint(&ctx) {
         EngineOutcome::Committed { commits } => match commits.last() {
-            Some(c) => c.oid.clone(),
+            Some(c) => {
+                engine_committed = true;
+                c.oid.clone()
+            }
             None => {
                 return RepoOutcome::Failed {
                     error: "the engine reported a commit with no commit id".into(),
@@ -836,6 +865,7 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         Ok(r) if r.ok() => RepoOutcome::Pushed {
             oid,
             warnings: onto_warning,
+            engine_committed,
         },
         Ok(r) => RepoOutcome::Failed {
             error: format!("push failed: {}", r.stderr.trim()),

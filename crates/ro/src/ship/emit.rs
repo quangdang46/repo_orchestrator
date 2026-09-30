@@ -375,6 +375,7 @@ mod tests {
         RepoOutcome::Pushed {
             oid: "aaa".into(),
             warnings: Vec::new(),
+            engine_committed: true,
         }
     }
 
