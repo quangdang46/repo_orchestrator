@@ -87,7 +87,12 @@ fn effective_credential_ref(repo: &TrackedRepo) -> Option<String> {
         let mut discard_a = None;
         let mut discard_b = None;
         let mut discard_c = None;
-        l.apply_to(&mut discard_a, &mut reference, &mut discard_b, &mut discard_c);
+        l.apply_to(
+            &mut discard_a,
+            &mut reference,
+            &mut discard_b,
+            &mut discard_c,
+        );
     }
     reference
 }
@@ -178,10 +183,7 @@ impl SyncOptions {
     /// the machine's own credential — that would be the wrong account,
     /// silently.
     pub fn run_opts_for(&self, repo: &TrackedRepo) -> Result<crate::manage::CredentialEnv> {
-        crate::manage::credential_env(
-            &repo.clone_url,
-            effective_credential_ref(repo).as_deref(),
-        )
+        crate::manage::credential_env(&repo.clone_url, effective_credential_ref(repo).as_deref())
     }
 
     /// Set the deadline on a git invocation and run it.
@@ -528,7 +530,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
         if opts.pull_only {
             return Ok(PlannedSync {
                 action: "skipped_clone".into(),
-                status: STATUS_SKIPPED.into(),
+                status: STATUS_SKIPPED,
                 ahead: None,
                 behind: None,
                 unmeasurable_reason: None,
@@ -540,7 +542,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
         }
         return Ok(PlannedSync {
             action: "clone".into(),
-            status: STATUS_DRY_RUN.into(),
+            status: STATUS_DRY_RUN,
             ahead: None,
             behind: None,
             unmeasurable_reason: None,
@@ -557,7 +559,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
     if opts.clone_only {
         return Ok(PlannedSync {
             action: "skipped_pull".into(),
-            status: STATUS_SKIPPED.into(),
+            status: STATUS_SKIPPED,
             ahead: None,
             behind: None,
             unmeasurable_reason: None,
@@ -584,14 +586,15 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
         Ok(false) => {
             return Ok(PlannedSync {
                 action: "skipped_unpushed".into(),
-                status: STATUS_SKIPPED.into(),
+                status: STATUS_SKIPPED,
                 ahead: None,
                 behind: None,
                 unmeasurable_reason: None,
-                plan: Some(format!(
+                plan: Some(
                     "no `origin` remote is configured, so there is nothing to fetch \
                      from — this run would skip the pull rather than fail it"
-                )),
+                        .into(),
+                ),
             });
         }
         // Could not even list the remotes: a checkout git cannot read. The
@@ -600,7 +603,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
         Err(e) => {
             return Ok(PlannedSync {
                 action: "pull".into(),
-                status: STATUS_ERROR.into(),
+                status: STATUS_ERROR,
                 ahead: None,
                 behind: None,
                 unmeasurable_reason: Some(format!("cannot list remotes: {e:#}")),
@@ -621,7 +624,7 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
     if dirty_count > 0 && !opts.autostash {
         return Ok(PlannedSync {
             action: "skipped_dirty".into(),
-            status: STATUS_SKIPPED.into(),
+            status: STATUS_SKIPPED,
             ahead: None,
             behind: None,
             unmeasurable_reason: None,
@@ -668,19 +671,15 @@ fn plan_repo(repo: &TrackedRepo, opts: &SyncOptions) -> Result<PlannedSync> {
         // and the real run then agree, which is the property the flag is
         // for; the alternative is a dry run that promises a pull and a real
         // run that exits 1.
-        (Some(a), Some(b))
-            if a > 0 && b > 0 && matches!(opts.strategy, SyncStrategy::FfOnly) =>
-        {
-            (
-                STATUS_ERROR,
-                format!(
-                    "the pull will fail — {branch} has diverged from {upstream} \
+        (Some(a), Some(b)) if a > 0 && b > 0 && matches!(opts.strategy, SyncStrategy::FfOnly) => (
+            STATUS_ERROR,
+            format!(
+                "the pull will fail — {branch} has diverged from {upstream} \
                      ({a} ahead, {b} behind) and --ff-only refuses a non-fast-forward. \
                      Use --strategy rebase or --strategy merge, or push the local \
                      commits first{stale}"
-                ),
-            )
-        }
+            ),
+        ),
         (Some(a), Some(b)) if a > 0 && b > 0 => (
             STATUS_DRY_RUN,
             format!(
@@ -1030,8 +1029,8 @@ fn sync_repo_inner(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
-            plan_mismatch: None,
-            reason: None,
+                plan_mismatch: None,
+                reason: None,
             });
         }
         // Clone
@@ -1067,8 +1066,8 @@ fn sync_repo_inner(
                         behind: None,
                         unmeasurable_reason: None,
                         plan: None,
-            plan_mismatch: None,
-            reason: None,
+                        plan_mismatch: None,
+                        reason: None,
                     });
                 }
                 let post_oid = ro_git::read::head_oid(local).ok().flatten();
@@ -1085,8 +1084,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 })
             }
             Err(e) => {
@@ -1104,8 +1103,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 })
             }
         }
@@ -1124,8 +1123,8 @@ fn sync_repo_inner(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
-            plan_mismatch: None,
-            reason: None,
+                plan_mismatch: None,
+                reason: None,
             });
         }
         // Fetch + pull
@@ -1175,8 +1174,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 });
             }
             let duration = start.elapsed().as_millis() as u64;
@@ -1193,8 +1192,8 @@ fn sync_repo_inner(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
-            plan_mismatch: None,
-            reason: None,
+                plan_mismatch: None,
+                reason: None,
             });
         }
 
@@ -1260,7 +1259,7 @@ fn sync_repo_inner(
                 behind: None,
                 unmeasurable_reason: None,
                 plan: None,
-            plan_mismatch: None,
+                plan_mismatch: None,
                 // `--autostash` is the whole remedy and the user cannot act on
                 // the word `skipped_dirty` alone.
                 reason: Some(detail),
@@ -1307,8 +1306,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 })
             }
             // `pull` returns `Ok` when the command *ran*, not when it
@@ -1337,8 +1336,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 })
             }
             // The command ran and failed. Distinguish a conflict from a
@@ -1365,8 +1364,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 })
             }
             Ok(outcome) => {
@@ -1410,7 +1409,7 @@ fn sync_repo_inner(
                         behind: None,
                         unmeasurable_reason: None,
                         plan: None,
-            plan_mismatch: None,
+                        plan_mismatch: None,
                         // The branch is new and unpushed, which is the normal
                         // state of `git checkout -b` — the sentence says so,
                         // because the word `skipped_unpushed` alone reads as
@@ -1435,8 +1434,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 })
             }
             Err(e) => {
@@ -1453,8 +1452,8 @@ fn sync_repo_inner(
                     behind: None,
                     unmeasurable_reason: None,
                     plan: None,
-            plan_mismatch: None,
-            reason: None,
+                    plan_mismatch: None,
+                    reason: None,
                 })
             }
         }
@@ -1730,17 +1729,19 @@ fn sync_fleet(
         for _ in 0..parallel.min(repos.len()) {
             let outcomes = &outcomes;
             let locks = &locks;
-            scope.spawn(move || loop {
-                let index = cursor.fetch_add(1, Ordering::Relaxed);
-                let Some(repo) = repos.get(index) else {
-                    break;
-                };
-                let pair = sync_one(repo, opts, locks, observer);
-                let mut slots = outcomes.lock().unwrap_or_else(|e| e.into_inner());
-                // The index, not the repo id: a repo id is a UUID, and
-                // parsing one as a slot number is a silent
-                // mis-assignment.
-                slots[index] = Some(pair);
+            scope.spawn(move || {
+                loop {
+                    let index = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(repo) = repos.get(index) else {
+                        break;
+                    };
+                    let pair = sync_one(repo, opts, locks, observer);
+                    let mut slots = outcomes.lock().unwrap_or_else(|e| e.into_inner());
+                    // The index, not the repo id: a repo id is a UUID, and
+                    // parsing one as a slot number is a silent
+                    // mis-assignment.
+                    slots[index] = Some(pair);
+                }
             });
         }
     });
@@ -1768,11 +1769,12 @@ fn sync_one(
     locks: &std::collections::HashMap<PathBuf, Arc<Mutex<()>>>,
     observer: &FleetObserver,
 ) -> (SyncResult, PendingResult) {
-    let guard = match locks.get(Path::new(&repo.local_path)) {
+    let guard = match locks.get(&lock_key(Path::new(&repo.local_path))) {
         Some(lock) => lock.lock().unwrap_or_else(|e| e.into_inner()),
-        // Unreachable: the map is built from the same rows. Answering with a
-        // visible failure beats `expect`, which would take down a fleet run
-        // over a bookkeeping bug.
+        // Unreachable: the map is built from the same rows through the same
+        // `lock_key`, so a miss here is a real bookkeeping bug rather than a
+        // spelling difference. Answering with a visible failure beats
+        // `expect`, which would take down a fleet run over it.
         None => {
             return (
                 SyncResult {
@@ -1792,7 +1794,7 @@ fn sync_one(
                     unmeasurable_reason: None,
                     plan: None,
                     plan_mismatch: None,
-            reason: None,
+                    reason: None,
                 },
                 pending(
                     &repo.id,
@@ -1839,9 +1841,17 @@ fn sync_one(
                     unmeasurable_reason: None,
                     plan: None,
                     plan_mismatch: None,
-            reason: None,
+                    reason: None,
                 },
-                pending(&repo.id, "error", STATUS_ERROR, 0, Some(&err_msg), &None, &None),
+                pending(
+                    &repo.id,
+                    "error",
+                    STATUS_ERROR,
+                    0,
+                    Some(&err_msg),
+                    &None,
+                    &None,
+                ),
             )
         }
     }
@@ -1876,6 +1886,26 @@ fn worker_produced_nothing(repo: &TrackedRepo) -> SyncResult {
     }
 }
 
+/// The key a checkout is locked under: canonicalised when the path exists,
+/// raw when it does not.
+///
+/// Canonicalisation fails for a path that does not exist yet — which is every
+/// repo about to be cloned — so the raw path is the fallback, exactly as
+/// `ro_git::RepoLock::acquire` does it.
+///
+/// **Building the map and reading it have to agree on this**, or the lock is
+/// silently absent and the thing it exists to prevent happens anyway. They
+/// did not: `path_locks` keyed the canonical form while `sync_one` looked up
+/// the stored string. `PathBuf`'s `Hash`/`Eq` compare bytes even on Windows,
+/// where the filesystem does not, so the two matched only when the stored
+/// string was already spelled the way the disk spells it. On Linux `/tmp`
+/// already is, so the fleet locked correctly; on Windows the drive and
+/// directory casing never is, every lookup missed, and every row failed with
+/// "the sync pool and the repo list disagree".
+fn lock_key(raw: &Path) -> PathBuf {
+    std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
+}
+
 /// One lock per distinct checkout, shared by every row naming it.
 ///
 /// Keyed on a **canonicalised** path so `/tmp/x`, `/tmp/x/` and a symlink to
@@ -1887,11 +1917,8 @@ fn worker_produced_nothing(repo: &TrackedRepo) -> SyncResult {
 fn path_locks(repos: &[TrackedRepo]) -> std::collections::HashMap<PathBuf, Arc<Mutex<()>>> {
     let mut locks = std::collections::HashMap::new();
     for repo in repos {
-        let raw = PathBuf::from(&repo.local_path);
-        let key = std::fs::canonicalize(&raw).unwrap_or(raw);
-        locks
-            .entry(key)
-            .or_insert_with(|| Arc::new(Mutex::new(())));
+        let key = lock_key(Path::new(&repo.local_path));
+        locks.entry(key).or_insert_with(|| Arc::new(Mutex::new(())));
     }
     locks
 }
@@ -3047,11 +3074,7 @@ mod dry_run_preview {
         run_git(&f.path_of("diverged"), &["fetch", "-q", "origin"]);
 
         // And the local states the old dry run could not tell apart.
-        std::fs::write(
-            f.path_of("dirty").join("a.txt"),
-            "LOCAL UNCOMMITTED\n",
-        )
-        .unwrap();
+        std::fs::write(f.path_of("dirty").join("a.txt"), "LOCAL UNCOMMITTED\n").unwrap();
         {
             // Fetched, then one local commit on top: one ahead **and** three
             // behind. `--ff-only` refuses that outright, so it is the case a
@@ -3796,7 +3819,11 @@ mod dry_run_preview {
         conn.execute(
             "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
              VALUES ('id-1', 'github.com', 'fleet', 'remoteless', ?1, ?2, ?3, ?3)",
-            params![local.to_string_lossy().to_string(), local.to_string_lossy().to_string(), now],
+            params![
+                local.to_string_lossy().to_string(),
+                local.to_string_lossy().to_string(),
+                now
+            ],
         )
         .unwrap();
 
@@ -3987,7 +4014,11 @@ mod run_exit_code_tests {
             1,
             "a run whose only bad repo is an autostash conflict must not exit 0"
         );
-        assert_eq!(run_exit_code(&[result(STATUS_ERROR)]), 1, "an error fails the run");
+        assert_eq!(
+            run_exit_code(&[result(STATUS_ERROR)]),
+            1,
+            "an error fails the run"
+        );
     }
 
     /// The negative control. This is the assertion that stops the fix above
@@ -3999,9 +4030,9 @@ mod run_exit_code_tests {
         let results = vec![
             result(STATUS_SUCCESS),
             result(STATUS_SUCCESS),
-            result(STATUS_SKIPPED),          // skipped_dirty
-            result(STATUS_SKIPPED),          // skipped_unpushed
-            result(STATUS_DRY_RUN),          // --dry-run
+            result(STATUS_SKIPPED), // skipped_dirty
+            result(STATUS_SKIPPED), // skipped_unpushed
+            result(STATUS_DRY_RUN), // --dry-run
             result(STATUS_SUCCESS),
         ];
         assert_eq!(
@@ -4020,7 +4051,11 @@ mod run_exit_code_tests {
     /// legitimate question with the answer "nothing to do", not a failure.
     #[test]
     fn an_empty_run_exits_zero() {
-        assert_eq!(run_exit_code(&[]), 0, "nothing went wrong because nothing ran");
+        assert_eq!(
+            run_exit_code(&[]),
+            0,
+            "nothing went wrong because nothing ran"
+        );
     }
 
     /// The third failure status, and the reason it is not the string `error`.
@@ -4170,7 +4205,10 @@ mod run_exit_code_tests {
         super::tests::run_git(&local_path, &["clone", &remote.to_string_lossy(), "."]);
         super::tests::run_git(&local_path, &["config", "user.email", "test@example.com"]);
         super::tests::run_git(&local_path, &["config", "user.name", "Test"]);
-        super::tests::run_git(&local_path, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        super::tests::run_git(
+            &local_path,
+            &["commit", "-q", "--allow-empty", "-m", "init"],
+        );
         super::tests::run_git(&local_path, &["push", "-q", "-u", "origin", "main"]);
 
         let repo_id = uuid::Uuid::new_v4().to_string();
@@ -4195,7 +4233,11 @@ mod run_exit_code_tests {
         // away, which is the correct answer and not a failure.
         std::fs::write(local_path.join("a.txt"), "uncommitted\n").unwrap();
         let results = sync_all(&conn, &SyncOptions::default(), &[]).unwrap();
-        assert_eq!(results[0].status, "skipped", "the fixture must skip: {:?}", results[0]);
+        assert_eq!(
+            results[0].status, "skipped",
+            "the fixture must skip: {:?}",
+            results[0]
+        );
 
         let recorded: i64 = conn
             .query_row(
@@ -4448,14 +4490,56 @@ mod deadline {
     #[test]
     fn a_hanging_git_is_killed_at_the_timeout_and_the_run_continues() {
         let tmp = TempDir::new().unwrap();
-        let shim = tmp.path().join("git-hang");
-        std::fs::write(&shim, "#!/bin/sh\nsleep 600\ntouch \"$MARKER\"\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
         let marker = tmp.path().join("grandchild-survived");
+        // Two scripts rather than one on Windows, because the shape under test
+        // is a **tree**: a direct child that hangs, and a grandchild that would
+        // perform its side effect if it outlived the kill. A single `.cmd`
+        // cannot express that, because `cmd.exe` has no equivalent of `sh`'s
+        // background `&`.
+        //
+        // The Unix fixture was a `#!/bin/sh` script named without an
+        // extension, which Windows refuses to execute at all — `os error 193,
+        // "%1 is not a valid Win32 application"`. The test then asserted on a
+        // spawn error rather than on a timeout, and reported the deadline as
+        // broken when the deadline had never been given a process to fire
+        // against. Rust's `Command` runs a `.cmd` through `cmd.exe`, so naming
+        // it is enough to make the fixture real here.
+        //
+        // `ping -n 25` is the Windows stand-in for `sleep`: it blocks for
+        // roughly 25 seconds with no output, which is far longer than the
+        // 500 ms deadline and the 3 s the marker is watched for.
+        #[cfg(windows)]
+        let shim = {
+            let grandchild = tmp.path().join("grandchild.cmd");
+            std::fs::write(
+                &grandchild,
+                format!(
+                    "@echo off\r\nping -n 25 127.0.0.1 > nul\r\necho survived> \"{}\"\r\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            let shim = tmp.path().join("git-hang.cmd");
+            std::fs::write(
+                &shim,
+                format!(
+                    "@echo off\r\nstart \"\" /b \"{}\"\r\nping -n 25 127.0.0.1 > nul\r\n",
+                    grandchild.display()
+                ),
+            )
+            .unwrap();
+            shim
+        };
+        #[cfg(not(windows))]
+        let shim = {
+            let shim = tmp.path().join("git-hang");
+            std::fs::write(&shim, "#!/bin/sh\nsleep 600\ntouch \"$MARKER\"\n").unwrap();
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            shim
+        };
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
 
@@ -4535,7 +4619,7 @@ mod wedged_remote {
     use super::*;
     use tempfile::TempDir;
 
-/// A TCP listener     that completes the handshake and then never answers.
+    /// A TCP listener     that completes the handshake and then never answers.
     ///
     /// This is the shape of the failure `--timeout` exists for: a server that
     /// accepts the connection and says nothing, so the client waits for bytes
@@ -4561,8 +4645,8 @@ mod wedged_remote {
 
     impl BlackHoleServer {
         pub(super) fn start() -> Self {
-            let listener =
-                std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener is bindable");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("a loopback listener is bindable");
             let port = listener
                 .local_addr()
                 .expect("a bound listener has an address")
@@ -4635,10 +4719,8 @@ mod wedged_remote {
             "the wedged fixture must be a real checkout: {}",
             String::from_utf8_lossy(&clone.stderr)
         );
-        let repoint = super::tests::run_git(
-            &wedged,
-            &["remote", "set-url", "origin", &black_hole.url()],
-        );
+        let repoint =
+            super::tests::run_git(&wedged, &["remote", "set-url", "origin", &black_hole.url()]);
         assert!(
             repoint.status.success(),
             "the origin repoint failed: {}",
@@ -4776,10 +4858,8 @@ mod wedged_remote {
         std::fs::create_dir_all(&wedged).unwrap();
         let clone = super::tests::run_git(&wedged, &["clone", &remote.to_string_lossy(), "."]);
         assert!(clone.status.success());
-        let repoint = super::tests::run_git(
-            &wedged,
-            &["remote", "set-url", "origin", &black_hole.url()],
-        );
+        let repoint =
+            super::tests::run_git(&wedged, &["remote", "set-url", "origin", &black_hole.url()]);
         assert!(repoint.status.success());
 
         let now = std::time::SystemTime::now()
@@ -4874,11 +4954,10 @@ mod wedged_remote {
 /// without intercepting any of them.
 #[cfg(test)]
 mod parallel_fleet {
-    use super::*;
     use super::tests::{commit_to_remote, init_bare_remote, run_git};
+    use super::*;
     use super::{FleetObserver, sync_all_observed};
     use tempfile::TempDir;
-
 
     /// A fleet of `n` rows, each pointing at its own checkout of `remote`.
     ///
@@ -4920,9 +4999,11 @@ mod parallel_fleet {
             // — asserted rather than assumed, because a fixture that is
             // quietly on `master` fails as "unmeasurable", which reads like
             // a concurrency bug and is not one.
-            let branch = String::from_utf8_lossy(&run_git(&local, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
-                .trim()
-                .to_string();
+            let branch = String::from_utf8_lossy(
+                &run_git(&local, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+            )
+            .trim()
+            .to_string();
             assert_eq!(
                 branch, "main",
                 "fixture {i} must be on main, like a real clone of this remote"
@@ -5038,10 +5119,7 @@ mod parallel_fleet {
     /// Returning them together is what keeps the observer's lifetime honest:
     /// it cannot outlive the run it measured, and a test cannot read a
     /// counter that belonged to some other test's fleet.
-    fn observed(
-        conn: &Connection,
-        parallel: usize,
-    ) -> (Vec<SyncResult>, FleetObserver) {
+    fn observed(conn: &Connection, parallel: usize) -> (Vec<SyncResult>, FleetObserver) {
         let observer = FleetObserver::watching();
         let results = sync_all_observed(conn, &SyncOptions::default(), &[], parallel, &observer)
             .expect("the fleet syncs");
@@ -5126,7 +5204,8 @@ mod parallel_fleet {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let _ = stream.set_nonblocking(false);
-                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                             let mut chunk = [0u8; 8192];
                             let Ok(n) = stream.read(&mut chunk) else {
                                 continue;
@@ -5138,7 +5217,9 @@ mod parallel_fleet {
                                 .and_then(|l| l.split_once(':'))
                                 .map(|(_, v)| v.trim().to_string());
                             seen_thread.lock().unwrap().push(header);
-                            let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+                            );
                             let _ = stream.flush();
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -5193,7 +5274,10 @@ mod parallel_fleet {
         run_git(&work, &["commit", "-q", "-m", "base"]);
 
         let (remote, url) = DemandingRemote::start();
-        run_git(&work, &["remote", "add", "origin", &format!("{url}/acme/api.git")]);
+        run_git(
+            &work,
+            &["remote", "add", "origin", &format!("{url}/acme/api.git")],
+        );
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5288,11 +5372,7 @@ mod parallel_fleet {
             assert_eq!(r.status, "success", "every repo synced: {r:?}");
         }
 
-        assert_eq!(
-            observer.total(),
-            ids.len(),
-            "every repo still ran"
-        );
+        assert_eq!(observer.total(), ids.len(), "every repo still ran");
         assert_eq!(
             observer.peak(),
             1,
@@ -5352,7 +5432,10 @@ mod parallel_fleet {
             "each repo's sync ran exactly once — the pool dropped or \
              duplicated one"
         );
-        let mut seen = results.iter().map(|r| r.repo_id.clone()).collect::<Vec<_>>();
+        let mut seen = results
+            .iter()
+            .map(|r| r.repo_id.clone())
+            .collect::<Vec<_>>();
         seen.sort();
         seen.dedup();
         assert_eq!(
@@ -5390,7 +5473,10 @@ mod parallel_fleet {
 
         let parallel = sync_all_bounded(&conn, &SyncOptions::default(), &[], 4).unwrap();
         assert_eq!(
-            parallel.iter().map(|r| r.repo_id.clone()).collect::<Vec<_>>(),
+            parallel
+                .iter()
+                .map(|r| r.repo_id.clone())
+                .collect::<Vec<_>>(),
             expected,
             "a parallel run must be in registry order too — completion order \
              would make the summary unreadable run to run"
@@ -5413,12 +5499,13 @@ mod parallel_fleet {
         assert_eq!(results.len(), 5, "the fleet ran");
 
         let runs: i64 = conn
-            .query_row("SELECT COUNT(*) FROM runs WHERE command = 'sync'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE command = 'sync'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(
-            runs, 1,
-            "a fleet of five repos is one sync run, not five"
-        );
+        assert_eq!(runs, 1, "a fleet of five repos is one sync run, not five");
 
         let open: i64 = conn
             .query_row(
@@ -5444,8 +5531,7 @@ mod parallel_fleet {
             "the run row's exit code is the verdict the CLI would print"
         );
         assert_eq!(
-            rows,
-            5,
+            rows, 5,
             "every repo in the fleet has a row under the one run"
         );
     }
@@ -5606,11 +5692,7 @@ mod parallel_fleet {
             assert_eq!(r.status, "success", "both rows synced: {r:?}");
         }
 
-        assert_eq!(
-            observer.total(),
-            ids.len(),
-            "both rows were synced"
-        );
+        assert_eq!(observer.total(), ids.len(), "both rows were synced");
         assert_eq!(
             observer.peak(),
             1,
@@ -5720,11 +5802,7 @@ mod parallel_fleet {
             assert_eq!(r.status, "success", "every repo synced: {r:?}");
         }
 
-        assert_eq!(
-            observer.total(),
-            6,
-            "every repo in the fleet was synced"
-        );
+        assert_eq!(observer.total(), 6, "every repo in the fleet was synced");
         assert!(
             observer.peak() <= 2,
             "six repos at a bound of two reached a peak of {} in flight. The \
@@ -5760,7 +5838,12 @@ mod parallel_fleet {
         assert!(clone.status.success(), "the fixture clones");
         run_git(
             &broken,
-            &["remote", "set-url", "origin", "https://127.0.0.1:1/nope.git"],
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://127.0.0.1:1/nope.git",
+            ],
         );
 
         // And three healthy ones around it.
@@ -5844,10 +5927,7 @@ mod parallel_fleet {
         std::fs::create_dir_all(&wedged).unwrap();
         let clone = run_git(&wedged, &["clone", &remote.to_string_lossy(), "."]);
         assert!(clone.status.success(), "the fixture clones");
-        run_git(
-            &wedged,
-            &["remote", "set-url", "origin", &black_hole.url()],
-        );
+        run_git(&wedged, &["remote", "set-url", "origin", &black_hole.url()]);
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -5886,8 +5966,6 @@ mod parallel_fleet {
         );
     }
 }
-
-
 
 /// How many repo syncs are in flight right now, the most there have
 /// been, and how many ran in all.
@@ -5935,10 +6013,16 @@ impl FleetObserver {
     fn enter(&self) -> FleetRun<'_> {
         match &self.counts {
             Some(counts) => {
-                let now =
-                    counts.in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                counts.total.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                counts.peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                let now = counts
+                    .in_flight
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                counts
+                    .total
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                counts
+                    .peak
+                    .fetch_max(now, std::sync::atomic::Ordering::SeqCst);
                 FleetRun {
                     counts: Some(counts.clone()),
                     _owner: std::marker::PhantomData,
@@ -5991,4 +6075,3 @@ impl Drop for FleetRun<'_> {
         }
     }
 }
-

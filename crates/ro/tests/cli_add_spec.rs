@@ -87,9 +87,8 @@ impl DemandingRemote {
                             .and_then(|l| l.split_once(':'))
                             .map(|(_, v)| v.trim().to_string());
                         seen_thread.lock().unwrap().push(header);
-                        let _ = stream.write_all(
-                            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
-                        );
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
                         let _ = stream.flush();
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -155,12 +154,17 @@ impl Remote {
         );
 
         let gitconfig = root.path().join("gitconfig");
+        // Forward slashes, because the `[url "..."]` value is a
+        // **double-quoted** git-config string and `\` is an escape character
+        // in one. A Windows path written verbatim arrives at git with its
+        // separators eaten — `C:\Users\me\api.git` becomes
+        // `C:Usersmeapi.git` — and the clone fails against a path that does
+        // not exist, which reads as ro's bug and is not. Git takes forward
+        // slashes on Windows natively, and a Unix path has none to rewrite.
+        let base = bare.to_string_lossy().replace('\\', "/");
         std::fs::write(
             &gitconfig,
-            format!(
-                "[url \"{}\"]\n\tinsteadOf = https://github.com/acme/api.git\n",
-                bare.display()
-            ),
+            format!("[url \"{base}\"]\n\tinsteadOf = https://github.com/acme/api.git\n"),
         )
         .unwrap();
 

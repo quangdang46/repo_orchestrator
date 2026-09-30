@@ -99,7 +99,7 @@ fn the_identity_reaches_the_child_and_survives_amend() {
 
     assert!(
         observed.contains("user.name"),
-        "GIT_CONFIG_KEY_0 must carry user.name, so:\n{observed}"
+        "a GIT_CONFIG_KEY_n must carry user.name, so:\n{observed}"
     );
     assert!(observed.contains("Work Identity"));
     assert!(observed.contains("work@example.com"));

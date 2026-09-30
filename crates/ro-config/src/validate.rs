@@ -40,9 +40,7 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     // flag; a typo in a config value must be reported at the config.
     if let Some(engine) = cfg.agent.engine.as_deref() {
         if !["claude", "codex", "git"].contains(&engine) {
-            bail!(
-                "agent.engine: '{engine}' is not valid (expected: claude | codex | git)"
-            );
+            bail!("agent.engine: '{engine}' is not valid (expected: claude | codex | git)");
         }
     }
 

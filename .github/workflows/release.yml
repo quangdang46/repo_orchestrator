@@ -28,8 +28,53 @@ permissions:
   contents: write
 
 jobs:
+  # A release may only ship a commit CI has signed off on.
+  #
+  # This workflow is tag-triggered, which means it used to run on whatever
+  # commit the tag happened to point at — including one whose CI was still
+  # red. That is not hypothetical: v0.4.0 was tagged onto a commit where
+  # Format, Clippy and all three Test jobs were failing, and every one of
+  # those jobs here then built an artifact from it. A tag is a claim about a
+  # commit, and nothing was checking the claim.
+  #
+  # So the first job is the check, and everything else waits on it. It reads
+  # the CI workflow's own conclusion for the tagged SHA rather than
+  # re-running the suite, so the gate costs one API call and cannot disagree
+  # with the run a developer already watched go green.
+  gate:
+    name: Gate on CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: The CI workflow must have passed on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          run_json=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=1")
+
+          conclusion=$(jq -r '.workflow_runs[0].conclusion // "none"' <<<"${run_json}")
+          html_url=$(jq -r '.workflow_runs[0].html_url // "(no run)"' <<<"${run_json}")
+
+          if [ "${conclusion}" != "success" ]; then
+            echo "::error::Refusing to release ${TAG}." \
+              "The CI workflow's latest run on ${SHA} concluded '${conclusion}', not 'success'." \
+              "See ${html_url}. Wait for it to go green, or fix what is red, then re-tag."
+            exit 1
+          fi
+
+          echo "CI passed on ${SHA} (${html_url}); releasing ${TAG}."
+
   plan:
     name: Plan
+    needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:

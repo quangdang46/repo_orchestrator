@@ -296,21 +296,18 @@ impl AgentEngine {
         before: Option<&str>,
         after: Option<&str>,
     ) -> EngineOutcome {
-        let commits: Vec<CommitRecord> = ro_git::read::commits_between(
-            ctx.repo_root,
-            before,
-            after,
-        )
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|oid| {
-            Some(CommitRecord {
-                message: ro_git::read::commit_subject(ctx.repo_root, &oid)?,
-                oid,
-                files: Vec::new(),
-            })
-        })
-        .collect();
+        let commits: Vec<CommitRecord> =
+            ro_git::read::commits_between(ctx.repo_root, before, after)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|oid| {
+                    Some(CommitRecord {
+                        message: ro_git::read::commit_subject(ctx.repo_root, &oid)?,
+                        oid,
+                        files: Vec::new(),
+                    })
+                })
+                .collect();
 
         // HEAD moved and ro found nothing to name. That is not "committed
         // nothing" — `render` turns an empty `Committed` into exactly that
@@ -393,14 +390,12 @@ impl AgentEngine {
         // the two halves call for opposite responses.
         let stranded = stranded(ctx.repo_root, after);
         let where_it_is = match stranded {
-            Stranded::Stranded => "are sitting local and unreachable from any remote",
-            Stranded::Published => {
-                "were published under that identity by the agent itself"
-            }
+            Publication::Stranded => "are sitting local and unreachable from any remote",
+            Publication::Published => "were published under that identity by the agent itself",
             // The question could not be answered, so neither fact is
             // claimed. Saying "sitting local" when it might be published
             // would be the same contradiction the clause used to fix.
-            Stranded::Unknown => "are on the current branch, reachability unknown",
+            Publication::Unknown => "are on the current branch, reachability unknown",
         };
         let mut error = format!(
             "the agent committed the work itself, under an identity that is \
@@ -418,19 +413,19 @@ impl AgentEngine {
         // future reader can see the two cases are still distinguished —
         // the distinction is the whole point of asking.
         match stranded {
-            Stranded::Published => {
+            Publication::Published => {
                 error.push_str(
                     "\nAt least one of these commits is already reachable from \
                      a remote, so it has been published under that identity.",
                 );
             }
-            Stranded::Stranded => {
+            Publication::Stranded => {
                 error.push_str(
                     "\nNone of these commits is reachable from a remote, so the \
                      work is stranded locally.",
                 );
             }
-            Stranded::Unknown => {}
+            Publication::Unknown => {}
         }
 
         EngineOutcome::Failed {
@@ -564,7 +559,6 @@ impl Engine for AgentEngine {
 /// A second inherent `impl` block rather than one, so `checkpoint` stays in
 /// the `Engine` impl — where the trait's method belongs — while the helpers
 /// it calls sit with the rest of the engine.
-
 impl AgentEngine {
     /// What the run's output and the worktree together mean.
     ///
@@ -683,11 +677,8 @@ impl AgentEngine {
                     class: FailureClass::DirtyWorktree,
                 };
             }
-            let oid = match ro_git::primitives::commit_all_as(
-                ctx.repo_root,
-                &group.subject,
-                author,
-            ) {
+            let oid = match ro_git::primitives::commit_all_as(ctx.repo_root, &group.subject, author)
+            {
                 Ok(oid) => oid,
                 Err(e) => {
                     return EngineOutcome::Failed {
@@ -702,7 +693,6 @@ impl AgentEngine {
                 files: group.files,
             });
         }
-
 
         EngineOutcome::Committed { commits }
     }
@@ -811,7 +801,7 @@ fn commit_author(repo_root: &std::path::Path, oid: &str) -> Option<(String, Stri
 /// `ro ship`: the user ran the fleet, the base was pushed last time, and
 /// this run's work has not gone anywhere. Answering that "published" tells
 /// the user their stranded work went out.
-enum Stranded {
+enum Publication {
     /// At least one of the agent's commits is reachable from a remote.
     Published,
     /// None of them is.
@@ -827,11 +817,11 @@ enum Stranded {
 /// remote ref contains it, and the tip is the one that settles it: a push
 /// that carried any of the agent's commits necessarily carried the tip,
 /// because the tip is the newest of them.
-fn stranded(repo_root: &std::path::Path, after: Option<&str>) -> Stranded {
+fn stranded(repo_root: &std::path::Path, after: Option<&str>) -> Publication {
     let Some(tip) = after else {
         // No `after` means ro could not read HEAD, so there is nothing to
         // ask about.
-        return Stranded::Unknown;
+        return Publication::Unknown;
     };
     // The **remote's** refs, not the local remote-tracking refs.
     //
@@ -847,16 +837,26 @@ fn stranded(repo_root: &std::path::Path, after: Option<&str>) -> Stranded {
     // "nothing is there", and reporting the second is how work that is
     // published gets described as lost.
     let out = std::process::Command::new("git")
+        // `credential.helper=` / `core.askPass=` for the same reason as every
+        // other network call ro makes: an empty helper list leaves git nothing
+        // that can open a window. On a machine whose git config names Git
+        // Credential Manager as its helper, this `ls-remote` was the one call
+        // on the stranded-publication path that could pop a password dialog
+        // at the user. A remote that cannot be reached is `Unknown` below
+        // regardless, so declining to authenticate costs nothing.
+        .args(["-c", "credential.helper=", "-c", "core.askPass="])
         .args(["ls-remote", "--heads"])
         .current_dir(repo_root)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GCM_UI", "Never")
         .env("LC_ALL", "C")
         .output();
     let Ok(o) = out else {
-        return Stranded::Unknown;
+        return Publication::Unknown;
     };
     if !o.status.success() {
-        return Stranded::Unknown;
+        return Publication::Unknown;
     }
     // `ls-remote` reports the *tip* of every branch, not the history. A
     // commit that is an ancestor of a branch tip is still published, so the
@@ -881,10 +881,10 @@ fn stranded(repo_root: &std::path::Path, after: Option<&str>) -> Stranded {
         if let Ok(c) = contains
             && c.status.success()
         {
-            return Stranded::Published;
+            return Publication::Published;
         }
     }
-    Stranded::Stranded
+    Publication::Stranded
 }
 
 /// The subject `--message` asked for, if it is one.
@@ -1080,10 +1080,7 @@ fn parse_config(text: &str) -> std::collections::BTreeMap<String, String> {
         if let Some(rest) = trimmed.strip_prefix('[') {
             // `[section]`, `[section "sub"]` and `[a.b]` all name a prefix.
             let name = rest.split(']').next().unwrap_or("").trim().replace('"', "");
-            section = name
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(".");
+            section = name.split_whitespace().collect::<Vec<_>>().join(".");
             // `[a.b.c]` is a dotted subsection, not a nesting; the dots are
             // already the separator this map uses.
             last = None;
@@ -1092,10 +1089,7 @@ fn parse_config(text: &str) -> std::collections::BTreeMap<String, String> {
         // A continuation is a line that starts with whitespace — git's own
         // rule — and belongs to the value above it.
         let (key, value) = match trimmed.split_once('=') {
-            Some((k, v)) => (
-                format!("{section}.{}", k.trim()),
-                v.trim().to_string(),
-            ),
+            Some((k, v)) => (format!("{section}.{}", k.trim()), v.trim().to_string()),
             None => match &last {
                 Some(k) => (k.clone(), String::new()),
                 None => continue,
@@ -1168,11 +1162,7 @@ fn report_config_drift(
 /// the status says about the group's own paths says exactly why the index
 /// was empty, and it is one cheap git call away. The one-line change that
 /// fixes this at the source is in `primitives.rs`.
-fn commit_failure_detail(
-    repo_root: &std::path::Path,
-    err: &str,
-    group: &CommitGroup,
-) -> String {
+fn commit_failure_detail(repo_root: &std::path::Path, err: &str, group: &CommitGroup) -> String {
     let mut message = format!("committing {:?} failed: {err}", group.subject);
     if has_reason(err) {
         return message;
@@ -1280,7 +1270,9 @@ fn parse_commits(stdout: &str, format: StreamFormat) -> Vec<CommitGroup> {
                 let Some(content) = v.get("message").and_then(|m| m.get("content")) else {
                     continue;
                 };
-                let Some(blocks) = content.as_array() else { continue };
+                let Some(blocks) = content.as_array() else {
+                    continue;
+                };
                 // Every text block, not the last one. Claude streams a
                 // *sequence* of assistant turns, and the plan lands in
                 // whichever turn produced it.
@@ -1733,9 +1725,7 @@ fn run_with_deadline(
 /// two pipes have to be drained **concurrently**: reading stdout to the end
 /// first would leave stderr to fill its own 64 KiB buffer and wedge the
 /// child, which is the same deadlock one pipe over.
-fn drain<P: std::io::Read + Send + 'static>(
-    pipe: Option<P>,
-) -> std::thread::JoinHandle<Vec<u8>> {
+fn drain<P: std::io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut p) = pipe {
@@ -1864,16 +1854,23 @@ mod tests {
         // By URL, so no `refs/remotes/origin/...` ref is created.
         run_git(
             &work,
-            &["push", "-q", &bare.to_string_lossy(), "HEAD:refs/heads/agent-published"],
+            &[
+                "push",
+                "-q",
+                &bare.to_string_lossy(),
+                "HEAD:refs/heads/agent-published",
+            ],
         );
 
         let tip = head_oid(&work).expect("HEAD resolves");
         assert!(
-            !work.join(".git/refs/remotes/origin/agent-published").exists(),
+            !work
+                .join(".git/refs/remotes/origin/agent-published")
+                .exists(),
             "the fixture must have no tracking ref, or it proves nothing"
         );
         assert!(
-            matches!(stranded(&work, Some(&tip)), Stranded::Published),
+            matches!(stranded(&work, Some(&tip)), Publication::Published),
             "the commit IS on the remote; `git branch -r --contains` cannot see it"
         );
     }
@@ -1899,7 +1896,7 @@ mod tests {
 
         let tip = head_oid(&work).expect("HEAD resolves");
         assert!(
-            matches!(stranded(&work, Some(&tip)), Stranded::Stranded),
+            matches!(stranded(&work, Some(&tip)), Publication::Stranded),
             "a commit that was never pushed is stranded"
         );
     }
@@ -2216,7 +2213,9 @@ mod tests {
             .expect("the script is writable");
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut p = std::fs::metadata(&script).expect("the script exists").permissions();
+            let mut p = std::fs::metadata(&script)
+                .expect("the script exists")
+                .permissions();
             p.set_mode(0o755);
             std::fs::set_permissions(&script, p).expect("the mode is settable");
         }
@@ -2227,7 +2226,11 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run_with_deadline(&mut cmd, Duration::from_millis(300), None));
+            let _ = tx.send(run_with_deadline(
+                &mut cmd,
+                Duration::from_millis(300),
+                None,
+            ));
         });
 
         let out = rx
@@ -2256,7 +2259,9 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\nsleep 300\n").expect("the script is writable");
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut p = std::fs::metadata(&script).expect("the script exists").permissions();
+            let mut p = std::fs::metadata(&script)
+                .expect("the script exists")
+                .permissions();
             p.set_mode(0o755);
             std::fs::set_permissions(&script, p).expect("the mode is settable");
         }
@@ -2337,7 +2342,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir(dir.path().join("claude.exe")).unwrap();
         let path = std::env::join_paths([dir.path()]).unwrap();
-        assert_eq!(find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD"), None);
+        assert_eq!(
+            find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD"),
+            None
+        );
     }
 
     /// An empty `PATH` entry means "the current directory" to a shell, and
@@ -2350,11 +2358,8 @@ mod tests {
         // Leading empty entry: if it were honoured, the lookup would
         // consult the process's working directory and this test's answer
         // would depend on where the test binary was started.
-        let path = std::env::join_paths([
-            std::path::PathBuf::from(""),
-            dir.path().to_path_buf(),
-        ])
-        .unwrap();
+        let path =
+            std::env::join_paths([std::path::PathBuf::from(""), dir.path().to_path_buf()]).unwrap();
         let found = find_with_extensions("claude", &path, ".COM;.EXE;.BAT;.CMD").unwrap();
         assert_eq!(found, dir.path().join("claude.exe"));
     }
@@ -2394,8 +2399,8 @@ mod tests {
     fn a_removed_config_key_is_reported() {
         let before = "[user]\n\tname = Ro User\n\temail = ro@example.com\n";
         let after = "[user]\n\temail = ro@example.com\n";
-        let report =
-            config_drift_report(before.as_bytes(), after.as_bytes()).expect("a removed key must be reported");
+        let report = config_drift_report(before.as_bytes(), after.as_bytes())
+            .expect("a removed key must be reported");
         assert!(
             report.contains("user.name"),
             "the removed key must be named, got: {report}"
@@ -2411,8 +2416,8 @@ mod tests {
     fn an_added_config_key_is_reported() {
         let before = "[user]\n\temail = ro@example.com\n";
         let after = "[user]\n\temail = ro@example.com\n\tname = Agent\n";
-        let report =
-            config_drift_report(before.as_bytes(), after.as_bytes()).expect("an added key must be reported");
+        let report = config_drift_report(before.as_bytes(), after.as_bytes())
+            .expect("an added key must be reported");
         assert!(report.contains("user.name"), "got: {report}");
         assert!(report.contains("Agent"), "got: {report}");
     }
@@ -2424,7 +2429,10 @@ mod tests {
     #[test]
     fn an_unchanged_config_is_not_reported() {
         let config = "[user]\n\tname = Ro User\n\temail = ro@example.com\n";
-        assert_eq!(config_drift_report(config.as_bytes(), config.as_bytes()), None);
+        assert_eq!(
+            config_drift_report(config.as_bytes(), config.as_bytes()),
+            None
+        );
     }
 
     /// A reformat is not a change. Reporting "the agent changed your config"
@@ -2481,10 +2489,9 @@ mod tests {
     #[test]
     fn a_token_in_a_remote_url_is_not_printed() {
         let before = "[remote \"origin\"]\n\turl = https://github.com/a/b\n";
-        let after =
-            "[remote \"origin\"]\n\turl = https://x-access-token:ghp_16C7e42F292c6912E7710c838347Ae178B4a@github.com/a/b\n";
-        let report =
-            config_drift_report(before.as_bytes(), after.as_bytes()).expect("a changed URL must be reported");
+        let after = "[remote \"origin\"]\n\turl = https://x-access-token:ghp_16C7e42F292c6912E7710c838347Ae178B4a@github.com/a/b\n";
+        let report = config_drift_report(before.as_bytes(), after.as_bytes())
+            .expect("a changed URL must be reported");
         assert!(!report.contains("ghp_"), "got: {report}");
         assert!(report.contains("url"), "the key is still named: {report}");
     }
@@ -2495,8 +2502,7 @@ mod tests {
     #[test]
     fn a_token_shaped_value_is_redacted_even_in_an_innocent_key() {
         let before = "[core]\n\trepositoryformatversion = 0\n";
-        let after =
-            "[core]\n\trepositoryformatversion = 0\n\teditor = ghp_16C7e42F292c6912E7710c838347Ae178B4a\n";
+        let after = "[core]\n\trepositoryformatversion = 0\n\teditor = ghp_16C7e42F292c6912E7710c838347Ae178B4a\n";
         let report = config_drift_report(before.as_bytes(), after.as_bytes())
             .expect("a changed value must be reported");
         assert!(!report.contains("ghp_"), "got: {report}");
@@ -2726,15 +2732,13 @@ mod tests {
             .expect("the script is writable");
         {
             use std::os::unix::fs::PermissionsExt;
-            let mut p = std::fs::metadata(&script).expect("the script exists").permissions();
+            let mut p = std::fs::metadata(&script)
+                .expect("the script exists")
+                .permissions();
             p.set_mode(0o755);
             std::fs::set_permissions(&script, p).expect("the mode is settable");
         }
-        let shim = ro_testkit::FakeBinary::at(
-            dir.path().to_path_buf(),
-            script,
-            "claude",
-        );
+        let shim = ro_testkit::FakeBinary::at(dir.path().to_path_buf(), script, "claude");
         let engine = AgentEngine::with(
             EngineKind::Claude,
             shim.program().to_string_lossy().to_string(),

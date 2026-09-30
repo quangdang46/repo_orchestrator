@@ -69,9 +69,17 @@ impl Test {
         text.lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("each line is a JSON object"))
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).expect("each line is a JSON object")
+            })
             .find(|v| v["local_path"].as_str() == Some(wanted))
-            .map(|v| format!("{}/{}", v["owner"].as_str().unwrap(), v["name"].as_str().unwrap()))
+            .map(|v| {
+                format!(
+                    "{}/{}",
+                    v["owner"].as_str().unwrap(),
+                    v["name"].as_str().unwrap()
+                )
+            })
             .unwrap_or_else(|| panic!("no row has local_path {wanted:?}; ro list said:\n{text}"))
     }
 }
@@ -123,7 +131,11 @@ fn a_tag_matching_nothing_does_not_sync_the_whole_fleet() {
     let t = Test::initialised();
     three_repos(&t);
 
-    let out = t.cmd().args(["sync", "--tag", "nonexistent"]).output().unwrap();
+    let out = t
+        .cmd()
+        .args(["sync", "--tag", "nonexistent"])
+        .output()
+        .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(
@@ -211,7 +223,14 @@ fn a_plural_positional_selects_every_named_repo() {
 
     let out = t
         .cmd()
-        .args(["ship", "--dry-run", "--engine", "git", &repos[0].0, &repos[1].0])
+        .args([
+            "ship",
+            "--dry-run",
+            "--engine",
+            "git",
+            &repos[0].0,
+            &repos[1].0,
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -246,7 +265,15 @@ fn all_plus_a_pattern_matching_nothing_does_not_widen_to_the_fleet() {
 
     let out = t
         .cmd()
-        .args(["ship", "--dry-run", "--engine", "git", "--all", "--pattern", "work/nomatch*"])
+        .args([
+            "ship",
+            "--dry-run",
+            "--engine",
+            "git",
+            "--all",
+            "--pattern",
+            "work/nomatch*",
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -271,7 +298,15 @@ fn all_plus_a_tag_matching_nothing_is_a_usage_error() {
     three_repos(&t);
 
     t.cmd()
-        .args(["commit", "--dry-run", "--engine", "git", "--all", "--tag", "nonexistent"])
+        .args([
+            "commit",
+            "--dry-run",
+            "--engine",
+            "git",
+            "--all",
+            "--tag",
+            "nonexistent",
+        ])
         .assert()
         .code(64);
 }
@@ -283,7 +318,14 @@ fn a_tag_matching_nothing_is_a_usage_error() {
     three_repos(&t);
 
     t.cmd()
-        .args(["commit", "--dry-run", "--engine", "git", "--tag", "nonexistent"])
+        .args([
+            "commit",
+            "--dry-run",
+            "--engine",
+            "git",
+            "--tag",
+            "nonexistent",
+        ])
         .assert()
         .code(64);
 }
@@ -312,7 +354,14 @@ fn a_matching_pattern_still_runs() {
 
     let out = t
         .cmd()
-        .args(["commit", "--dry-run", "--engine", "git", "--pattern", &repos[0].0])
+        .args([
+            "commit",
+            "--dry-run",
+            "--engine",
+            "git",
+            "--pattern",
+            &repos[0].0,
+        ])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -422,7 +471,11 @@ fn a_bare_name_selects_the_repo_the_help_text_promises() {
     beta.write("b.txt", "x\n");
 
     // The bare name, not `owner/name`.
-    let bare = alpha_label.rsplit('/').next().expect("a label has a name").to_string();
+    let bare = alpha_label
+        .rsplit('/')
+        .next()
+        .expect("a label has a name")
+        .to_string();
     t.cmd()
         .args(["commit", &bare, "--engine", "git"])
         .assert()

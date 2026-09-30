@@ -195,10 +195,8 @@ pub fn resolve_targets(
         // one token is still a set if it is 'proj/*', and two literal names
         // are still identities.
         if let Some(f) = filter {
-            let narrow = tokens.is_empty()
-                || tokens
-                    .iter()
-                    .any(|(tok, _)| tok.contains(['*', '?', '[']));
+            let narrow =
+                tokens.is_empty() || tokens.iter().any(|(tok, _)| tok.contains(['*', '?', '[']));
             if narrow && !matches_filter(conn, &repo.id, &label, f)? {
                 continue;
             }
@@ -496,7 +494,6 @@ fn matches_filter(
     _label: &str,
     filter: &str,
 ) -> Result<bool> {
-
     // A filter with a space in it is two filters, and the tool's own
     // refusal message says so: "`--tag` is shorthand for `--filter tag:<T>`
     // — pass the tag form, or fold it into a single `--filter` expression."
@@ -561,16 +558,13 @@ fn matches_filter(
     // on every repository.
     if let Some(flag) = filter.strip_prefix("has:") {
         return match flag {
-            "archived" | "disabled" | "cloned" => {
-                Ok(matches_filter_repo(conn, repo_id, flag))
-            }
+            "archived" | "disabled" | "cloned" => Ok(matches_filter_repo(conn, repo_id, flag)),
             other => bail!(
                 "unknown --filter has:{other}. \
                  Expected has:archived, has:disabled or has:cloned."
             ),
         };
     }
-
 
     bail!("unknown --filter {filter:?}. Expected health:<N>, tag:<name>, or has:<flag>.")
 }
@@ -1102,7 +1096,11 @@ mod filter_contract {
             false,
         )
         .expect("two real names are not an error");
-        assert_eq!(union.len(), 2, "a token list is a union, not an intersection");
+        assert_eq!(
+            union.len(),
+            2,
+            "a token list is a union, not an intersection"
+        );
     }
 
     #[test]
@@ -1336,10 +1334,7 @@ mod health_threshold_boundary {
             false,
         )
         .expect_err("the documented spelling gets the same refusal");
-        assert!(
-            format!("{err:#}").contains("999"),
-            "got: {err:#}"
-        );
+        assert!(format!("{err:#}").contains("999"), "got: {err:#}");
     }
 
     /// The negative control, and the reason this test can mean anything.
@@ -1352,15 +1347,8 @@ mod health_threshold_boundary {
     fn the_same_call_without_a_filter_still_selects_the_whole_fleet() {
         let (_t, conn) = five_healthy_repos();
         assert_eq!(select(&conn, "tag:work").len(), 0, "a tag nobody has");
-        let all = resolve_targets(
-            &conn,
-            None,
-            None,
-            true,
-            std::path::Path::new("/s"),
-            false,
-        )
-        .unwrap();
+        let all =
+            resolve_targets(&conn, None, None, true, std::path::Path::new("/s"), false).unwrap();
         assert_eq!(
             all.len(),
             5,

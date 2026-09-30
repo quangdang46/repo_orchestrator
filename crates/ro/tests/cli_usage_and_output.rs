@@ -61,19 +61,31 @@ impl Test {
     /// Register a checkout and return its `owner/name` label.
     fn register(&self, path: &std::path::Path) -> String {
         self.cmd().arg("add").arg(path).assert().success();
-        let out = self.cmd().args(["list", "--format", "ndjson"]).output().unwrap();
+        let out = self
+            .cmd()
+            .args(["list", "--format", "ndjson"])
+            .output()
+            .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         let wanted = path.to_str().unwrap();
         let mut labels = text
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("each line is a JSON object"))
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).expect("each line is a JSON object")
+            })
             .filter(|v| v["local_path"].as_str() == Some(wanted))
-            .map(|v| format!("{}/{}", v["owner"].as_str().unwrap(), v["name"].as_str().unwrap()));
-        labels
-            .next()
-            .unwrap_or_else(|| panic!("no listed row has local_path {wanted:?}; ro list said:\n{text}"))
+            .map(|v| {
+                format!(
+                    "{}/{}",
+                    v["owner"].as_str().unwrap(),
+                    v["name"].as_str().unwrap()
+                )
+            });
+        labels.next().unwrap_or_else(|| {
+            panic!("no listed row has local_path {wanted:?}; ro list said:\n{text}")
+        })
     }
 }
 
@@ -157,10 +169,7 @@ fn an_unknown_repo_name_on_tag_verbs_exits_usage_not_fatal() {
 #[test]
 fn an_unknown_repo_name_on_status_exits_usage() {
     let t = Test::initialised();
-    t.cmd()
-        .args(["status", "nosuchrepo"])
-        .assert()
-        .code(64);
+    t.cmd().args(["status", "nosuchrepo"]).assert().code(64);
 }
 
 /// A missing `=` is the simplest possible mistyped command line.
@@ -195,11 +204,7 @@ fn sync_json_is_one_parseable_document_over_a_fleet() {
         enrolled(&t);
     }
 
-    let out = t
-        .cmd()
-        .args(["sync", "--format", "json"])
-        .output()
-        .unwrap();
+    let out = t.cmd().args(["sync", "--format", "json"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
 
     let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
@@ -209,15 +214,13 @@ fn sync_json_is_one_parseable_document_over_a_fleet() {
              stdout was {} bytes with {} top-level arrays — the Json arm is \
              inside the per-repo loop, so N repos print N copies of the fleet.",
             text.len(),
-            text.lines().filter(|l| l.trim_start().starts_with('[')).count(),
+            text.lines()
+                .filter(|l| l.trim_start().starts_with('['))
+                .count(),
         )
     });
     let rows = value.as_array().expect("a fleet of results is an array");
-    assert_eq!(
-        rows.len(),
-        3,
-        "one row per repo: {text}"
-    );
+    assert_eq!(rows.len(), 3, "one row per repo: {text}");
 }
 
 /// `ndjson` is a stream and is the negative control: one object per line,
@@ -362,7 +365,10 @@ fn the_schema_does_not_advertise_a_flag_the_binary_rejects() {
         }
     }
     collect(&schema, &mut flags);
-    assert!(flags.len() > 10, "the schema lists the whole surface: {flags:?}");
+    assert!(
+        flags.len() > 10,
+        "the schema lists the whole surface: {flags:?}"
+    );
 
     for flag in &flags {
         assert_ne!(
@@ -448,10 +454,7 @@ fn a_shipped_config_key_round_trips_into_the_file() {
         "core.layout=\"nested\"",
         "github.auth=\"env\"",
     ] {
-        t.cmd()
-            .args(["config", "set", pair])
-            .assert()
-            .success();
+        t.cmd().args(["config", "set", pair]).assert().success();
     }
     let out = t.cmd().args(["config", "print"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);

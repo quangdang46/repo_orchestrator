@@ -159,8 +159,12 @@ pub fn plan_for(
     //
     // A missing file is not an error: most repos will not have one, and
     // that is the design rather than a gap.
-    let local = ro_config::local::RepoLocalConfig::load(&local_path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e:#}", local_path.join(".ro/config.local.toml").display()))?;
+    let local = ro_config::local::RepoLocalConfig::load(&local_path).map_err(|e| {
+        anyhow::anyhow!(
+            "reading {}: {e:#}",
+            local_path.join(".ro/config.local.toml").display()
+        )
+    })?;
     let mut author_ref = repo.author_ref.clone();
     let mut credential_ref = repo.credential_ref.clone();
     let mut engine_row = repo.engine.clone();
@@ -176,7 +180,11 @@ pub fn plan_for(
 
     let identity = match author_ref.as_deref() {
         Some(name) => Some(profiles.resolve(name).map_err(|why| {
-            anyhow::anyhow!("repo {}/{}: author_ref = {name:?}\n  {why}", repo.owner, repo.name)
+            anyhow::anyhow!(
+                "repo {}/{}: author_ref = {name:?}\n  {why}",
+                repo.owner,
+                repo.name
+            )
         })?),
         None => global_identity.cloned(),
     };
@@ -419,9 +427,6 @@ mod tests {
     /// whitespace-only flag would leave the row naming `""`.
     #[test]
     fn an_empty_onto_names_the_checkout_branch() {
-        assert_eq!(
-            written_branch(&plan_onto(Some("   ")), &pushed()),
-            "work"
-        );
+        assert_eq!(written_branch(&plan_onto(Some("   ")), &pushed()), "work");
     }
 }

@@ -49,14 +49,26 @@ pub fn load_config(path: &Path) -> Result<AppConfig> {
 /// is the only way it can fire at all, since an unmodelled table is ignored
 /// rather than rejected.
 pub(crate) const CUT_TABLES: &[(&str, &str)] = &[
-    ("review", "its settings moved to [agent] and the preflight defaults"),
+    (
+        "review",
+        "its settings moved to [agent] and the preflight defaults",
+    ),
     ("providers", "use [agent] engine"),
     ("engines", "use [agent] engine"),
-    ("jobs", "the job runner is gone; `ro sync` records a run instead"),
+    (
+        "jobs",
+        "the job runner is gone; `ro sync` records a run instead",
+    ),
     ("mcp", "the MCP sidecar is gone"),
-    ("safety", "the preflight is not configurable; it always blocks"),
+    (
+        "safety",
+        "the preflight is not configurable; it always blocks",
+    ),
     ("git", "the per-command flags are the only git settings"),
-    ("checkpoint", "the preflight is not configurable; it always blocks"),
+    (
+        "checkpoint",
+        "the preflight is not configurable; it always blocks",
+    ),
 ];
 
 pub fn deprecated_tables(raw: &str) -> Vec<String> {
@@ -208,8 +220,7 @@ pub fn classify_key(dotted_key: &str) -> KeyVerdict {
         }
         return KeyVerdict::UnknownKey {
             dotted: dotted_key.to_string(),
-            suggestion: nearest_key(leaf, IDENTITY_PROFILE_KEYS)
-                .map(|k| format!("{profile}.{k}")),
+            suggestion: nearest_key(leaf, IDENTITY_PROFILE_KEYS).map(|k| format!("{profile}.{k}")),
             valid,
         };
     }
@@ -387,9 +398,7 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
             suggestion,
         } => {
             let valid = valid.join(", ");
-            let mut msg = format!(
-                "{dotted} is not a setting ro reads. Valid keys here: {valid}."
-            );
+            let mut msg = format!("{dotted} is not a setting ro reads. Valid keys here: {valid}.");
             if let Some(s) = suggestion {
                 msg.push_str(&format!(" Did you mean {s}?"));
             }
@@ -641,8 +650,10 @@ mod tests {
         // load, and must not be tripping the cut-table warning.
         let again = load_config(&path).unwrap();
         assert_eq!(cfg.core.parallel, again.core.parallel);
-        assert!(deprecated_tables(&std::fs::read_to_string(&path).unwrap()).is_empty(),
-            "the shipped default config must not look like a config to migrate");
+        assert!(
+            deprecated_tables(&std::fs::read_to_string(&path).unwrap()).is_empty(),
+            "the shipped default config must not look like a config to migrate"
+        );
     }
 
     /// A config carrying a table ro no longer reads must SAY SO.
@@ -670,10 +681,16 @@ bin = \"claude\"
         )
         .unwrap();
         let notes = deprecated_tables(&std::fs::read_to_string(&path).unwrap());
-        assert!(notes.len() >= 2, "both stale tables must be reported, got {notes:?}");
+        assert!(
+            notes.len() >= 2,
+            "both stale tables must be reported, got {notes:?}"
+        );
         let joined = notes.join(" ");
         assert!(joined.contains("[jobs]") && joined.contains("[providers]"));
-        assert!(joined.contains("ro config set"), "and the note must say what to do");
+        assert!(
+            joined.contains("ro config set"),
+            "and the note must say what to do"
+        );
         // And the file still loads — a warning, not a refusal.
         assert!(load_config(&path).is_ok());
     }
@@ -795,7 +812,10 @@ bin = \"claude\"
         let err = set_key_in_file(&path, "github.aut", "\"gh\"").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("github.aut"), "got: {msg}");
-        assert!(msg.contains("auth"), "the valid keys must be named, got: {msg}");
+        assert!(
+            msg.contains("auth"),
+            "the valid keys must be named, got: {msg}"
+        );
         assert!(msg.contains("Did you mean github.auth?"), "got: {msg}");
     }
 
@@ -829,7 +849,10 @@ bin = \"claude\"
         set_key_in_file(&path, "identity.work.email", "\"dev@corp.com\"").unwrap();
 
         let cfg = load_config(&path).unwrap();
-        let id = cfg.identity.resolve("work").expect("both keys were written");
+        let id = cfg
+            .identity
+            .resolve("work")
+            .expect("both keys were written");
         assert_eq!(id.name, "Dev Work");
         assert_eq!(id.email, "dev@corp.com");
     }
@@ -852,7 +875,10 @@ bin = \"claude\"
             .resolve("work")
             .expect_err("an incomplete profile must not resolve to an address")
             .to_string();
-        assert!(err.contains("name"), "it must say what is missing, got: {err}");
+        assert!(
+            err.contains("name"),
+            "it must say what is missing, got: {err}"
+        );
     }
 
     /// A typo inside a profile is refused, and the message names the profile
@@ -866,8 +892,14 @@ bin = \"claude\"
         let err = set_key_in_file(&path, "identity.work.emali", "\"x@y.z\"").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("identity.work.emali"), "got: {msg}");
-        assert!(msg.contains("name"), "the profile keys must be named, got: {msg}");
-        assert!(msg.contains("email"), "the profile keys must be named, got: {msg}");
+        assert!(
+            msg.contains("name"),
+            "the profile keys must be named, got: {msg}"
+        );
+        assert!(
+            msg.contains("email"),
+            "the profile keys must be named, got: {msg}"
+        );
     }
 
     /// Every key in the shipped default config must be one `ro config set`
@@ -924,7 +956,10 @@ bin = \"claude\"
         let err = set_key_in_file(&path, "core", "4").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("core"), "got: {msg}");
-        assert!(msg.contains("layout"), "the valid keys must be named, got: {msg}");
+        assert!(
+            msg.contains("layout"),
+            "the valid keys must be named, got: {msg}"
+        );
     }
 
     /// A key too deep to be real. `core.layout.x` parses, and nothing reads

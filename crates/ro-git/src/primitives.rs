@@ -193,11 +193,7 @@ pub fn commit_all(repo: &Path, message: &str) -> Result<String> {
 /// The parameters are a plain `(name, email)` rather than a profile type, so
 /// this crate keeps no dependency on the config layer: `ro-git` runs git
 /// commands, and what an "identity profile" means is not its business.
-pub fn commit_all_as(
-    repo: &Path,
-    message: &str,
-    author: Option<(&str, &str)>,
-) -> Result<String> {
+pub fn commit_all_as(repo: &Path, message: &str, author: Option<(&str, &str)>) -> Result<String> {
     let mut argv: Vec<String> = Vec::new();
     if let Some((name, email)) = author {
         // `-c` is a git-wide option and has to precede the subcommand.
@@ -1109,11 +1105,7 @@ pub fn amend_tree(
         }
         // Uncommit whatever landed on top, keeping every change staged, then
         // amend the commit underneath. One rewrite, not N.
-        run_in(
-            Some(repo),
-            &["reset", "--soft", prev],
-            &RunOpts::none(),
-        )?;
+        run_in(Some(repo), &["reset", "--soft", prev], &RunOpts::none())?;
     }
 
     let mut argv: Vec<String> = Vec::new();

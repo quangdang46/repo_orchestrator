@@ -122,7 +122,10 @@ impl IdentityConfig {
             if known.is_empty() {
                 format!("no [identity.*] profile named {name:?} is defined")
             } else {
-                format!("no [identity.*] profile named {name:?}; known: {}", known.join(", "))
+                format!(
+                    "no [identity.*] profile named {name:?}; known: {}",
+                    known.join(", ")
+                )
             }
         })?;
 
@@ -341,7 +344,10 @@ pub fn is_modelled_field<T: serde::de::DeserializeOwned>(key: &str) -> bool {
 
 /// The keys of `table`, or `None` if no such table is read.
 pub fn known_keys_for(table: &str) -> Option<&'static [&'static str]> {
-    CONFIG_KEYS.iter().find(|(t, _)| *t == table).map(|(_, k)| *k)
+    CONFIG_KEYS
+        .iter()
+        .find(|(t, _)| *t == table)
+        .map(|(_, k)| *k)
 }
 
 /// The closest key to `typo`, when one is close enough to have been meant.
@@ -438,10 +444,7 @@ engine = "codex"
         assert_eq!(cfg.core.parallel, 3);
         assert_eq!(cfg.core.timeout_secs, 45);
         assert_eq!(cfg.identity.default.as_deref(), Some("work"));
-        assert_eq!(
-            cfg.identity.resolve("work").unwrap().email,
-            "dev@corp.com"
-        );
+        assert_eq!(cfg.identity.resolve("work").unwrap().email, "dev@corp.com");
         assert_eq!(cfg.auth.expected_login.as_deref(), Some("quangdang46"));
         assert_eq!(cfg.github.auth, "gh");
         assert_eq!(cfg.agent.engine.as_deref(), Some("codex"));
@@ -573,10 +576,16 @@ engine = "codex"
     #[test]
     fn a_typo_is_recognised_as_a_typo() {
         assert_eq!(
-            nearest_key("paralel", &["layout", "parallel", "projects_dir", "timeout_secs"]),
+            nearest_key(
+                "paralel",
+                &["layout", "parallel", "projects_dir", "timeout_secs"]
+            ),
             Some("parallel")
         );
-        assert_eq!(nearest_key("layot", &["layout", "parallel"]), Some("layout"));
+        assert_eq!(
+            nearest_key("layot", &["layout", "parallel"]),
+            Some("layout")
+        );
         // A different word, not a typo: no suggestion, rather than a wrong one.
         assert_eq!(nearest_key("banana", &["layout", "parallel"]), None);
     }

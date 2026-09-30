@@ -65,7 +65,8 @@ pub fn credential_env(clone_url: &str, reference: Option<&str>) -> Result<Creden
     let parsed: CredentialRef = reference
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid credential reference: {e}"))?;
-    let secret = ro_core::credential_resolve::resolve(&parsed).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let secret =
+        ro_core::credential_resolve::resolve(&parsed).map_err(|e| anyhow::anyhow!("{e}"))?;
     let env = match extraheader_host(clone_url) {
         Some(host) => ro_git::mutation::extraheader_env(&host, &secret),
         // A local path and an SSH remote have no HTTP origin to scope this
@@ -318,9 +319,10 @@ pub fn classify_add_input(input: &str) -> Result<AddSource> {
     //    user is standing right in front of it.
     let path = std::path::Path::new(value);
     if path.join(".git").exists() {
-        let canonical = strip_verbatim(path.canonicalize().with_context(|| {
-            format!("resolving local path: {}", path.display())
-        })?);
+        let canonical = strip_verbatim(
+            path.canonicalize()
+                .with_context(|| format!("resolving local path: {}", path.display()))?,
+        );
         let name = canonical
             .file_name()
             .and_then(|n| n.to_str())
@@ -834,7 +836,10 @@ pub fn find_repo(conn: &Connection, key: &str) -> Result<TrackedRepo> {
             bail!(
                 "'{key}' matches more than one repo: {}/{} and {}/{}. \
                  Use owner/name.",
-                first.owner, first.name, second.owner, second.name
+                first.owner,
+                first.name,
+                second.owner,
+                second.name
             );
         }
         return Ok(first);
@@ -999,7 +1004,13 @@ mod tests {
     #[test]
     fn add_basic() {
         let (tmp, conn) = setup();
-        let repo = add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap();
+        let repo = add(
+            &conn,
+            "quangdang46/repo_orchestrator",
+            &projects_dir(&tmp),
+            "nested",
+        )
+        .unwrap();
         assert_eq!(repo.owner, "quangdang46");
         assert_eq!(repo.name, "repo_orchestrator");
         assert_eq!(repo.host, "github.com");
@@ -1023,8 +1034,20 @@ mod tests {
     #[test]
     fn add_rejects_duplicate() {
         let (tmp, conn) = setup();
-        add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap();
-        let err = add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap_err();
+        add(
+            &conn,
+            "quangdang46/repo_orchestrator",
+            &projects_dir(&tmp),
+            "nested",
+        )
+        .unwrap();
+        let err = add(
+            &conn,
+            "quangdang46/repo_orchestrator",
+            &projects_dir(&tmp),
+            "nested",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("already tracked"));
     }
 
@@ -1038,7 +1061,13 @@ mod tests {
     #[test]
     fn remove_by_owner_name() {
         let (tmp, conn) = setup();
-        add(&conn, "quangdang46/repo_orchestrator", &projects_dir(&tmp), "nested").unwrap();
+        add(
+            &conn,
+            "quangdang46/repo_orchestrator",
+            &projects_dir(&tmp),
+            "nested",
+        )
+        .unwrap();
         let removed = remove(&conn, "quangdang46/repo_orchestrator").unwrap();
         assert_eq!(removed.name, "repo_orchestrator");
         assert!(list(&conn, None).unwrap().is_empty());
@@ -1525,6 +1554,13 @@ mod tests {
 #[cfg(test)]
 mod verbatim_tests {
     use super::strip_verbatim;
+    // Only the `cfg(windows)` tests below name `PathBuf` unqualified, and only
+    // they are compiled on Windows — so an unconditional import would be an
+    // unused import everywhere else, and `-D warnings` would fail the build
+    // that is otherwise fine. The gate is the whole point: this module did
+    // not build on Windows at all until the import was added.
+    #[cfg(windows)]
+    use std::path::PathBuf;
 
     /// The prefix is a Win32 implementation detail, and it was ending up in
     /// the stored `local_path` and in every line `ro list` printed. A repo

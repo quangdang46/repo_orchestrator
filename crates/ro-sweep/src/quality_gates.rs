@@ -179,6 +179,16 @@ pub fn run_gate(repo_path: &Path, gate: &Gate) -> GateResult {
         .current_dir(repo_path)
         .env("CI", "true")
         .env("GIT_TERMINAL_PROMPT", "0")
+        // A gate is a third-party binary that may shell out to git itself
+        // (`cargo` fetching a git dependency is the ordinary case). The same
+        // argument as everywhere else in ro: `GIT_TERMINAL_PROMPT=0` silences
+        // a terminal, not a credential helper, and on Windows that helper is
+        // Git Credential Manager and its password prompt is a window on the
+        // user's desktop. A gate runs unattended, so it must not be able to
+        // open one. These cannot be set as `-c credential.helper=` the way
+        // ro's own git calls do, because this is not a git invocation.
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GCM_UI", "Never")
         .env("LC_ALL", "C")
         .env("CARGO_TERM_COLOR", "never");
     let output = cmd.output();

@@ -84,11 +84,7 @@ impl AheadBehind {
 /// remote-tracking ref was written by something other than a fetch, has no
 /// timestamp to report, and answering `Some(0)` there would put a number on
 /// a question nobody asked.
-pub fn remote_ref_updated_at(
-    repo_path: &Path,
-    remote: &str,
-    branch: &str,
-) -> Result<Option<i64>> {
+pub fn remote_ref_updated_at(repo_path: &Path, remote: &str, branch: &str) -> Result<Option<i64>> {
     let refname = format!("refs/remotes/{remote}/{branch}");
     let path = repo_path.join(".git").join("logs").join(&refname);
     let path = if path.is_file() {
@@ -110,12 +106,8 @@ pub fn remote_ref_updated_at(
             return Ok(None);
         }
     };
-    let contents = std::fs::read_to_string(&path).with_context(|| {
-        format!(
-            "reading the reflog for {refname} at {}",
-            path.display()
-        )
-    })?;
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading the reflog for {refname} at {}", path.display()))?;
     // The reflog is append-only, so the last line is the newest entry, and
     // its shape is
     //
@@ -130,8 +122,7 @@ pub fn remote_ref_updated_at(
     // committer identity before it may itself contain spaces.
     let newest = contents
         .lines()
-        .filter(|l| !l.trim().is_empty())
-        .next_back()
+        .rfind(|l| !l.trim().is_empty())
         .and_then(|line| line.split('\t').next())
         .and_then(|head| head.split_whitespace().rev().nth(1))
         .and_then(|ts| ts.parse::<i64>().ok());
@@ -264,7 +255,10 @@ mod tests {
         let work = tmp.join("work");
         std::fs::create_dir_all(&work).unwrap();
         run_git(&work, &["init", "-q", "-b", "main"]);
-        run_git(&work, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        run_git(
+            &work,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
         std::fs::write(work.join("a.txt"), "one\n").unwrap();
         run_git(&work, &["add", "."]);
         run_git(&work, &["commit", "-q", "-m", "one"]);
@@ -353,7 +347,10 @@ mod tests {
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
         run_git(&work, &["init", "-q", "-b", "main"]);
-        run_git(&work, &["remote", "add", "origin", &remote.to_string_lossy()]);
+        run_git(
+            &work,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
         std::fs::write(work.join("a.txt"), "one\n").unwrap();
         run_git(&work, &["add", "."]);
         run_git(&work, &["commit", "-q", "-m", "one"]);

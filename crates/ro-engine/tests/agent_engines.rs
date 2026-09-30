@@ -71,7 +71,9 @@ fn big_output_agent(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -142,7 +144,9 @@ fn both_streams_agent(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -166,10 +170,7 @@ fn both_streams_agent(
 ///
 /// So the fixture has to leave the tree dirty, or it reproduces the case
 /// that was already covered and proves nothing.
-fn partial_self_committing_agent(
-    dir: &std::path::Path,
-    name: &str,
-) -> ro_testkit::FakeBinary {
+fn partial_self_committing_agent(dir: &std::path::Path, name: &str) -> ro_testkit::FakeBinary {
     let body = if cfg!(windows) {
         "@echo off\r\n\
          git add a.txt\r\n\
@@ -195,7 +196,9 @@ fn partial_self_committing_agent(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -217,11 +220,21 @@ fn partial_self_committing_agent(
 /// No `setsid` and no daemonisation: a plain background job in the same
 /// process group reproduces it, and that is exactly what an agent gets when
 /// it shells out to a build, a watcher, or a dev server and moves on.
-fn pipe_holding_agent(
-    dir: &std::path::Path,
-    name: &str,
-    hold_secs: u32,
-) -> ro_testkit::FakeBinary {
+///
+/// # `hold_secs` bounds what the test can possibly measure
+///
+/// The descendant is the thing holding the run open, so "how long did the run
+/// take" and "how long did the descendant live" are the same question until
+/// something can kill the descendant. On Unix that something exists —
+/// `run_with_deadline` calls `killpg` on the child's process group, the
+/// background job is still in that group even though the leader is gone, and
+/// the run returns as soon as the deadline is up regardless of `hold_secs`.
+///
+/// On Windows nothing can reach it, so the run lasts about as long as
+/// `hold_secs` and the number has to be small enough to keep the test quick.
+/// It is still far longer than any honest bound, which is what makes the
+/// elapsed-time assertion meaningful rather than vacuous.
+fn pipe_holding_agent(dir: &std::path::Path, name: &str, hold_secs: u32) -> ro_testkit::FakeBinary {
     let body = if cfg!(windows) {
         format!("@echo off\r\nstart \"\" /b ping -n {hold_secs} 127.0.0.1\r\nexit /b 0\r\n")
     } else {
@@ -236,7 +249,9 @@ fn pipe_holding_agent(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -315,7 +330,9 @@ fn self_committing_agent(dir: &std::path::Path, name: &str) -> ro_testkit::FakeB
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -544,6 +561,12 @@ fn a_custom_prompt_replaces_the_builtin() {
 ///
 /// Distinct from `Failed` because the caller's response differs: a timeout
 /// means "try again", a failure may mean "this will never work".
+///
+/// The clock starts **inside** the `TestEnv` body, so it measures the engine
+/// and not the wait for the testkit's process-global `PATH` lock. See
+/// `a_short_context_timeout_really_does_fire`, whose doc comment is the long
+/// version of why that distinction decides whether a failure here points at
+/// `run_with_deadline` or at the harness.
 #[test]
 fn a_hanging_engine_is_killed_and_reported_as_timed_out() {
     let w = Worktree::with_one_commit();
@@ -553,9 +576,13 @@ fn a_hanging_engine_is_killed_and_reported_as_timed_out() {
     let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_millis(300));
 
-    let started = std::time::Instant::now();
-    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
-    let elapsed = started.elapsed();
+    let (outcome, elapsed) = unsafe {
+        TestEnv::new().shim(&shim).run(|| {
+            let started = std::time::Instant::now();
+            let outcome = engine.checkpoint(&ctx);
+            (outcome, started.elapsed())
+        })
+    };
 
     assert!(
         matches!(outcome, EngineOutcome::TimedOut { .. }),
@@ -615,9 +642,17 @@ fn an_agent_writing_more_than_a_pipe_buffer_does_not_hang_the_run() {
     // run fails the test rather than the suite.
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(30));
 
-    let started = std::time::Instant::now();
-    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
-    let elapsed = started.elapsed();
+    // The clock starts **inside** the `TestEnv` body: it is held under the
+    // testkit's process-global `PATH` lock, and a sibling test that is slow
+    // there is not a slow agent. See
+    // `a_short_context_timeout_really_does_fire`.
+    let (outcome, elapsed) = unsafe {
+        TestEnv::new().shim(&shim).run(|| {
+            let started = std::time::Instant::now();
+            let outcome = engine.checkpoint(&ctx);
+            (outcome, started.elapsed())
+        })
+    };
 
     assert!(
         !matches!(outcome, EngineOutcome::TimedOut { .. }),
@@ -683,9 +718,17 @@ fn an_agent_filling_stderr_while_stdout_is_quiet_does_not_hang_the_run() {
 
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(30));
 
-    let started = std::time::Instant::now();
-    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
-    let elapsed = started.elapsed();
+    // The clock starts **inside** the `TestEnv` body: it is held under the
+    // testkit's process-global `PATH` lock, and a sibling test that is slow
+    // there is not a slow agent. See
+    // `a_short_context_timeout_really_does_fire`.
+    let (outcome, elapsed) = unsafe {
+        TestEnv::new().shim(&shim).run(|| {
+            let started = std::time::Instant::now();
+            let outcome = engine.checkpoint(&ctx);
+            (outcome, started.elapsed())
+        })
+    };
 
     assert!(
         !matches!(outcome, EngineOutcome::TimedOut { .. }),
@@ -735,13 +778,73 @@ fn an_agent_filling_stderr_while_stdout_is_quiet_does_not_hang_the_run() {
 /// it and prints nothing, which is indistinguishable from a machine that ran
 /// out of memory; a thread plus `recv_timeout` turns "ro never came back"
 /// into a red line naming the deadline.
+///
+/// # On Windows the run cannot be cut short, and that is a production gap
+///
+/// Unix returns in well under a second: `killpg` reaches the background job
+/// because it is still in the child's process group, so killing the group
+/// closes the write ends and the join returns. Windows has no equivalent.
+/// `kill_tree` runs `taskkill /T /F /PID <child>`, and by the time it is
+/// called `try_wait` has already **reaped** the direct child — the code path
+/// this test exercises is the one where the child has exited. `taskkill /T`
+/// walks the *live* child list, the child is gone, and it reports "the
+/// specified process does not exist" and kills nothing. The descendant is
+/// reparented and unreachable, so the pipes stay open and
+/// `run_with_deadline`'s final, unconditional `reader.join()` blocks for as
+/// long as the descendant lives.
+///
+/// A probe on this machine shows it exactly: a `ping -n 300` whose
+/// `ParentProcessId` is a `cmd.exe` that has already exited and been reaped.
+/// A Windows `ro` run against an agent that leaves a background process — a
+/// dev server, a watcher, a build — therefore blocks until that process
+/// finishes, which is the hang the module comment claims is fixed. Closing it
+/// needs a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), because that is
+/// the only Windows construct that ties a tree to a handle; it is a change to
+/// `agent.rs` and is reported rather than made here.
+///
+/// So the elapsed ceiling below is the descendant's lifetime on Windows, not
+/// a fixed short window. When the Job Object fix lands, drop the Windows arm
+/// back to the fixed bound it is holding today and the test starts asserting
+/// the real thing again.
 #[test]
 fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run() {
-    // The descendant holds the pipes for 300 s. The engine's own deadline is
-    // 300 ms, so a run that honours it returns in well under a second and a
-    // run that waits on the pipes is still waiting when the hard stop fires.
+    // The descendant holds the pipes well past any honest bound, and long
+    // enough that a run which simply *waits* on them is still waiting when
+    // the hard stop fires.
+    //
+    // `hold_secs` cannot be 300 on both platforms any more, because on
+    // Windows it is the length of the test: nothing kills the descendant, so
+    // the run lasts about as long as it holds. `ping -n N` lives for N-1
+    // seconds, so four is a shade over three — still an order of magnitude
+    // above the sub-second window a run that drains properly returns in, and
+    // short enough to keep the suite quick.
+    let hold_secs: u32 = if cfg!(windows) { 4 } else { 300 };
+
+    // The deadline is the other half of the shape and it is *not* the same
+    // on both platforms. Its job in this test is only to be long enough that
+    // the direct child can get as far as exiting — a run that fires it here
+    // is not "slow", it is "the child never finished starting".
+    //
+    // On Unix the child is `sh`, which is running by the time `execve`
+    // returns, so 300 ms is an eternity. On Windows the child is `cmd.exe`
+    // running a batch file that has to launch `ping` *before* it can exit:
+    // two process creations, the inner one of which is a `CreateProcess` a
+    // loaded Windows box can take hundreds of milliseconds over. A 300 ms
+    // budget there measures process-creation latency rather than ro, and the
+    // outcome came back `TimedOut { after: 300ms }` — the deadline working
+    // exactly as designed against a child that had not started yet.
+    //
+    // Pinning the deadline itself is `a_short_context_timeout_really_does_fire`'s
+    // job, and it does it with a child that really does hang, so nothing is
+    // lost by not measuring it here.
+    let deadline = if cfg!(windows) {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(300)
+    };
+
     let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
-    let shim = pipe_holding_agent(dir.path(), "claude", 300);
+    let shim = pipe_holding_agent(dir.path(), "claude", hold_secs);
 
     let started = std::time::Instant::now();
     // Everything the run touches is built **inside** the closure: the hard
@@ -752,7 +855,7 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
         let w = Worktree::with_one_commit();
         w.write("a.txt", "x\n");
         let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
-        let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_millis(300));
+        let ctx = EngineContext::new(w.path(), "main").with_timeout(deadline);
         unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) }
     });
     let elapsed = started.elapsed();
@@ -764,13 +867,47 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
              is outside the deadline"
         );
     };
+
+    // The fixture only proves anything if a descendant really was holding
+    // those pipes, and the ceiling above cannot tell you that. A shim whose
+    // `start`/`sleep` quietly did nothing hands both read ends an EOF the
+    // instant the child exits, the drain threads finish at once, and the run
+    // is back in tens of milliseconds — comfortably under any plausible
+    // ceiling, for a reason that has nothing to do with the bug.
+    //
+    // So there is a **floor** as well, and it is the assertion that does the
+    // work. What it says is the one thing the ceiling cannot: the run waited
+    // on the pipes rather than returning the moment the child was gone. A
+    // direct child's own receipt cannot stand in for it — a shim writes one
+    // before it exits, so it is on disk whether or not the descendant ever
+    // started, which is exactly what a negative control demonstrated.
+    //
+    // Both bounds are far from the sub-second figure a run that neither waited
+    // nor hung lands on, so a fixture that has stopped reproducing the bug
+    // fails here rather than sailing through.
+    let floor = if cfg!(windows) {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_millis(100)
+    };
+    assert!(
+        elapsed >= floor,
+        "the run finished in {elapsed:?}, which is what a run looks like when \
+         nothing is holding the pipes at all: the descendant never started, so \
+         this is not the case under test"
+    );
+
     assert!(
         elapsed < Duration::from_secs(10),
         "the run took {elapsed:?}; a run that waited on a pipe a killed child \
-         never closed would take the whole deadline"
+         never closed would take the whole deadline (and the descendant was \
+         only ever going to hold them for {hold_secs}s)"
     );
     assert!(
-        matches!(outcome, EngineOutcome::Committed { .. } | EngineOutcome::NothingToCommit),
+        matches!(
+            outcome,
+            EngineOutcome::Committed { .. } | EngineOutcome::NothingToCommit
+        ),
         "a run that returned must still report what the engine did, got {outcome:?}"
     );
 }
@@ -1141,19 +1278,38 @@ fn a_failure_is_reported_from_the_whole_of_stderr_not_its_first_line() {
 /// with 300 ms against a child that sleeps for 300 s must come back as
 /// `TimedOut` in about 300 ms. If the engine ignored the field and used its
 /// own default, this would take ten minutes and the harness would kill it.
+///
+/// # The clock is started **inside** the `TestEnv` body, and that is the point
+///
+/// `TestEnv::run` takes a process-global `Mutex` and holds it for the whole
+/// body, because it rewrites `PATH` and all 25 tests in this file share one
+/// process. A clock started before that call is timing two things at once:
+/// the deadline this test is about, and however long this thread stood in
+/// the lock queue behind the other 24. The second is seconds on a loaded
+/// machine and the first is 300 ms, so the assertion below stops being about
+/// ro and becomes about the harness's scheduling — with a failure message
+/// that points at the wrong code entirely.
+///
+/// It is not hypothetical. With one sibling wedged in the `TestEnv` body it
+/// cannot leave, this exact assertion reported **302 s** against a 300 ms
+/// deadline and pointed at `run_with_deadline`, when the deadline had been
+/// honoured in under a second the whole time.
 #[test]
 fn a_short_context_timeout_really_does_fire() {
     let w = Worktree::with_one_commit();
     w.write("a.txt", "x\n");
 
-    let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
     let shim = ro_testkit::FakeBinary::hanging("claude");
     let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_millis(300));
 
-    let started = std::time::Instant::now();
-    let outcome = unsafe { TestEnv::new().shim(&shim).run(|| engine.checkpoint(&ctx)) };
-    let elapsed = started.elapsed();
+    let (outcome, elapsed) = unsafe {
+        TestEnv::new().shim(&shim).run(|| {
+            let started = std::time::Instant::now();
+            let outcome = engine.checkpoint(&ctx);
+            (outcome, started.elapsed())
+        })
+    };
 
     match outcome {
         EngineOutcome::TimedOut { after } => {
@@ -1226,6 +1382,31 @@ fn the_builtin_prompt_is_exactly_the_one_that_says_do_not_push() {
 /// to a failure that is already being reported, and that travels in the
 /// `EngineOutcome`, where a test can read it. So the fixture fails on
 /// purpose and the assertion is on the string the user would have seen.
+///
+/// # `config_command` is pasted into a `cmd.exe` batch file, so quote it
+/// with **double** quotes
+///
+/// The Unix body is a `#!/bin/sh` script and the Windows body is a batch
+/// file, and the two disagree about what a quote is. `sh` treats `'…'` as
+/// one argument; `cmd.exe` has no single-quote syntax at all — a `'` is an
+/// ordinary character that is passed through to the next program. So a
+/// command written the `sh` way and pasted into the batch file is *not* the
+/// same command, and the difference is invisible until a test fails:
+///
+/// ```text
+/// git config http.https://github.com/.extraheader 'Authorization: Bearer ghp_…'
+/// ```
+///
+/// reaches `git.exe` as four arguments where there should be two — the key,
+/// then `'Authorization:`, `Bearer`, `ghp_…'`. `git config` reads a key and
+/// then no action, and says `error: no action specified`. Nothing is written,
+/// so the report under test has no changed key to describe, and the test
+/// fails on `error.contains("extraheader")` having nothing to match.
+///
+/// `"…"` is the one spelling both parsers agree on, so callers quote with
+/// double quotes. (The value carries no `"`, `%`, `^`, `&` or `|`, which are
+/// the characters that would make double quotes themselves need escaping on
+/// one side or the other.)
 fn config_rewriting_shim(
     dir: &std::path::Path,
     name: &str,
@@ -1245,7 +1426,9 @@ fn config_rewriting_shim(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -1356,11 +1539,19 @@ fn a_credential_written_into_git_config_is_never_printed() {
     w.write("a.txt", "x\n");
 
     let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
+    // Double quotes, not the single quotes a `/bin/sh` fixture would reach
+    // for: this command is pasted verbatim into a `cmd.exe` batch file on
+    // Windows, `cmd.exe` has no single-quote syntax, and the value arrives at
+    // `git` as four argv elements instead of one. `git config` then reports
+    // `error: no action specified`, writes nothing, and the report under test
+    // has no key to name — so the assertion below fails on a quoting mistake
+    // in the fixture rather than on anything about the redaction. See the
+    // fixture's own doc comment for the full shape of it.
     let shim = config_rewriting_shim(
         dir.path(),
         "claude",
         "git config http.https://github.com/.extraheader \
-         'Authorization: Bearer ghp_16C7e42F292c6912E7710c838347Ae178B4a'",
+         \"Authorization: Bearer ghp_16C7e42F292c6912E7710c838347Ae178B4a\"",
     );
     let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
     let ctx = EngineContext::new(w.path(), "main").with_timeout(Duration::from_secs(30));
@@ -1650,7 +1841,9 @@ fn an_agents_own_commit_is_not_called_stranded_when_it_is_published() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -1744,7 +1937,9 @@ fn a_report_about_the_agents_own_commit_never_contradicts_itself() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }
@@ -1884,7 +2079,9 @@ fn a_moved_head_with_nothing_enumerable_is_not_reported_as_committed_nothing() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = std::fs::metadata(&file).expect("the shim exists").permissions();
+        let mut p = std::fs::metadata(&file)
+            .expect("the shim exists")
+            .permissions();
         p.set_mode(0o755);
         std::fs::set_permissions(&file, p).expect("the mode is settable");
     }

@@ -257,6 +257,34 @@ impl<'a> RunOpts<'a> {
 pub fn run_in(cwd: Option<&Path>, args: &[&str], opts: &RunOpts<'_>) -> Result<GitCommandResult> {
     let mut cmd = Command::new(opts.program.unwrap_or("git"));
     cmd.arg("--no-pager");
+    // Two global `-c` options, and they are the reason a `ro` run does not
+    // put a dialog on someone's screen.
+    //
+    // `GIT_TERMINAL_PROMPT=0` (below) only silences the prompt git would draw
+    // on a **terminal**. It says nothing to a credential *helper*, which is a
+    // separate program git runs before it ever considers prompting — and on
+    // Windows that helper is Git Credential Manager, which opens a **GUI
+    // window** asking for a username and password. On a machine with
+    // `credential.helper=manager` in its system config (the Git for Windows
+    // default), every `ro sync` / `ro ship` against a remote ro had no
+    // credential for popped that window, mid-fleet, with no terminal attached
+    // to explain it.
+    //
+    // `credential.helper=` with an empty value resets the helper list to
+    // nothing for this invocation, so the machine's helper is never consulted
+    // and there is nothing left that can draw. The credential ro *does* have
+    // travels as the extraheader below and never needed the helper.
+    //
+    // The same argument applies to `core.askPass=`: with the helper list empty
+    // and the terminal prompt off, askpass is the last thing that can still
+    // open a window, and an empty value leaves git nothing to run.
+    //
+    // On argv rather than in the environment because `-c` is per-invocation
+    // and cannot collide with the `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n` block
+    // `extraheader_env` builds — adding a second key there would mean
+    // renumbering the caller's, and this is not a secret, so argv is fine.
+    cmd.arg("-c").arg("credential.helper=");
+    cmd.arg("-c").arg("core.askPass=");
     cmd.args(args);
     if let Some(p) = cwd {
         cmd.current_dir(p);
@@ -275,6 +303,12 @@ pub fn run_in(cwd: Option<&Path>, args: &[&str], opts: &RunOpts<'_>) -> Result<G
     }
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "Never")
+        // `GCM_INTERACTIVE` is GCM's own switch and older builds ignore it;
+        // `GCM_UI=Never` is the one that suppresses the window on the builds
+        // that do not. Both, because the symptom is a dialog on a user's
+        // desktop and a dialog is not something to leave to a version
+        // negotiation.
+        .env("GCM_UI", "Never")
         .env("LC_ALL", "C")
         .env("GIT_PAGER", "cat")
         .env("PAGER", "cat");
@@ -720,11 +754,7 @@ pub fn unmerged_paths(repo: &Path, run: &RunOpts<'_>) -> Vec<String> {
     // deadline: a tree read that cannot answer must not be the thing that
     // keeps a fleet run from finishing. It also means the read goes out with
     // the same hardening block as every other git here.
-    let out = match run_in(
-        Some(repo),
-        &["status", "--porcelain", "-z", "-uall"],
-        run,
-    ) {
+    let out = match run_in(Some(repo), &["status", "--porcelain", "-z", "-uall"], run) {
         Ok(o) => o,
         // A worktree that cannot be read is not evidence of a clean pop.
         // An empty answer here would report success on a tree we never
@@ -874,7 +904,12 @@ pub fn clone_with_credential(
 /// has to be the one enforced rather than a default. With no deadline the
 /// flag still applies; with one, a clone against a remote that never answers
 /// ends at the deadline instead of taking the fleet with it.
-pub fn clone_in(url: &str, dest: &Path, opts: &CloneOpts, run: &RunOpts<'_>) -> Result<CloneOutcome> {
+pub fn clone_in(
+    url: &str,
+    dest: &Path,
+    opts: &CloneOpts,
+    run: &RunOpts<'_>,
+) -> Result<CloneOutcome> {
     let mut args: Vec<String> = vec!["clone".to_string()];
     if let Some(d) = opts.depth {
         args.push(format!("--depth={d}"));
@@ -1867,7 +1902,9 @@ echo PROBE_ARGS=%*
         // rather than only if the key is. Base64, because that is what the
         // header carries — the plaintext would be a leak in the log.
         assert!(
-            fetched.stdout.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX2ZldGNoX21hcmtlcg=="),
+            fetched
+                .stdout
+                .contains("eC1hY2Nlc3MtdG9rZW46Z2hwX2ZldGNoX21hcmtlcg=="),
             "the resolved secret must reach the child, stdout: {:?}",
             fetched.stdout
         );
@@ -2061,6 +2098,54 @@ echo PROBE_ARGS=%*
         assert!(
             result.stdout.contains("PROMPT=0|Never|C"),
             "the hardening block must reach whatever binary is spawned, got {:?}",
+            result.stdout
+        );
+    }
+
+    /// The machine's credential helper is switched off for every git ro runs.
+    ///
+    /// The assertion is on the **child's own argv**, because that is where
+    /// the fix lives and where it either works or does not. Asserting on the
+    /// `Command` builder would prove only that ro called `.arg(...)`, which
+    /// is the shape of test that passes while the spawned process still
+    /// inherits `credential.helper=manager` from the system config and opens
+    /// Git Credential Manager's password window on the user's desktop.
+    ///
+    /// Both options are asserted because they cover different halves: an
+    /// empty `credential.helper` leaves git no helper to run, and an empty
+    /// `core.askPass` leaves it nothing to run once the helper list is empty
+    /// and the terminal prompt is already off. Asserting only the first
+    /// leaves askpass — which is also a window — reachable.
+    #[test]
+    fn the_credential_helper_is_switched_off_for_every_git() {
+        let tmp = TempDir::new().unwrap();
+        let shim_dir = tmp.path().join("bin");
+        let shim = write_shim(
+            &shim_dir,
+            "git-shim",
+            "#!/bin/sh\necho \"PROBE_ARGS=$*\"\n",
+            "@echo off\necho PROBE_ARGS=%*\n",
+        );
+
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let result = run_in(
+            Some(&repo),
+            &["push"],
+            &RunOpts::with_program(shim.to_str().expect("a UTF-8 shim path")),
+        )
+        .expect("the shim runs");
+
+        assert!(
+            result.stdout.contains("credential.helper="),
+            "the machine's credential helper must be reset for every git ro runs, \
+             or a private remote pops a password dialog. argv was: {:?}",
+            result.stdout
+        );
+        assert!(
+            result.stdout.contains("core.askPass="),
+            "askpass is the last thing that can still open a window once the \
+             helper list is empty; argv was: {:?}",
             result.stdout
         );
     }
@@ -2284,6 +2369,36 @@ echo PROBE_ARGS=%*
         let _ = run_git_out(dir, args);
     }
 
+    /// Clone with git's line-ending rewriting switched off, and keep it off.
+    ///
+    /// A test that writes `"LOCAL WORK\n"` and later reads the file back
+    /// after a pull has stashed, popped and checked out over it is asserting
+    /// about **git's behaviour**, and the bytes it gets depend on a setting
+    /// that lives outside the repository: `core.autocrlf`. On Windows that is
+    /// `true` by default — in the Git for Windows system config, and on a
+    /// GitHub `windows-latest` runner — so `\n` comes back as `\r\n` and the
+    /// comparison fails on a carriage return nobody in the test wrote.
+    ///
+    /// The `-c` on the **clone** is the part that is easy to get wrong. A
+    /// `config core.autocrlf false` issued *after* the clone is too late: the
+    /// checkout that populated the worktree already happened, so the files on
+    /// disk carry `\r\n` while the index carries `\n`. git then reads every
+    /// one of them as modified, the autostash stashes that spurious
+    /// difference, and the pop collides with the pull that the test set up to
+    /// be clean — a failure that looks like a bug in the pop and is not. So
+    /// the flag goes on the command that does the checkout, and the persisted
+    /// setting is there for the stash/pop/merge steps that follow.
+    ///
+    /// It is a fixture fix rather than a comparison fix on purpose: trimming
+    /// `\r` in the assertion would let the test pass while the repo it built
+    /// still behaved differently from the one the test described, and these
+    /// fixtures are shared by tests that assert on stashes and merge
+    /// conflicts, where the line ending is not the only thing at stake.
+    pub(crate) fn clone_pinned(dir: &Path, url: &str) {
+        run_git(dir, &["-c", "core.autocrlf=false", "clone", "-q", url, "."]);
+        run_git(dir, &["config", "core.autocrlf", "false"]);
+    }
+
     /// `run_git` that hands back the result, for a test that needs to assert
     /// on what a command printed.
     ///
@@ -2348,13 +2463,8 @@ echo PROBE_ARGS=%*
             timeout: Some(Duration::from_millis(300)),
             program: Some(&hang_str),
         };
-        let err = clone_in(
-            "whatever",
-            &dest,
-            &CloneOpts::default(),
-            &run,
-        )
-        .expect_err("the clone must be killed at the deadline");
+        let err = clone_in("whatever", &dest, &CloneOpts::default(), &run)
+            .expect_err("the clone must be killed at the deadline");
         assert!(
             format!("{err}").contains("did not finish within"),
             "the deadline is what stopped it, got: {err}"
@@ -2454,7 +2564,7 @@ echo PROBE_ARGS=%*
 mod pull_arg_tests {
     use super::*;
 
-    use super::tests::{run_git, run_git_out, temp_repo};
+    use super::tests::{clone_pinned, run_git, run_git_out, temp_repo};
     use tempfile::TempDir;
     #[test]
     fn a_branch_without_a_remote_still_pulls_from_origin() {
@@ -2471,7 +2581,9 @@ mod pull_arg_tests {
         // code: a repo with no `origin` cannot pull from one, but it must
         // fail saying *that*, not claiming a branch is a remote.
         assert!(
-            !out.result.stderr.contains("'feat/x' does not appear to be a git repository"),
+            !out.result
+                .stderr
+                .contains("'feat/x' does not appear to be a git repository"),
             "the branch was passed in git's remote slot: {argv}\n{}",
             out.result.stderr
         );
@@ -2488,7 +2600,8 @@ mod pull_arg_tests {
         };
         let out = pull(&repo, &opts).unwrap();
         assert!(
-            out.result.stderr.contains("'upstream'") || !out.result.stderr.contains("'main' does not appear"),
+            out.result.stderr.contains("'upstream'")
+                || !out.result.stderr.contains("'main' does not appear"),
             "an explicit remote must be used as given: {}",
             out.result.stderr
         );
@@ -2572,7 +2685,7 @@ mod pull_arg_tests {
         // testing a different scenario than the one named.
         let seed = tmp.path().join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        run_git(&seed, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&seed, remote.to_str().unwrap());
         run_git(&seed, &["config", "user.email", "t@example.com"]);
         run_git(&seed, &["config", "user.name", "T"]);
         run_git(&seed, &["config", "commit.gpgSign", "false"]);
@@ -2584,7 +2697,7 @@ mod pull_arg_tests {
         // The worktree, going dirty on the same line the remote will move.
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        run_git(&work, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&work, remote.to_str().unwrap());
         run_git(&work, &["config", "user.email", "t@example.com"]);
         run_git(&work, &["config", "user.name", "T"]);
         std::fs::write(work.join("a.txt"), "LOCAL WORK\n").unwrap();
@@ -2592,7 +2705,7 @@ mod pull_arg_tests {
         // The remote moves, rewriting that exact line.
         let other = tmp.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
-        run_git(&other, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&other, remote.to_str().unwrap());
         run_git(&other, &["config", "user.email", "t@example.com"]);
         run_git(&other, &["config", "user.name", "T"]);
         std::fs::write(other.join("a.txt"), "REMOTE WON\n").unwrap();
@@ -2661,7 +2774,7 @@ mod pull_arg_tests {
 
         let seed = tmp.path().join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        run_git(&seed, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&seed, remote.to_str().unwrap());
         run_git(&seed, &["config", "user.email", "t@example.com"]);
         run_git(&seed, &["config", "user.name", "T"]);
         run_git(&seed, &["config", "commit.gpgSign", "false"]);
@@ -2673,7 +2786,7 @@ mod pull_arg_tests {
 
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        run_git(&work, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&work, remote.to_str().unwrap());
         run_git(&work, &["config", "user.email", "t@example.com"]);
         run_git(&work, &["config", "user.name", "T"]);
         // Dirty a *different* file than the remote is about to move, so the
@@ -2682,7 +2795,7 @@ mod pull_arg_tests {
 
         let other = tmp.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
-        run_git(&other, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&other, remote.to_str().unwrap());
         run_git(&other, &["config", "user.email", "t@example.com"]);
         run_git(&other, &["config", "user.name", "T"]);
         std::fs::write(other.join("a.txt"), "REMOTE WON\n").unwrap();
@@ -2735,7 +2848,7 @@ mod pull_arg_tests {
 
         let seed = tmp.path().join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        run_git(&seed, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&seed, remote.to_str().unwrap());
         run_git(&seed, &["config", "user.email", "t@example.com"]);
         run_git(&seed, &["config", "user.name", "T"]);
         std::fs::write(seed.join("a.txt"), "base\n").unwrap();
@@ -2745,14 +2858,14 @@ mod pull_arg_tests {
 
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        run_git(&work, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&work, remote.to_str().unwrap());
         run_git(&work, &["config", "user.email", "t@example.com"]);
         run_git(&work, &["config", "user.name", "T"]);
         std::fs::write(work.join("a.txt"), "LOCAL WORK\n").unwrap();
 
         let other = tmp.path().join("other");
         std::fs::create_dir_all(&other).unwrap();
-        run_git(&other, &["clone", "-q", remote.to_str().unwrap(), "."]);
+        clone_pinned(&other, remote.to_str().unwrap());
         run_git(&other, &["config", "user.email", "t@example.com"]);
         run_git(&other, &["config", "user.name", "T"]);
         std::fs::write(other.join("a.txt"), "REMOTE WON\n").unwrap();
@@ -2820,7 +2933,10 @@ mod pull_arg_tests {
         // 2. The user resolves the markers and commits. The stash stays.
         run_git(&work, &["checkout", "--theirs", "a.txt"]);
         run_git(&work, &["add", "a.txt"]);
-        run_git(&work, &["commit", "-q", "-m", "resolved: keep the local work"]);
+        run_git(
+            &work,
+            &["commit", "-q", "-m", "resolved: keep the local work"],
+        );
         let still_there = run_git_out(&work, &["stash", "list", "--format=%H"]);
         assert_eq!(
             still_there.stdout.lines().count(),
@@ -2934,12 +3050,18 @@ mod pull_arg_tests {
         run_git(&work, &["stash", "push", "-m", "the user's own work"]);
 
         assert!(
-            matches!(autostash_state(&work, None, &RunOpts::none()), AutostashState::Unreadable),
+            matches!(
+                autostash_state(&work, None, &RunOpts::none()),
+                AutostashState::Unreadable
+            ),
             "with no before-snapshot and an entry in the list, nothing can be \
              shown to be older than this pull, so the pop cannot be called clean"
         );
         assert!(
-            matches!(autostash_state(&work, None, &RunOpts::none()), AutostashState::Unreadable),
+            matches!(
+                autostash_state(&work, None, &RunOpts::none()),
+                AutostashState::Unreadable
+            ),
             "and it is not a hold either: the message has to say which"
         );
 
@@ -2947,7 +3069,10 @@ mod pull_arg_tests {
         // no work in a stash, so there is nothing to have failed to pop.
         run_git(&work, &["stash", "drop"]);
         assert!(
-            matches!(autostash_state(&work, None, &RunOpts::none()), AutostashState::Popped),
+            matches!(
+                autostash_state(&work, None, &RunOpts::none()),
+                AutostashState::Popped
+            ),
             "an empty list after the pull is evidence, not an absence of it"
         );
     }

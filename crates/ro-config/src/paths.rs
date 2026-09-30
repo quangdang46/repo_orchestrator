@@ -262,7 +262,14 @@ mod tests {
             assert!(t.contains_key(live), "[{live}] is read and must be shipped");
         }
         for gone in [
-            "git", "jobs", "mcp", "safety", "checkpoint", "review", "providers", "engines",
+            "git",
+            "jobs",
+            "mcp",
+            "safety",
+            "checkpoint",
+            "review",
+            "providers",
+            "engines",
         ] {
             assert!(
                 !t.contains_key(gone),
@@ -348,7 +355,11 @@ mod tests {
         let specified: Vec<&str> = READERS.iter().map(|(key, _, _)| *key).collect();
         assert_eq!(
             specified.len(),
-            READERS.iter().map(|(k, _, _)| k).collect::<std::collections::BTreeSet<_>>().len(),
+            READERS
+                .iter()
+                .map(|(k, _, _)| k)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
             "READERS lists a key twice"
         );
         for key in &inert {
@@ -361,7 +372,10 @@ mod tests {
         for (key, site, replaces) in READERS {
             assert!(
                 has_reader(
-                    key.split_once('.').map(|(t, k)| (t, k)).unwrap_or(("", key)).0,
+                    key.split_once('.')
+                        .map(|(t, k)| (t, k))
+                        .unwrap_or(("", key))
+                        .0,
                     key.split_once('.').map(|(_, k)| k).unwrap_or(key),
                 ),
                 "READERS claims {key} is read at `{site}` (replacing {replaces}), but \

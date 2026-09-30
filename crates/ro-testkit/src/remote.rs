@@ -184,8 +184,22 @@ impl Default for RemotePair {
 /// do with whatever the sibling test is asserting.
 fn git() -> Command {
     let mut c = Command::new(git_path());
+    // The same two global `-c` options ro's own git calls carry, and for the
+    // same reason: `GIT_TERMINAL_PROMPT=0` below silences a **terminal**, not
+    // a credential *helper*, and on a Windows machine the helper is Git
+    // Credential Manager — a GUI password dialog that opens over whatever the
+    // developer happens to be looking at. Several tests here point a fixture
+    // repo at a real HTTP server that demands an Authorization header, and
+    // without this the suite put a dialog on a developer's screen mid-run and
+    // then sat there waiting for input nobody was going to type.
+    //
+    // They are `-c` on the command line rather than `GIT_CONFIG_*` in the
+    // environment because this `Command` has not been given its subcommand
+    // yet, so a global option here is still in front of it.
+    c.args(["-c", "credential.helper=", "-c", "core.askPass="]);
     c.env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "Never")
+        .env("GCM_UI", "Never")
         .env("LC_ALL", "C")
         .env("GIT_AUTHOR_NAME", "Test")
         .env("GIT_AUTHOR_EMAIL", "test@example.com")

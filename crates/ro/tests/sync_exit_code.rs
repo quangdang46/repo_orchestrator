@@ -103,8 +103,11 @@ fn diverged(name: &str) -> (Worktree, BareRemote) {
     // a fast-forward rather than a rejected non-fast-forward.
     ro_testkit::worktree::run(&other_path, &["fetch", "-q", "origin", "main"]);
     ro_testkit::worktree::run(&other_path, &["checkout", "-q", "-B", "main", "FETCH_HEAD"]);
-    std::fs::write(other_path.join("shared.txt"), format!("REMOTE SIDE {name}\n"))
-        .expect("the file is writable");
+    std::fs::write(
+        other_path.join("shared.txt"),
+        format!("REMOTE SIDE {name}\n"),
+    )
+    .expect("the file is writable");
     ro_testkit::worktree::run(&other_path, &["add", "-A"]);
     ro_testkit::worktree::run(&other_path, &["commit", "-q", "-m", "remote"]);
     ro_testkit::worktree::run(&other_path, &["push", "-q", "origin", "HEAD:main"]);
@@ -149,7 +152,13 @@ fn register(t: &Test, path: &std::path::Path) -> String {
         .filter(|l| !l.is_empty())
         .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("each line is a JSON object"))
         .filter(|v| v["local_path"].as_str() == Some(wanted))
-        .map(|v| format!("{}/{}", v["owner"].as_str().unwrap(), v["name"].as_str().unwrap()));
+        .map(|v| {
+            format!(
+                "{}/{}",
+                v["owner"].as_str().unwrap(),
+                v["name"].as_str().unwrap()
+            )
+        });
     let label = labels.next().unwrap_or_else(|| {
         panic!("no listed row has local_path {wanted:?}; ro list said:\n{text}")
     });

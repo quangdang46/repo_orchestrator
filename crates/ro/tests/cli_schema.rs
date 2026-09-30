@@ -125,9 +125,9 @@ fn schema_publishes_values_only_for_args_that_take_a_value() {
 
     fn check(command: &Value, path: &str, problems: &mut Vec<String>) {
         for a in command["args"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-            let name = a["long"].as_str().unwrap_or_else(|| {
-                a["name"].as_str().unwrap_or("<unnamed>")
-            });
+            let name = a["long"]
+                .as_str()
+                .unwrap_or_else(|| a["name"].as_str().unwrap_or("<unnamed>"));
             // The schema publishes `takes_value`, so the assertion can be
             // made about the RIGHT thing rather than inferred.
             //
@@ -149,7 +149,11 @@ fn schema_publishes_values_only_for_args_that_take_a_value() {
                 ));
             }
         }
-        for sub in command["subcommands"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        for sub in command["subcommands"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
             let name = sub["name"].as_str().unwrap_or("?");
             check(sub, &format!("{path} {name}"), problems);
         }
@@ -166,11 +170,7 @@ fn schema_publishes_values_only_for_args_that_take_a_value() {
     // So the root's own args are checked directly, and each child is walked
     // through `check`, which descends `subcommands` from there on.
     check(&s, "ro", &mut problems);
-    for sub in s["commands"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or(&[])
-    {
+    for sub in s["commands"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
         let name = sub["name"].as_str().unwrap_or("?");
         check(sub, &format!("ro {name}"), &mut problems);
     }

@@ -277,9 +277,7 @@ pub fn run_verb(
         // fallback, not an override. It was read by nothing at all, so a
         // user who followed the shipped file's description of a
         // "different instruction" and set it got the built-in prompt.
-        prompt: prompt
-            .clone()
-            .or_else(|| config.agent.prompt.clone()),
+        prompt: prompt.clone().or_else(|| config.agent.prompt.clone()),
         // `core.parallel` and `core.timeout_secs` are read **here**, at the
         // one production construction site, rather than in
         // `RunOptions::default()`. The default impl is a library default
@@ -296,7 +294,6 @@ pub fn run_verb(
         // the program actually applied.
         parallel: config.core.parallel.max(1) as usize,
         timeout: std::time::Duration::from_secs(config.core.timeout_secs.max(1) as u64),
-        ..Default::default()
     };
     let summary = run(&plans, &opts);
 

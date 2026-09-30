@@ -162,7 +162,6 @@ pub fn ensure_gitignored(repo_root: &Path) -> Result<bool> {
     }
     updated.push_str(&format!("\n# ro per-repo settings\n{LOCAL_IGNORE}\n"));
 
-    std::fs::write(&path, updated)
-        .with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(&path, updated).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
 }

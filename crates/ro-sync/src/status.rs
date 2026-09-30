@@ -187,11 +187,7 @@ pub fn status_repo(conn: &Connection, repo_id: &str) -> Result<RepoStatus> {
 /// [`status_repo`] so that every existing caller — and the CLI in
 /// `crates/ro` — keeps compiling unchanged, and wiring `--fetch` is one
 /// call site rather than a workspace-wide signature change.
-pub fn status_repo_with(
-    conn: &Connection,
-    repo_id: &str,
-    fetch_first: bool,
-) -> Result<RepoStatus> {
+pub fn status_repo_with(conn: &Connection, repo_id: &str, fetch_first: bool) -> Result<RepoStatus> {
     let mut stmt =
         conn.prepare("SELECT owner, name, branch, local_path FROM repos WHERE id = ?1")?;
     let row = stmt
@@ -256,7 +252,12 @@ pub fn status_repo_with(
                 let mut discard_a = None;
                 let mut discard_b = None;
                 let mut discard_c = None;
-                l.apply_to(&mut discard_a, &mut reference, &mut discard_b, &mut discard_c);
+                l.apply_to(
+                    &mut discard_a,
+                    &mut reference,
+                    &mut discard_b,
+                    &mut discard_c,
+                );
             }
             reference
         };
@@ -275,11 +276,8 @@ pub fn status_repo_with(
             env: &credential_env,
             ..ro_git::mutation::RunOpts::none()
         };
-        match ro_git::mutation::fetch_in(
-            &path,
-            &ro_git::mutation::FetchOpts::default(),
-            &fetch_run,
-        ) {
+        match ro_git::mutation::fetch_in(&path, &ro_git::mutation::FetchOpts::default(), &fetch_run)
+        {
             // `fetch` returns `Ok` for a git that *ran and failed*:
             // `run_in` reports the exit status in the outcome rather than as
             // an error, and only a spawn failure is an `Err`. Checking
@@ -288,10 +286,7 @@ pub fn status_repo_with(
             // prints exactly the numbers it would have printed without the
             // flag, and the flag becomes a claim rather than a measurement.
             Ok(result) if !result.ok() => {
-                fetch_error = Some(format!(
-                    "fetch did not succeed: {}",
-                    result.stderr.trim()
-                ));
+                fetch_error = Some(format!("fetch did not succeed: {}", result.stderr.trim()));
             }
             Err(e) => fetch_error = Some(format!("fetch could not run: {e:#}")),
             Ok(_) => {}
@@ -311,11 +306,7 @@ pub fn status_repo_with(
             // board: `ro status` exists to answer "is anything wrong with
             // my repos right now", and this is the answer for one of them.
             let branch_read = ro_git::read::current_branch(&path);
-            let branch = branch_read
-                .as_ref()
-                .ok()
-                .and_then(|o| o.as_ref())
-                .cloned();
+            let branch = branch_read.as_ref().ok().and_then(|o| o.as_ref()).cloned();
             let dirty_read = ro_git::read::is_dirty(&path);
             let is_dirty = dirty_read.as_ref().ok().copied().unwrap_or(false);
             // A `.git` that exists but which git cannot read at all — a
@@ -336,89 +327,96 @@ pub fn status_repo_with(
                     false,
                 )
             } else {
-            // The cached default_branch is gone as of V4. The branch git
-            // reports is authoritative; the tracked branch is only a
-            // fallback for a detached HEAD.
-            let upstream_branch = branch.as_ref().or(tracked_branch.as_ref());
-            match upstream_branch {
-                // The measurement is kept even when it fails. `?` here
-                // would abort the *whole* `ro status` listing because one
-                // repo has a typo'd upstream — which is the same bug from
-                // the other end: one unmeasurable row takes out the other
-                // nineteen, so the user learns about nothing at all.
-                Some(b) => {
-                    // A repo with no `origin` has no upstream to compare
-                    // against, and that is a *fact about the repository*,
-                    // not a failed measurement — so it is asked first, and
-                    // answered from `has_remote` rather than by letting a
-                    // guaranteed `rev-list` failure stand in for the answer.
-                    // Without this check a perfectly healthy local repo
-                    // reported "unknown" forever, which teaches users to
-                    // ignore the unknown marker and so hides the rows that
-                    // are genuinely broken.
-                    match ro_git::read::has_remote(&path, "origin") {
-                        Ok(false) => (
-                            branch,
-                            is_dirty,
-                            Some(0),
-                            Some(0),
-                            None,
-                            // The counts are honest — there is nothing to be
-                            // behind — and the row still has to be able to
-                            // say so. `false` here is what keeps a repo
-                            // whose `origin` was deleted from rendering as
-                            // in sync with a remote it no longer has.
-                            false,
-                        ),
-                        // Could not even find out whether there is a remote —
-                        // a broken checkout. Not a clean zero.
-                        Err(e) => (
-                            branch,
-                            is_dirty,
-                            None,
-                            None,
-                            Some(format!("cannot determine remotes: {e:#}")),
-                            false,
-                        ),
-                        Ok(true) => {
-                            let upstream = format!("origin/{b}");
-                            match ro_git::read::ahead_behind(&path, &upstream) {
-                                Ok(ab) => (
-                                    branch,
-                                    is_dirty,
-                                    Some(ab.ahead),
-                                    Some(ab.behind),
-                                    None,
-                                    true,
-                                ),
-                                // The remote exists but `origin/main` does not
-                                // — a wrong branch name, a fetch that has not
-                                // run, or a typo in the tracked branch. Named
-                                // precisely so the fix is obvious.
-                                Err(e) => (
-                                    branch,
-                                    is_dirty,
-                                    None,
-                                    None,
-                                    Some(format!("no upstream ref {upstream}: {e:#}")),
-                                    true,
-                                ),
+                // The cached default_branch is gone as of V4. The branch git
+                // reports is authoritative; the tracked branch is only a
+                // fallback for a detached HEAD.
+                let upstream_branch = branch.as_ref().or(tracked_branch.as_ref());
+                match upstream_branch {
+                    // The measurement is kept even when it fails. `?` here
+                    // would abort the *whole* `ro status` listing because one
+                    // repo has a typo'd upstream — which is the same bug from
+                    // the other end: one unmeasurable row takes out the other
+                    // nineteen, so the user learns about nothing at all.
+                    Some(b) => {
+                        // A repo with no `origin` has no upstream to compare
+                        // against, and that is a *fact about the repository*,
+                        // not a failed measurement — so it is asked first, and
+                        // answered from `has_remote` rather than by letting a
+                        // guaranteed `rev-list` failure stand in for the answer.
+                        // Without this check a perfectly healthy local repo
+                        // reported "unknown" forever, which teaches users to
+                        // ignore the unknown marker and so hides the rows that
+                        // are genuinely broken.
+                        match ro_git::read::has_remote(&path, "origin") {
+                            Ok(false) => (
+                                branch,
+                                is_dirty,
+                                Some(0),
+                                Some(0),
+                                None,
+                                // The counts are honest — there is nothing to be
+                                // behind — and the row still has to be able to
+                                // say so. `false` here is what keeps a repo
+                                // whose `origin` was deleted from rendering as
+                                // in sync with a remote it no longer has.
+                                false,
+                            ),
+                            // Could not even find out whether there is a remote —
+                            // a broken checkout. Not a clean zero.
+                            Err(e) => (
+                                branch,
+                                is_dirty,
+                                None,
+                                None,
+                                Some(format!("cannot determine remotes: {e:#}")),
+                                false,
+                            ),
+                            Ok(true) => {
+                                let upstream = format!("origin/{b}");
+                                match ro_git::read::ahead_behind(&path, &upstream) {
+                                    Ok(ab) => (
+                                        branch,
+                                        is_dirty,
+                                        Some(ab.ahead),
+                                        Some(ab.behind),
+                                        None,
+                                        true,
+                                    ),
+                                    // The remote exists but `origin/main` does not
+                                    // — a wrong branch name, a fetch that has not
+                                    // run, or a typo in the tracked branch. Named
+                                    // precisely so the fix is obvious.
+                                    Err(e) => (
+                                        branch,
+                                        is_dirty,
+                                        None,
+                                        None,
+                                        Some(format!("no upstream ref {upstream}: {e:#}")),
+                                        true,
+                                    ),
+                                }
                             }
                         }
                     }
+                    // No branch means there is no upstream to compare against.
+                    // That is a fact, not a failure: the repo has nothing to be
+                    // behind. `None` on ahead/behind would render as "unknown",
+                    // which would be a *less* honest answer than saying so.
+                    None => (branch, is_dirty, Some(0), Some(0), None, false),
                 }
-                // No branch means there is no upstream to compare against.
-                // That is a fact, not a failure: the repo has nothing to be
-                // behind. `None` on ahead/behind would render as "unknown",
-                // which would be a *less* honest answer than saying so.
-                None => (branch, is_dirty, Some(0), Some(0), None, false),
-            }
             }
         } else {
             // Not cloned. The row exists but the worktree does not, so
             // there is genuinely nothing to measure — reported as "not
             // cloned" rather than as a clean zero.
-            (None, false, None, None, Some("not cloned".to_string()), false)
+            (
+                None,
+                false,
+                None,
+                None,
+                Some("not cloned".to_string()),
+                false,
+            )
         };
 
     let last_synced_at: Option<i64> = conn
@@ -449,22 +447,20 @@ pub fn status_repo_with(
     // the base of a measurement that had no base, and a JSON consumer reading
     // `measured_against: "origin/main"` was told the counts meant something
     // they do not.
-    let (measured_against, measured_against_updated_at) = if has_upstream
-        && ahead.is_some()
-        && behind.is_some()
-    {
-        match branch.as_deref().or(tracked_branch.as_deref()) {
-            Some(b) => (
-                Some(format!("origin/{b}")),
-                ro_git::status::remote_ref_updated_at(&path, "origin", b)
-                    .ok()
-                    .flatten(),
-            ),
-            None => (None, None),
-        }
-    } else {
-        (None, None)
-    };
+    let (measured_against, measured_against_updated_at) =
+        if has_upstream && ahead.is_some() && behind.is_some() {
+            match branch.as_deref().or(tracked_branch.as_deref()) {
+                Some(b) => (
+                    Some(format!("origin/{b}")),
+                    ro_git::status::remote_ref_updated_at(&path, "origin", b)
+                        .ok()
+                        .flatten(),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
 
     // Resolved before the struct literal, because two of the fields want
     // to *look* at the branch and one wants to own it.
@@ -643,7 +639,8 @@ mod tests {
     #[test]
     fn status_all_returns_all_repos() {
         let (tmp, conn) = setup();
-        let repo1 = crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
+        let repo1 =
+            crate::manage::add(&conn, "alice/proj1", &projects_dir(&tmp), "nested").unwrap();
         let repo2 = crate::manage::add(&conn, "bob/proj2", &projects_dir(&tmp), "nested").unwrap();
 
         let statuses = status_all(&conn).unwrap();
@@ -722,8 +719,10 @@ mod tests {
     #[test]
     fn one_broken_repo_does_not_hide_the_others() {
         let (tmp, conn) = setup();
-        let healthy = crate::manage::add(&conn, "alice/healthy", &projects_dir(&tmp), "nested").unwrap();
-        let broken = crate::manage::add(&conn, "alice/broken", &projects_dir(&tmp), "nested").unwrap();
+        let healthy =
+            crate::manage::add(&conn, "alice/healthy", &projects_dir(&tmp), "nested").unwrap();
+        let broken =
+            crate::manage::add(&conn, "alice/broken", &projects_dir(&tmp), "nested").unwrap();
 
         let healthy_path = projects_dir(&tmp).join("alice").join("healthy");
         init_repo(&healthy_path);
@@ -819,7 +818,12 @@ mod tests {
         // The precondition, asserted: this is a tree with no operation
         // marker in it at all. The old check looked for those four files
         // and nothing else, so this is the whole reason it said "fine".
-        for marker in ["MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+        for marker in [
+            "MERGE_HEAD",
+            "REBASE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+        ] {
             assert!(
                 !local_path.join(".git").join(marker).exists(),
                 "{marker} must be absent, or this is not the case under test"
@@ -901,7 +905,10 @@ mod tests {
         assert_eq!(porcelain(&local_path), "UU f.txt");
 
         let status = status_repo(&conn, &repo.id).unwrap();
-        assert!(status.in_conflict, "the source of the conflict is irrelevant");
+        assert!(
+            status.in_conflict,
+            "the source of the conflict is irrelevant"
+        );
     }
 
     /// A repo that is not a git repository at all has no index to
@@ -927,9 +934,11 @@ mod tests {
     #[test]
     fn a_conflicted_repo_does_not_hide_the_rest_of_the_fleet() {
         let (tmp, conn) = setup();
-        let conflicted = crate::manage::add(&conn, "alice/conflicted", &projects_dir(&tmp), "nested").unwrap();
+        let conflicted =
+            crate::manage::add(&conn, "alice/conflicted", &projects_dir(&tmp), "nested").unwrap();
         let clean = crate::manage::add(&conn, "bob/clean", &projects_dir(&tmp), "nested").unwrap();
-        let missing = crate::manage::add(&conn, "carol/missing", &projects_dir(&tmp), "nested").unwrap();
+        let missing =
+            crate::manage::add(&conn, "carol/missing", &projects_dir(&tmp), "nested").unwrap();
 
         leave_conflicting_autostash_pop(&projects_dir(&tmp).join("alice").join("conflicted"));
 
@@ -1031,7 +1040,10 @@ mod tests {
 
         // A second checkout rewrites the same line and pushes it.
         let other = tmp.path().join("other");
-        run_git(tmp.path(), &["clone", "-q", &remote.display().to_string(), "other"]);
+        run_git(
+            tmp.path(),
+            &["clone", "-q", &remote.display().to_string(), "other"],
+        );
         run_git(&other, &["config", "user.email", "test@example.com"]);
         run_git(&other, &["config", "user.name", "Test"]);
         commit(&other, "shared.txt", "line1\nREMOTE-VERSION\nline3\n");
@@ -1064,7 +1076,10 @@ mod tests {
 
     /// `git status --porcelain`, the index's own answer.
     fn porcelain(dir: &Path) -> String {
-        git_out(dir, &["status", "--porcelain"]).stdout.trim().to_string()
+        git_out(dir, &["status", "--porcelain"])
+            .stdout
+            .trim()
+            .to_string()
     }
 
     /// A git call whose *output* is wanted, and whose failure is not
@@ -1132,7 +1147,14 @@ mod tests {
         // a root commit — rejected as a non-fast-forward.
         run_git(
             tmp.path(),
-            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                &remote.path().to_string_lossy(),
+                "other",
+            ],
         );
         run_git(&other, &["config", "user.email", "test@example.com"]);
         run_git(&other, &["config", "user.name", "Test"]);
@@ -1154,7 +1176,11 @@ mod tests {
             Some("origin/main"),
             "the row must name the ref the counts were measured against: {status:?}"
         );
-        assert_eq!(status.behind, Some(0), "the local ref is genuinely behind nothing it can see");
+        assert_eq!(
+            status.behind,
+            Some(0),
+            "the local ref is genuinely behind nothing it can see"
+        );
         assert!(
             status.measured_against_updated_at.is_some(),
             "a ref that was pushed to has a reflog, and the row must carry \
@@ -1284,7 +1310,14 @@ mod tests {
         // a root commit — rejected as a non-fast-forward.
         run_git(
             tmp.path(),
-            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                &remote.path().to_string_lossy(),
+                "other",
+            ],
         );
         run_git(&other, &["config", "user.email", "test@example.com"]);
         run_git(&other, &["config", "user.name", "Test"]);
@@ -1463,7 +1496,8 @@ mod tests {
         let row: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
         assert_eq!(
-            row["has_upstream"], serde_json::Value::Bool(false),
+            row["has_upstream"],
+            serde_json::Value::Bool(false),
             "the fact must reach json and ndjson: {row}"
         );
         assert_eq!(row["ahead"], 0);
@@ -1571,14 +1605,24 @@ mod tests {
         let other = tmp.path().join("other");
         run_git(
             tmp.path(),
-            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                &remote.path().to_string_lossy(),
+                "other",
+            ],
         );
         run_git(&other, &["config", "user.email", "test@example.com"]);
         run_git(&other, &["config", "user.name", "Test"]);
         for i in 1..=3 {
             std::fs::write(other.join("b.txt"), format!("remote moved {i}\n")).unwrap();
             run_git(&other, &["add", "."]);
-            run_git(&other, &["commit", "-q", "-m", &format!("remote moved {i}")]);
+            run_git(
+                &other,
+                &["commit", "-q", "-m", &format!("remote moved {i}")],
+            );
         }
         run_git(&other, &["push", "-q", "origin", "HEAD:main"]);
 
@@ -1640,7 +1684,14 @@ mod tests {
         let other = tmp.path().join("other");
         run_git(
             tmp.path(),
-            &["clone", "-q", "-b", "main", &remote.path().to_string_lossy(), "other"],
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                &remote.path().to_string_lossy(),
+                "other",
+            ],
         );
         run_git(&other, &["config", "user.email", "test@example.com"]);
         run_git(&other, &["config", "user.name", "Test"]);

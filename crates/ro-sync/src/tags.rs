@@ -69,8 +69,7 @@ pub fn remove(conn: &Connection, key: &str, tags: &[String]) -> Result<usize> {
 /// Every tag on one repo, sorted.
 pub fn of(conn: &Connection, key: &str) -> Result<Vec<String>> {
     let id = repo_id(conn, key)?;
-    let mut stmt = conn
-        .prepare("SELECT tag FROM repo_tags WHERE repo_id = ?1 ORDER BY tag")?;
+    let mut stmt = conn.prepare("SELECT tag FROM repo_tags WHERE repo_id = ?1 ORDER BY tag")?;
     let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
@@ -78,8 +77,7 @@ pub fn of(conn: &Connection, key: &str) -> Result<Vec<String>> {
 /// Every tag in use, with how many repos carry it — the shape a
 /// `--tag` picker needs.
 pub fn all_with_counts(conn: &Connection) -> Result<Vec<(String, i64)>> {
-    let mut stmt =
-        conn.prepare("SELECT tag, COUNT(*) FROM repo_tags GROUP BY tag ORDER BY tag")?;
+    let mut stmt = conn.prepare("SELECT tag, COUNT(*) FROM repo_tags GROUP BY tag ORDER BY tag")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     Ok(rows.filter_map(Result::ok).collect())
 }
@@ -140,7 +138,11 @@ mod tests {
     fn tagging_twice_and_removing_a_stranger_are_both_no_ops() {
         let c = setup();
         add(&c, "api", &[t("work")]).unwrap();
-        assert_eq!(add(&c, "api", &[t("work")]).unwrap(), 0, "second add changed nothing");
+        assert_eq!(
+            add(&c, "api", &[t("work")]).unwrap(),
+            0,
+            "second add changed nothing"
+        );
         assert_eq!(remove(&c, "api", &["nope".to_string()]).unwrap(), 0);
         assert_eq!(of(&c, "api").unwrap(), vec!["work"]);
     }
@@ -169,7 +171,10 @@ mod tests {
         add(&c, "api", &[t("work")]).unwrap();
         // A duplicate that slipped past the INSERT OR IGNORE would inflate
         // this count if the key were not what the table says it is.
-        conn_exec(&c, "INSERT OR IGNORE INTO repo_tags (repo_id, tag) VALUES ('id-acme-api', 'work')");
+        conn_exec(
+            &c,
+            "INSERT OR IGNORE INTO repo_tags (repo_id, tag) VALUES ('id-acme-api', 'work')",
+        );
         add(&c, "web", &[t("work")]).unwrap();
 
         let counts = all_with_counts(&c).unwrap();

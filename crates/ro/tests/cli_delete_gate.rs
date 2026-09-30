@@ -177,6 +177,34 @@ fn innocent_directory(parent: &std::path::Path) -> std::path::PathBuf {
     dir
 }
 
+/// The path `ro add` will have written into the row for `checkout`.
+///
+/// A row's `local_path` is the **canonicalized** checkout, not the path the
+/// caller typed: `AddSource::Local::path` documents that, and
+/// `classify_add_input` is where the `canonicalize` happens. A test that
+/// compares the row against the raw fixture path therefore matches only when
+/// the two happen to be spelled the same, and every temp dir is a case where
+/// they are not — on macOS `TempDir` hands back `/var/folders/...` while
+/// `canonicalize` resolves `/var` to `/private/var`, so the lookup found
+/// nothing and the test failed on a fact about the platform rather than about
+/// the gate it exists for.
+///
+/// The `\\?\` prefix is stripped for the same reason one level down: Windows'
+/// `canonicalize` returns verbatim paths, and the product strips them before
+/// storing, so the expected side has to be stripped to be spelled like the
+/// row.
+fn registered_path(checkout: &std::path::Path) -> std::path::PathBuf {
+    let canonical = checkout.canonicalize().expect("the checkout exists");
+    #[cfg(windows)]
+    {
+        let s = canonical.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    canonical
+}
+
 /// A stale `local_path` naming a directory that is not a checkout at all.
 ///
 /// The row is the only evidence, and the evidence is wrong.
@@ -247,7 +275,9 @@ fn delete_refuses_a_row_whose_path_does_not_exist() {
         .stderr(predicate::str::contains("refused"))
         // The reason, not the word "does not exist": the path is printed in
         // full above, and the refusal has to say which fact failed.
-        .stderr(predicate::str::contains("does not exist, so it is not the working copy"));
+        .stderr(predicate::str::contains(
+            "does not exist, so it is not the working copy",
+        ));
 
     assert!(
         !missing.exists(),
@@ -333,7 +363,14 @@ fn delete_refuses_a_checkout_with_no_origin() {
 /// the gate would delete through the symlink and take the other repo's work
 /// with it. The gate must refuse on the symlink itself, before git is ever
 /// asked to look through it.
+///
+/// Unix only, because it builds the link with `std::os::unix::fs::symlink`.
+/// On Windows the same call needs `SeCreateSymbolicLinkPrivilege`, which a
+/// CI runner does not reliably have, so the test is gated rather than made
+/// to skip: a privilege-dependent test that quietly stops testing is the
+/// failure this whole file is about.
 #[test]
+#[cfg(unix)]
 fn delete_refuses_a_symlink_aimed_at_another_checkout() {
     let t = Test::new();
     let label = t.add();
@@ -639,8 +676,16 @@ fn delete_refuses_a_checkout_containing_an_unregistered_nested_repo() {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .map(|l| serde_json::from_str::<serde_json::Value>(&l).expect("a JSON row"))
-            .find(|v| v["local_path"].as_str() == Some(checkout.to_str().unwrap()))
-            .map(|v| format!("{}/{}", v["owner"].as_str().unwrap(), v["name"].as_str().unwrap()))
+            .find(|v| {
+                v["local_path"].as_str() == Some(registered_path(&checkout).to_str().unwrap())
+            })
+            .map(|v| {
+                format!(
+                    "{}/{}",
+                    v["owner"].as_str().unwrap(),
+                    v["name"].as_str().unwrap()
+                )
+            })
             .expect("the checkout is registered")
     };
 

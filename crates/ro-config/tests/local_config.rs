@@ -15,7 +15,7 @@
 //!
 //!   4. **the gitignore entry is a directory pattern, and idempotent**
 
-use ro_config::local::{ensure_gitignored, RepoLocalConfig, LOCAL_IGNORE};
+use ro_config::local::{LOCAL_IGNORE, RepoLocalConfig, ensure_gitignored};
 use std::path::Path;
 use tempfile::TempDir;
 
@@ -46,7 +46,9 @@ engine = "codex"
 engine-args = "--sandbox danger"
 "#,
     );
-    let c = RepoLocalConfig::load(tmp.path()).unwrap().expect("file exists");
+    let c = RepoLocalConfig::load(tmp.path())
+        .unwrap()
+        .expect("file exists");
     assert_eq!(c.author.as_deref(), Some("work"));
     assert_eq!(c.credential.as_deref(), Some("env:GH_WORK"));
     assert_eq!(c.engine.as_deref(), Some("codex"));
@@ -77,7 +79,10 @@ fn a_partial_file_is_a_partial_overlay() {
 #[test]
 fn the_file_outranks_the_row() {
     let tmp = TempDir::new().unwrap();
-    write(tmp.path(), "author = \"personal\"\ncredential = \"env:PERSONAL\"\n");
+    write(
+        tmp.path(),
+        "author = \"personal\"\ncredential = \"env:PERSONAL\"\n",
+    );
     let c = RepoLocalConfig::load(tmp.path()).unwrap().unwrap();
 
     let (mut author, mut cred, _, _) = (
@@ -95,8 +100,7 @@ fn the_file_outranks_the_row() {
 fn a_typo_is_an_error_rather_than_a_key_that_does_nothing() {
     let tmp = TempDir::new().unwrap();
     write(tmp.path(), "authent = \"work\"\n");
-    let err = RepoLocalConfig::load(tmp.path())
-        .expect_err("a typo must fail");
+    let err = RepoLocalConfig::load(tmp.path()).expect_err("a typo must fail");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("authent") || msg.contains("unknown field"),
@@ -146,7 +150,11 @@ fn the_gitignore_entry_is_written_once() {
 fn an_existing_entry_in_any_spelling_is_left_alone() {
     for existing in [".ro/", "/.ro/", "  .ro/  ", "/.ro"] {
         let tmp = TempDir::new().unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), format!("target/\n{existing}\n")).unwrap();
+        std::fs::write(
+            tmp.path().join(".gitignore"),
+            format!("target/\n{existing}\n"),
+        )
+        .unwrap();
         assert!(
             !ensure_gitignored(tmp.path()).unwrap(),
             "{existing:?} already ignores the directory; adding again duplicates it"
@@ -255,11 +263,7 @@ fn the_local_files_engine_args_outranks_the_row() {
     );
     c.apply_to(&mut author, &mut cred, &mut engine, &mut args);
 
-    assert_eq!(
-        args.as_deref(),
-        Some("--sandbox danger"),
-        "the file wins"
-    );
+    assert_eq!(args.as_deref(), Some("--sandbox danger"), "the file wins");
     assert_eq!(engine.as_deref(), Some("claude"), "untouched keys inherit");
 }
 

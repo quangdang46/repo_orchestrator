@@ -259,7 +259,10 @@ mod tests {
 
     #[test]
     fn a_clean_run_exits_zero() {
-        let s = Summary::new(vec![row("acme/a", pushed("aaa")), row("acme/b", pushed("bbb"))]);
+        let s = Summary::new(vec![
+            row("acme/a", pushed("aaa")),
+            row("acme/b", pushed("bbb")),
+        ]);
         assert_eq!(s.counts(), (2, 0));
         assert_eq!(s.pushed(), 2);
     }
@@ -353,9 +356,7 @@ mod tests {
             "acme/a",
             RepoOutcome::Pushed {
                 oid: "aaa".into(),
-                warnings: vec![
-                    "--onto new: the remote does not have it. ro created it.".into()
-                ],
+                warnings: vec!["--onto new: the remote does not have it. ro created it.".into()],
             },
         );
         let text = Summary::new(vec![r]).render();
@@ -392,8 +393,7 @@ mod tests {
         );
         let json = Summary::new(vec![r]).render_json(OutputFormat::Json);
 
-        let doc: serde_json::Value =
-            serde_json::from_str(&json).expect("the json parses");
+        let doc: serde_json::Value = serde_json::from_str(&json).expect("the json parses");
         let row = &doc["repos"][0];
         let warnings = row["warnings"]
             .as_array()
@@ -455,7 +455,6 @@ mod tests {
         assert!(warnings.is_empty(), "got: {json}");
     }
 }
-
 
 /// The summary line must not read "0 failed" over a fleet that needs help.
 #[cfg(test)]

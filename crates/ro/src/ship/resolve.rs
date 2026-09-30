@@ -138,7 +138,9 @@ pub fn resolve_conflict(
         EngineOutcome::Committed { .. } | EngineOutcome::NothingToCommit => {}
         EngineOutcome::Unavailable { binary, hint } => {
             return Resolution::Failed {
-                error: format!("resolving the conflict: {binary} is not installed. {hint}{MID_REBASE}"),
+                error: format!(
+                    "resolving the conflict: {binary} is not installed. {hint}{MID_REBASE}"
+                ),
             };
         }
         EngineOutcome::TimedOut { after } => {
@@ -364,7 +366,10 @@ mod tests {
             }
             other => panic!("a conflict with no --resolve must be handed over, got {other:?}"),
         }
-        assert!(!outcome.can_push(), "nothing may be pushed after a hand-over");
+        assert!(
+            !outcome.can_push(),
+            "nothing may be pushed after a hand-over"
+        );
     }
 
     /// With `--resolve`, the engine is dispatched exactly once and the
@@ -384,16 +389,13 @@ mod tests {
 
         let engine = ro_engine::resolve("git", &ro_engine::EngineSlots::default(), None)
             .expect("git is one of the three");
-        let outcome =
-            resolve_conflict(f.repo(), &base, &engine, ResolveOptions { resolve: true });
+        let outcome = resolve_conflict(f.repo(), &base, &engine, ResolveOptions { resolve: true });
 
         match &outcome {
             // The raw backend stages the markers; ro does not continue.
             Resolution::NeedsUser { files } => {
                 assert!(
-                    files
-                        .iter()
-                        .any(|f| f.contains("conflict markers")),
+                    files.iter().any(|f| f.contains("conflict markers")),
                     "the hand-over must say the markers are still there, got {files:?}"
                 );
             }
@@ -458,8 +460,7 @@ mod tests {
             Some("ro-test-no-such-agent-binary-8f3a"),
         )
         .expect("claude is one of the three");
-        let outcome =
-            resolve_conflict(f.repo(), &base, &engine, ResolveOptions { resolve: true });
+        let outcome = resolve_conflict(f.repo(), &base, &engine, ResolveOptions { resolve: true });
 
         match &outcome {
             Resolution::Failed { error } => {
@@ -495,8 +496,7 @@ mod tests {
         let marker = f.repo().parent().unwrap().join("ro-test-resolved.marker");
         let engine = shim_engine(&f, &marker);
 
-        let outcome =
-            resolve_conflict(f.repo(), &base, &engine, ResolveOptions { resolve: true });
+        let outcome = resolve_conflict(f.repo(), &base, &engine, ResolveOptions { resolve: true });
 
         assert!(
             marker.exists(),
@@ -529,7 +529,9 @@ mod tests {
         ));
         // The pair without the opener is a merge that finished, or a
         // document about one.
-        assert!(!text_has_conflict_markers("=======\ntheirs\n>>>>>>> origin/main\n"));
+        assert!(!text_has_conflict_markers(
+            "=======\ntheirs\n>>>>>>> origin/main\n"
+        ));
     }
 
     /// An engine that resolves a conflict the way one is asked to.

@@ -340,7 +340,8 @@ mod tests {
     #[test]
     fn prune_archived_removes_archived() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/archived-repo", &projects_dir(&tmp), "nested").unwrap();
+        let repo = crate::manage::add(&conn, "alice/archived-repo", &projects_dir(&tmp), "nested")
+            .unwrap();
         // Mark as archived
         conn.execute(
             "UPDATE repos SET archived = 1 WHERE id = ?1",
@@ -378,7 +379,8 @@ mod tests {
     #[test]
     fn prune_missing_keeps_existing_paths() {
         let (tmp, conn) = setup();
-        let _repo = crate::manage::add(&conn, "alice/present", &projects_dir(&tmp), "nested").unwrap();
+        let _repo =
+            crate::manage::add(&conn, "alice/present", &projects_dir(&tmp), "nested").unwrap();
         // Create the local path
         let local = projects_dir(&tmp).join("alice").join("present");
         std::fs::create_dir_all(&local).unwrap();
@@ -393,7 +395,8 @@ mod tests {
     #[test]
     fn prune_repo_with_sync_history_succeeds() {
         let (tmp, conn) = setup();
-        let repo = crate::manage::add(&conn, "alice/with-history", &projects_dir(&tmp), "nested").unwrap();
+        let repo =
+            crate::manage::add(&conn, "alice/with-history", &projects_dir(&tmp), "nested").unwrap();
 
         // Insert a run + sync_result so FK enforcement bites.
         conn.execute(

@@ -350,7 +350,11 @@ mod tests {
 /// `None` for either end means "empty" — a repo with no commits has no
 /// history to walk, and a run whose `before` is unknown cannot say what
 /// changed.
-pub fn commits_between(repo_path: &Path, before: Option<&str>, after: Option<&str>) -> Result<Vec<String>> {
+pub fn commits_between(
+    repo_path: &Path,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Result<Vec<String>> {
     let after = match after {
         Some(a) => a,
         None => return Ok(Vec::new()),
@@ -452,7 +456,11 @@ mod log_tests {
     fn commits_between_an_unmoved_head_is_empty() {
         let (_t, p) = repo_with_three();
         let head = head_oid(&p).unwrap().unwrap();
-        assert!(commits_between(&p, Some(&head), Some(&head)).unwrap().is_empty());
+        assert!(
+            commits_between(&p, Some(&head), Some(&head))
+                .unwrap()
+                .is_empty()
+        );
         assert!(commits_between(&p, Some(&head), None).unwrap().is_empty());
     }
 
@@ -461,6 +469,9 @@ mod log_tests {
         let (_t, p) = repo_with_three();
         let head = head_oid(&p).unwrap().unwrap();
         assert_eq!(commit_subject(&p, &head).as_deref(), Some("third"));
-        assert_eq!(commit_subject(&p, "0000000000000000000000000000000000000000"), None);
+        assert_eq!(
+            commit_subject(&p, "0000000000000000000000000000000000000000"),
+            None
+        );
     }
 }

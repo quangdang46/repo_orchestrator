@@ -142,10 +142,18 @@ impl Worktree {
 /// comment names them and says why they are still out of reach. Read that
 /// before concluding the crate has no `PATH`-dependent `git`.
 pub fn run(dir: &Path, args: &[&str]) -> String {
+    // `credential.helper=` / `core.askPass=` for the reason documented on
+    // `remote::git`: without them this inherits the machine's credential
+    // helper, which on Windows is Git Credential Manager, and a fixture that
+    // reaches an HTTP remote opens a password dialog on the developer's
+    // screen and the test waits on an answer that never comes.
     let out = Command::new(git_path())
+        .args(["-c", "credential.helper=", "-c", "core.askPass="])
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GCM_UI", "Never")
         .env("LC_ALL", "C")
         .output()
         .expect("git runs");

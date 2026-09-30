@@ -201,7 +201,11 @@ mod tests {
     #[test]
     fn a_duplicate_add_is_a_usage_problem_not_a_crash() {
         let e = FatalError::usage("already tracked");
-        assert_ne!(e.code(), EX_FATAL, "a duplicate add must not read as a crash");
+        assert_ne!(
+            e.code(),
+            EX_FATAL,
+            "a duplicate add must not read as a crash"
+        );
         assert_eq!(e.code(), EX_USAGE);
     }
 

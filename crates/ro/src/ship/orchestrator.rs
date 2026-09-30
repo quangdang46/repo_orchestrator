@@ -577,14 +577,14 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                             r.stderr.trim()
                         }
                     ),
-                class: ro_core::FailureClass::MissingProvider,
-            };
+                    class: ro_core::FailureClass::MissingProvider,
+                };
             }
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: format!("fetch failed: {e:#}"),
-                class: ro_core::FailureClass::MissingProvider,
-            };
+                    class: ro_core::FailureClass::MissingProvider,
+                };
             }
         }
     }
@@ -642,15 +642,14 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                                 detail: format!("{summary}: {}", files.join(", ")),
                             }
                         }
-                        crate::ship::resolve::Resolution::Failed { error } => {
-                            RepoOutcome::Failed { error,
-                class: ro_core::FailureClass::MissingProvider,
-            }
-                        }
+                        crate::ship::resolve::Resolution::Failed { error } => RepoOutcome::Failed {
+                            error,
+                            class: ro_core::FailureClass::MissingProvider,
+                        },
                         _ => RepoOutcome::Failed {
                             error: "the rebase did not finish".to_string(),
-                class: ro_core::FailureClass::MissingProvider,
-            },
+                            class: ro_core::FailureClass::MissingProvider,
+                        },
                     };
                 }
             }
@@ -661,8 +660,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: e.to_string(),
-                class: ro_core::FailureClass::MissingProvider,
-            };
+                    class: ro_core::FailureClass::MissingProvider,
+                };
             }
         }
     }
@@ -702,8 +701,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             None => {
                 return RepoOutcome::Failed {
                     error: "the engine reported a commit with no commit id".into(),
-                class: ro_core::FailureClass::MissingProvider,
-            };
+                    class: ro_core::FailureClass::MissingProvider,
+                };
             }
         },
         // Nothing for the *engine* to do is not nothing for the *run*.
@@ -721,14 +720,14 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                 Ok(None) => {
                     return RepoOutcome::Failed {
                         error: "there is work to push but HEAD does not resolve".into(),
-                class: ro_core::FailureClass::MissingProvider,
-            }
+                        class: ro_core::FailureClass::MissingProvider,
+                    };
                 }
                 Err(e) => {
                     return RepoOutcome::Failed {
                         error: format!("could not read HEAD: {e:#}"),
-                class: ro_core::FailureClass::MissingProvider,
-            }
+                        class: ro_core::FailureClass::MissingProvider,
+                    };
                 }
             }
         }
@@ -744,9 +743,12 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                 class: ro_core::FailureClass::MissingProvider,
             };
         }
-        EngineOutcome::Failed { error, .. } => return RepoOutcome::Failed { error,
+        EngineOutcome::Failed { error, .. } => {
+            return RepoOutcome::Failed {
+                error,
                 class: ro_core::FailureClass::MissingProvider,
-            },
+            };
+        }
     };
 
     // `--amend`: fold what the engine just committed into the commit
@@ -765,14 +767,17 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             .clone()
             .or_else(|| head_before.and_then(|h| subject_of(repo, h)))
             .unwrap_or_else(|| "amend".to_string());
-        let author = plan.identity.as_ref().map(|i| (i.name.as_str(), i.email.as_str()));
+        let author = plan
+            .identity
+            .as_ref()
+            .map(|i| (i.name.as_str(), i.email.as_str()));
         match ro_git::primitives::amend_tree(repo, head_before, &subject, author) {
             Ok(new) => new,
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: format!("amending HEAD failed: {e:#}"),
-                class: ro_core::FailureClass::MissingProvider,
-            }
+                    class: ro_core::FailureClass::MissingProvider,
+                };
             }
         }
     } else {
@@ -834,12 +839,12 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         },
         Ok(r) => RepoOutcome::Failed {
             error: format!("push failed: {}", r.stderr.trim()),
-                class: ro_core::FailureClass::MissingProvider,
-            },
+            class: ro_core::FailureClass::MissingProvider,
+        },
         Err(e) => RepoOutcome::Failed {
             error: format!("push failed: {e:#}"),
-                class: ro_core::FailureClass::MissingProvider,
-            },
+            class: ro_core::FailureClass::MissingProvider,
+        },
     }
 }
 
@@ -1405,13 +1410,14 @@ fn rebase_still_running(repo: &Path) -> bool {
     // `is_rebase_in_progress` reads the wrong place and answers "no" for a
     // live rebase; `rev-parse --absolute-git-dir` resolves the real one.
     // The first is the cheap path and answers for every ordinary clone.
-    ro_git::primitives::is_rebase_in_progress(repo) || match absolute_git_dir(repo) {
-        Some(dir) => dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists(),
-        // Cannot tell. Treat the marker as real: skipping a repo that
-        // turns out to be fine is a delay, and committing into a live
-        // rebase is a mess nobody wants to unpick.
-        None => true,
-    }
+    ro_git::primitives::is_rebase_in_progress(repo)
+        || match absolute_git_dir(repo) {
+            Some(dir) => dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists(),
+            // Cannot tell. Treat the marker as real: skipping a repo that
+            // turns out to be fine is a delay, and committing into a live
+            // rebase is a mess nobody wants to unpick.
+            None => true,
+        }
 }
 
 /// The real git directory, for a checkout where `.git` is a file.
@@ -1481,9 +1487,26 @@ fn base_for(repo: &Path, onto: Option<&str>) -> Option<String> {
 /// walked back.
 fn remote_branch_exists(repo: &Path, branch: &str) -> bool {
     std::process::Command::new("git")
-        .args(["ls-remote", "--heads", "origin", &format!("refs/heads/{branch}")])
+        // The two global `-c` options, and the reason this is not a raw
+        // `ls-remote`: without them git consults the machine's credential
+        // helper, which on Windows is Git Credential Manager and opens a
+        // **window** asking for a password. This is the one question here
+        // that touches the network, so it was the one place on this path
+        // where `GIT_TERMINAL_PROMPT=0` did not help — that silences a
+        // terminal, not a helper. An unreachable remote answers `false`
+        // below either way, so refusing to authenticate costs this check
+        // nothing and saves the user a dialog.
+        .args(["-c", "credential.helper=", "-c", "core.askPass="])
+        .args([
+            "ls-remote",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ])
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GCM_UI", "Never")
         .env("LC_ALL", "C")
         .output()
         .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
@@ -1591,8 +1614,7 @@ fn rebase_onto_remote_base(
         // the same question `ro_git::mutation::pull_in` asks for the same
         // flag: `git rebase --autostash` and `git pull --autostash` share the
         // contract, so they share the fix.
-        let unmerged =
-            ro_git::mutation::unmerged_paths(repo, &ro_git::mutation::RunOpts::none());
+        let unmerged = ro_git::mutation::unmerged_paths(repo, &ro_git::mutation::RunOpts::none());
         if !unmerged.is_empty() {
             return Err(RebaseError::Conflicted { base });
         }
@@ -1639,7 +1661,11 @@ mod resolve_stage_tests {
         // branch conflicts exactly the same way.
         run_git(f.repo(), &["checkout", "-q", "-b", "feat/x"]);
         f.make_conflict();
-        let marker = f.repo().parent().unwrap().join("ro-test-resolve-ran.marker");
+        let marker = f
+            .repo()
+            .parent()
+            .unwrap()
+            .join("ro-test-resolve-ran.marker");
         let plan = RepoPlan {
             engine: resolving_engine(&f, &marker),
             ..plan_on(&f, "feat/x", None)
@@ -1751,7 +1777,8 @@ mod resolve_stage_tests {
         let outcome = run_one(&plan, &opts);
 
         match &outcome {
-            RepoOutcome::Failed { error,
+            RepoOutcome::Failed {
+                error,
                 class: ro_core::FailureClass::MissingProvider,
             } => {
                 assert!(
@@ -1783,7 +1810,11 @@ mod resolve_stage_tests {
         // branch conflicts exactly the same way.
         run_git(f.repo(), &["checkout", "-q", "-b", "feat/x"]);
         f.make_conflict();
-        let marker = f.repo().parent().unwrap().join("ro-test-resolve-ran.marker");
+        let marker = f
+            .repo()
+            .parent()
+            .unwrap()
+            .join("ro-test-resolve-ran.marker");
         let plan = RepoPlan {
             engine: resolving_engine(&f, &marker),
             ..plan_on(&f, "feat/x", None)
@@ -2003,7 +2034,8 @@ mod rebase_tests {
         f.force_remote_file("shared.txt", "remote version\n");
         f.write_local("shared.txt", "local version\n");
 
-        let err = rebase_onto_remote_base(f.repo(), None, None, None).expect_err("must fail loudly");
+        let err =
+            rebase_onto_remote_base(f.repo(), None, None, None).expect_err("must fail loudly");
         let msg = err.to_string();
         assert!(
             msg.contains("rebase --abort") || msg.contains("rebase --continue"),
@@ -2085,8 +2117,8 @@ pub(crate) mod tests_support {
     /// other test in this file has been paying to avoid.
     pub fn run_git_out(dir: &Path, args: &[&str]) -> std::process::Output {
         let out = run_git_once(dir, args);
-        let transport_failure = String::from_utf8_lossy(&out.stderr)
-            .contains("unable to access the remote");
+        let transport_failure =
+            String::from_utf8_lossy(&out.stderr).contains("unable to access the remote");
         if out.status.success() || !transport_failure {
             return out;
         }
@@ -2094,10 +2126,28 @@ pub(crate) mod tests_support {
     }
 
     fn run_git_once(dir: &Path, args: &[&str]) -> std::process::Output {
+        // `credential.helper=` / `core.askPass=` on argv, and the reason is
+        // this file specifically: several tests here repoint a fixture repo's
+        // `origin` at `DemandingRemote`, a real HTTP server on loopback that
+        // **demands** an Authorization header. Any later fixture `git` call in
+        // such a repo is an unauthenticated HTTP request, and with the
+        // machine's credential helper left in place git handed that to Git
+        // Credential Manager on Windows — which opens a password dialog on the
+        // developer's screen and the test sits there waiting for an answer
+        // nobody is going to type. The dialog named the loopback port, which
+        // is how it was traced back to here rather than to the code under
+        // test.
+        //
+        // `GIT_TERMINAL_PROMPT=0` below never helped: it silences a
+        // **terminal**, not a helper, and a helper is a separate program git
+        // runs first.
         std::process::Command::new("git")
+            .args(["-c", "credential.helper=", "-c", "core.askPass="])
             .args(args)
             .current_dir(dir)
             .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GCM_INTERACTIVE", "Never")
+            .env("GCM_UI", "Never")
             .env("LC_ALL", "C")
             .output()
             .expect("git runs")
@@ -2612,40 +2662,28 @@ mod protected_tests {
         run_git(f.repo(), &["push", "-q", "-u", "origin", "feat/fetch"]);
         f.write_local("f.txt", "work\n");
 
-        // A `git` shim that fails the fetch and execs the real git for
-        // everything else, so the rest of the pipeline still works and the
-        // only thing under test is the fetch's exit status. The real git is
-        // resolved through `git_path()` — an absolute path — rather than by
-        // searching `PATH`, because the shim itself is first on `PATH` and a
-        // search would find the shim and recurse.
-        let keep = std::env::temp_dir().join(format!("ro-fetch-shim-{}", std::process::id()));
-        std::fs::create_dir_all(&keep).unwrap();
-        let real_git = ro_testkit::git_path().to_path_buf();
-        let script = keep.join("git");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\n\
-                 # `run_in` prepends `--no-pager`, so the subcommand is not $1.\n\
-                 for a in \"$@\"; do\n\
-                   if [ \"$a\" = fetch ]; then\n\
-                     echo 'fatal: unable to access the remote' >&2\n\
-                     exit 128\n\
-                   fi\n\
-                 done\n\
-                 exec '{}' \"$@\"\n",
-                real_git.display()
-            ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script, perms).unwrap();
-        }
-        let shim = ro_testkit::FakeBinary::at(keep, script, "git");
+        // The fetch fails because `origin` now names a path that is not
+        // there. No shim, and so no platform in the fixture.
+        //
+        // This used to be a `git` shim on `PATH` that exited 128 on `fetch`
+        // and exec'd the real git for everything else. That fixture was
+        // Unix-only in a way nothing declared: the shim was a `#!/bin/sh`
+        // script, and on Windows `Command::new("git")` resolves through the
+        // OS loader, which will not execute an extensionless file. The shim
+        // was therefore never invoked there, the real fetch succeeded, and
+        // the test asserted "a failed fetch must be a failure" over a push
+        // that had actually landed — green on Linux, red on Windows, and
+        // testing nothing at all in between.
+        //
+        // An unreachable remote is the same condition with nothing
+        // platform-specific in it. Real git fails the fetch on every OS,
+        // which is all the gate under test ever cared about: the exit status
+        // of the fetch, not who produced it.
+        let missing = f.remote_path().with_file_name("no-such-remote.git");
+        run_git(
+            f.repo(),
+            &["remote", "set-url", "origin", &missing.to_string_lossy()],
+        );
 
         let plan = plan_on(&f, "feat/fetch", None);
         let mut opts = opts_for(&f);
@@ -2653,11 +2691,11 @@ mod protected_tests {
         // Ship alone. Testing it on Push would pass without ever running a
         // git fetch, which is the vacuous shape this test exists to avoid.
         opts.how_far = HowFar::Ship;
-        let outcome =
-            unsafe { ro_testkit::TestEnv::new().shim(&shim).run(|| run_one(&plan, &opts)) };
+        let outcome = run_one(&plan, &opts);
 
         match &outcome {
-            RepoOutcome::Failed { error,
+            RepoOutcome::Failed {
+                error,
                 class: ro_core::FailureClass::MissingProvider,
             } => {
                 assert!(
@@ -2728,10 +2766,7 @@ mod protected_tests {
             listener
                 .set_nonblocking(true)
                 .expect("the listener can poll instead of blocking");
-            let port = listener
-                .local_addr()
-                .expect("the socket is bound")
-                .port();
+            let port = listener.local_addr().expect("the socket is bound").port();
             let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let seen_thread = seen.clone();
@@ -2745,7 +2780,9 @@ mod protected_tests {
                             let mut chunk = [0u8; 8192];
                             // The request head is the whole of what is under
                             // test; a request body, if one follows, is not.
-                            let Ok(n) = stream.read(&mut chunk) else { continue };
+                            let Ok(n) = stream.read(&mut chunk) else {
+                                continue;
+                            };
                             let head = String::from_utf8_lossy(&chunk[..n]).into_owned();
                             let header = head
                                 .lines()
@@ -2756,8 +2793,9 @@ mod protected_tests {
                                 .lock()
                                 .expect("the lock is poison-free")
                                 .push(header);
-                            let _ = stream
-                                .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n");
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+                            );
                             let _ = stream.flush();
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2956,9 +2994,9 @@ mod protected_tests {
             "the remote must have been asked for something, got nothing"
         );
         for header in &headers {
-            let header = header.as_deref().expect(
-                "a plain-HTTP row with a credential must authenticate its fetch",
-            );
+            let header = header
+                .as_deref()
+                .expect("a plain-HTTP row with a credential must authenticate its fetch");
             assert!(
                 // Base64 of `x-access-token:ghp_plain_http_marker`.
                 header.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX3BsYWluX2h0dHBfbWFya2Vy"),
@@ -3001,9 +3039,9 @@ mod protected_tests {
             "the rebase must have fetched, got no request at all"
         );
         for header in &headers {
-            let header = header.as_deref().expect(
-                "the rebase's fetch must authenticate against a remote that demands it",
-            );
+            let header = header
+                .as_deref()
+                .expect("the rebase's fetch must authenticate against a remote that demands it");
             // Base64 of `x-access-token:ghp_rebase_fetch_marker`.
             assert!(
                 header.contains("eC1hY2Nlc3MtdG9rZW46Z2hwX3JlYmFzZV9mZXRjaF9tYXJrZXI="),
@@ -3072,7 +3110,8 @@ mod protected_tests {
         };
 
         match &outcome {
-            RepoOutcome::Failed { error,
+            RepoOutcome::Failed {
+                error,
                 class: ro_core::FailureClass::MissingProvider,
             } => {
                 assert!(
@@ -3137,7 +3176,6 @@ mod protected_tests {
         assert!(refused.render().contains("main"));
         assert!(!refused.render().contains("failed:"));
     }
-
 }
 
 /// Which branch of `refs/remotes/origin` holds the push's target.
@@ -3579,14 +3617,19 @@ mod onto_tests {
         run_git(f.repo(), &["fetch", "-q", "origin"]);
         run_git(
             f.repo(),
-            &["push", "-q", "origin", "refs/remotes/origin/main:refs/heads/release"],
+            &[
+                "push",
+                "-q",
+                "origin",
+                "refs/remotes/origin/main:refs/heads/release",
+            ],
         );
         // …and one more, on `release` alone.
-        run_git(&f.other(), &["checkout", "-q", "-B", "release"]);
+        run_git(f.other(), &["checkout", "-q", "-B", "release"]);
         std::fs::write(f.other().join("release-only.txt"), "only here\n").unwrap();
-        run_git(&f.other(), &["add", "-A"]);
-        run_git(&f.other(), &["commit", "-q", "-m", "release only moves on"]);
-        run_git(&f.other(), &["push", "-q", "origin", "HEAD:release"]);
+        run_git(f.other(), &["add", "-A"]);
+        run_git(f.other(), &["commit", "-q", "-m", "release only moves on"]);
+        run_git(f.other(), &["push", "-q", "origin", "HEAD:release"]);
         run_git(f.repo(), &["fetch", "-q", "origin"]);
     }
 
@@ -3716,7 +3759,9 @@ mod onto_tests {
             "a fully-qualified ref is not a branch name; got {outcome:?}"
         );
         assert!(
-            !f.remote_refs().iter().any(|r| r.contains("refs/heads/refs")),
+            !f.remote_refs()
+                .iter()
+                .any(|r| r.contains("refs/heads/refs")),
             "no branch may be invented from a ref: {:?}",
             f.remote_refs()
         );
@@ -3752,7 +3797,12 @@ mod onto_tests {
         run_git(&shallow, &["remote", "set-head", "origin", "-a"]);
 
         let tracked = std::process::Command::new("git")
-            .args(["show-ref", "--verify", "--quiet", "refs/remotes/origin/ancient"])
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/ancient",
+            ])
             .current_dir(&shallow)
             .output()
             .expect("git runs");
@@ -3810,12 +3860,7 @@ mod onto_tests {
             f.remote_refs()
         );
         let upstream = std::process::Command::new("git")
-            .args([
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                "@{u}",
-            ])
+            .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
             .current_dir(f.repo())
             .output()
             .expect("git runs");
@@ -3841,7 +3886,10 @@ mod extraheader_host_tests {
     /// run out of ideas.
     #[test]
     fn the_scheme_is_matched_case_insensitively_and_emitted_lower_cased() {
-        for spelling in ["HTTP://example.invalid/o/r.git", "Http://example.invalid/o/r.git"] {
+        for spelling in [
+            "HTTP://example.invalid/o/r.git",
+            "Http://example.invalid/o/r.git",
+        ] {
             assert_eq!(
                 extraheader_host(spelling).as_deref(),
                 Some("http://example.invalid"),

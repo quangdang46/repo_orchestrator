@@ -108,7 +108,15 @@ pub fn is_stripped(name: &str) -> bool {
 ///     credential; a long value in `MY_API_KEY` almost certainly is.
 pub fn value_looks_like_a_credential(value: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-", "xoxb-", "xoxp-",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
     ];
     if PREFIXES.iter().any(|p| value.starts_with(p)) {
         return true;
@@ -144,7 +152,15 @@ pub fn value_looks_like_a_credential(value: &str) -> bool {
 /// unreachable.
 pub fn is_conclusive_credential_shape(value: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "ghp_", "gho_", "ghs_", "ghu_", "ghr_", "github_pat_", "sk-", "xoxb-", "xoxp-",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "ghu_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
     ];
     if PREFIXES.iter().any(|p| value.starts_with(p)) {
         return true;
@@ -160,7 +176,15 @@ pub fn is_conclusive_credential_shape(value: &str) -> bool {
 pub fn name_looks_secret(name: &str) -> bool {
     let n = name.to_ascii_uppercase();
     const MARKERS: &[&str] = &[
-        "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "CRED", "KEY", "PAT", "AUTH",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "CRED",
+        "KEY",
+        "PAT",
+        "AUTH",
         "PRIVATE",
     ];
     // **A marker is a word, not a substring.** `PAT` matched `PATH`,
@@ -240,8 +264,49 @@ impl ChildEnv {
     fn with_git_hardening(mut self) -> Self {
         self.set("GIT_TERMINAL_PROMPT", "0");
         self.set("GCM_INTERACTIVE", "Never");
+        // The engine runs a third-party binary that may itself shell out to
+        // git, and it does so with this environment. `GIT_TERMINAL_PROMPT=0`
+        // only silences a terminal; a credential *helper* is a separate
+        // program git runs first, and on Windows that is Git Credential
+        // Manager, which opens a GUI window asking for a password. The
+        // engine's own git calls are local, but nothing stops a tool it
+        // invokes from reaching the network, and a dialog appearing on a
+        // user's desktop with no terminal attached is not a thing to leave
+        // to a version negotiation. `GCM_UI=Never` is the switch the newer
+        // GCM builds honour; the older ones read `GCM_INTERACTIVE`.
+        self.set("GCM_UI", "Never");
         self.set("GIT_PAGER", "cat");
         self.set("PAGER", "cat");
+
+        // The two entries that stop git, anywhere under this environment,
+        // from having anything left that can open a window.
+        //
+        // `GIT_TERMINAL_PROMPT=0` silences a terminal and nothing else. A
+        // credential *helper* is a separate program git runs before it ever
+        // considers prompting, and it is inherited from the machine's own git
+        // config rather than from this environment — `env_clear()` does not
+        // reach a file on disk. On Windows that helper is Git Credential
+        // Manager, whose prompt is a GUI window, so an engine that shelled out
+        // to git for any reason could put a password dialog on a user's
+        // desktop with no terminal attached to explain it.
+        //
+        // So the helper list is emptied the way git documents: an empty value
+        // for `credential.helper` resets it, and an empty `core.askPass`
+        // leaves nothing to run once the list is empty and the terminal
+        // prompt is already off. ro's own git calls pass these as `-c` on the
+        // command line; an engine subprocess is not a git invocation ro
+        // controls the argv of, which is why this has to travel as config.
+        //
+        // These occupy indices 0 and 1, and `GIT_CONFIG_COUNT` is the **total**
+        // across every writer — so `with_identity` continues at 2 and raises
+        // the count to 4. The two functions own this block between them;
+        // nothing else writes `GIT_CONFIG_*`.
+        self.set("GIT_CONFIG_COUNT", "2");
+        self.set("GIT_CONFIG_KEY_0", "credential.helper");
+        self.set("GIT_CONFIG_VALUE_0", "");
+        self.set("GIT_CONFIG_KEY_1", "core.askPass");
+        self.set("GIT_CONFIG_VALUE_1", "");
+
         // `PATHEXT` on Windows, and it is load-bearing.
         //
         // A `Command` spawns through the OS loader, which decides that
@@ -293,15 +358,21 @@ impl ChildEnv {
         let Some(id) = identity else {
             return self;
         };
-        // Two entries: user.name and user.email. `GIT_CONFIG_COUNT` has to
-        // be the *total*, so a caller that already added entries would
-        // break this — hence the base is a count of exactly these two and
-        // the caller's own entries are numbered from there by `with_env`.
-        self.set("GIT_CONFIG_COUNT", "2");
-        self.set("GIT_CONFIG_KEY_0", "user.name");
-        self.set("GIT_CONFIG_VALUE_0", &id.name);
-        self.set("GIT_CONFIG_KEY_1", "user.email");
-        self.set("GIT_CONFIG_VALUE_1", &id.email);
+        // Two entries, at indices **2 and 3** — `with_git_hardening` already
+        // claimed 0 and 1 for `credential.helper` and `core.askPass`, and
+        // `GIT_CONFIG_COUNT` is the total across every writer, so this raises
+        // it to 4 rather than replacing it. Getting this wrong is not a
+        // compile error: an over-low count silently drops the identity, and an
+        // over-high one points git at entries that do not exist.
+        //
+        // ro's own git calls pass `credential.helper=` as `-c` on the command
+        // line instead. An engine subprocess is not a git invocation whose
+        // argv ro controls, so the same reset has to travel as config here.
+        self.set("GIT_CONFIG_COUNT", "4");
+        self.set("GIT_CONFIG_KEY_2", "user.name");
+        self.set("GIT_CONFIG_VALUE_2", &id.name);
+        self.set("GIT_CONFIG_KEY_3", "user.email");
+        self.set("GIT_CONFIG_VALUE_3", &id.email);
         self
     }
 
@@ -464,10 +535,21 @@ mod tests {
             email: "work@example.com".into(),
         };
         let env = ChildEnv::subtracting(parent_with_a_token()).with_identity(Some(&id));
-        assert_eq!(env.get("GIT_CONFIG_KEY_0"), Some("user.name"));
-        assert_eq!(env.get("GIT_CONFIG_VALUE_0"), Some("Work"));
-        assert_eq!(env.get("GIT_CONFIG_KEY_1"), Some("user.email"));
-        assert_eq!(env.get("GIT_CONFIG_VALUE_1"), Some("work@example.com"));
+        // Indices 2 and 3, not 0 and 1: the hardening block owns those, and
+        // `GIT_CONFIG_COUNT` is the total across both writers. Asserting the
+        // indices rather than searching the map is deliberate — a lookup by
+        // key would still pass if the identity were written at the wrong
+        // index, which is the failure that actually happens.
+        assert_eq!(env.get("GIT_CONFIG_KEY_2"), Some("user.name"));
+        assert_eq!(env.get("GIT_CONFIG_VALUE_2"), Some("Work"));
+        assert_eq!(env.get("GIT_CONFIG_KEY_3"), Some("user.email"));
+        assert_eq!(env.get("GIT_CONFIG_VALUE_3"), Some("work@example.com"));
+        assert_eq!(
+            env.get("GIT_CONFIG_COUNT"),
+            Some("4"),
+            "the count must cover the hardening's two entries as well, or git \
+             reads the identity as if it were not there"
+        );
     }
 
     #[test]
@@ -475,6 +557,45 @@ mod tests {
         let env = ChildEnv::subtracting(Vec::<(String, String)>::new());
         assert_eq!(env.get("GIT_TERMINAL_PROMPT"), Some("0"));
         assert_eq!(env.get("GCM_INTERACTIVE"), Some("Never"));
+    }
+
+    /// The engine's environment leaves git nothing that can open a window.
+    ///
+    /// The engine is a third-party binary, and anything it shells out to
+    /// inherits this environment. `GIT_TERMINAL_PROMPT=0` does not reach a
+    /// credential *helper*, which is a separate program read from the
+    /// machine's git config on disk — a file `env_clear()` never touches. On
+    /// Windows that helper is Git Credential Manager, and its prompt is a GUI
+    /// window on the user's desktop.
+    ///
+    /// Asserted on the map because that is the whole contract here: an engine
+    /// subprocess is not a git invocation whose argv ro controls, so this
+    /// reset has to survive as configuration rather than as `-c`.
+    #[test]
+    fn the_engine_environment_cannot_reach_a_credential_helper() {
+        let env = ChildEnv::subtracting(Vec::<(String, String)>::new());
+        assert_eq!(env.get("GIT_CONFIG_KEY_0"), Some("credential.helper"));
+        assert_eq!(env.get("GIT_CONFIG_VALUE_0"), Some(""));
+        assert_eq!(env.get("GIT_CONFIG_KEY_1"), Some("core.askPass"));
+        assert_eq!(env.get("GIT_CONFIG_VALUE_1"), Some(""));
+        assert_eq!(env.get("GCM_UI"), Some("Never"));
+    }
+
+    /// The hardening block holds its ground when an identity is added on top.
+    ///
+    /// The two writers share one `GIT_CONFIG_COUNT`, and a count that is too
+    /// low is silent: git simply never reads the entries past it. This is
+    /// that failure, asserted directly.
+    #[test]
+    fn the_credential_reset_survives_an_identity() {
+        let id = CommitIdentity {
+            name: "Work".into(),
+            email: "work@example.com".into(),
+        };
+        let env = ChildEnv::subtracting(Vec::<(String, String)>::new()).with_identity(Some(&id));
+        assert_eq!(env.get("GIT_CONFIG_KEY_0"), Some("credential.helper"));
+        assert_eq!(env.get("GIT_CONFIG_KEY_2"), Some("user.name"));
+        assert_eq!(env.get("GIT_CONFIG_COUNT"), Some("4"));
     }
 
     #[test]
@@ -562,7 +683,13 @@ mod leak_tests {
                 "the key is in the vault, ask the platform team for the current one",
             ),
         ]);
-        for k in ["EDITOR", "SSH_AUTH_SOCK", "API_KEY_URL", "NPM_CONFIG", "API_KEY"] {
+        for k in [
+            "EDITOR",
+            "SSH_AUTH_SOCK",
+            "API_KEY_URL",
+            "NPM_CONFIG",
+            "API_KEY",
+        ] {
             assert!(env.get(k).is_some(), "{k} must survive the gate");
         }
     }

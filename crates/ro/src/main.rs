@@ -594,21 +594,21 @@ fn same_path(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// sit at any depth. The walk is bounded: it descends at most
 /// [`NESTED_SCAN_DEPTH`] levels and skips the directories that are build
 /// output, where a vendored copy is not a repository the user would miss.
-fn find_nested_repo(root: &std::path::Path, self_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+fn find_nested_repo(
+    root: &std::path::Path,
+    self_dir: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     /// Deep enough for a `deps/`, shallow enough to be cheap.
     const NESTED_SCAN_DEPTH: usize = 4;
     /// Never descended into: build output and dependency trees, where a
     /// `.git` entry is vendored rather than a working copy.
-    const SKIP: &[&str] = &[
-        "target",
-        "node_modules",
-        ".venv",
-        "vendor",
-        "dist",
-        "build",
-    ];
+    const SKIP: &[&str] = &["target", "node_modules", ".venv", "vendor", "dist", "build"];
 
-    fn walk(dir: &std::path::Path, depth: usize, self_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    fn walk(
+        dir: &std::path::Path,
+        depth: usize,
+        self_dir: &std::path::Path,
+    ) -> Option<std::path::PathBuf> {
         if depth == 0 {
             return None;
         }
@@ -1195,25 +1195,25 @@ fn run() -> Result<()> {
                 author_ref: author,
                 tags,
             };
-            let repo =
-                manage::add_from_input(&conn, &spec, &projects_dir, &opts, layout)
-                    .map_err(|e| {
-                // A bad invocation is a usage error, not a broken
-                // installation. `add_from_input` refuses three things
-                // that are all the caller's fault and none of which
-                // retrying unchanged can fix: a spec that is neither a
-                // remote nor a checkout, a destination that already
-                // exists, and a repo that is already tracked. All three
-                // used to surface as `EX_FATAL` — the same code as a
-                // config file that will not parse — so a typo read as a
-                // broken install and invited a retry that cannot work.
-                // `exit.rs` already says a duplicate add is a usage
-                // problem; this is where that promise is kept.
-                // Raised rather than printed: `main`'s top-level
-                // handler prints it once, so the message appears
-                // exactly one time on the way out.
-                exit::FatalError::usage(format!("adding repo: {e:#}"))
-            })?;
+            let repo = manage::add_from_input(&conn, &spec, &projects_dir, &opts, layout).map_err(
+                |e| {
+                    // A bad invocation is a usage error, not a broken
+                    // installation. `add_from_input` refuses three things
+                    // that are all the caller's fault and none of which
+                    // retrying unchanged can fix: a spec that is neither a
+                    // remote nor a checkout, a destination that already
+                    // exists, and a repo that is already tracked. All three
+                    // used to surface as `EX_FATAL` — the same code as a
+                    // config file that will not parse — so a typo read as a
+                    // broken install and invited a retry that cannot work.
+                    // `exit.rs` already says a duplicate add is a usage
+                    // problem; this is where that promise is kept.
+                    // Raised rather than printed: `main`'s top-level
+                    // handler prints it once, so the message appears
+                    // exactly one time on the way out.
+                    exit::FatalError::usage(format!("adding repo: {e:#}"))
+                },
+            )?;
             eprintln!("Added: {}/{} (id={})", repo.owner, repo.name, repo.id);
             eprintln!("  path: {}", repo.local_path);
 
@@ -1327,8 +1327,7 @@ fn run() -> Result<()> {
                 // canonicalises, so this needs a hand-edited or
                 // arithmetically-derived row, which is the threat model the
                 // gate's own comment claims to cover.
-                let wanted = std::fs::canonicalize(&path)
-                    .unwrap_or_else(|_| path.clone());
+                let wanted = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 let wanted = wanted.to_string_lossy().to_string();
                 let clash = manage::list(&conn, None)
                     .unwrap_or_default()
@@ -1637,7 +1636,7 @@ fn run() -> Result<()> {
                         OutputFormat::Json => {
                             let rows: Vec<String> = repos
                                 .iter()
-                                .map(|r| serde_json::to_string(r))
+                                .map(serde_json::to_string)
                                 .collect::<Result<Vec<_>, _>>()?;
                             println!("[{}]", rows.join(","));
                         }
@@ -1863,7 +1862,7 @@ fn run() -> Result<()> {
             if let OutputFormat::Json = format {
                 let rows: Vec<String> = results
                     .iter()
-                    .map(|r| serde_json::to_string(r))
+                    .map(serde_json::to_string)
                     .collect::<Result<Vec<_>, _>>()?;
                 println!("[{}]", rows.join(","));
             }
@@ -2031,7 +2030,7 @@ fn run() -> Result<()> {
                     OutputFormat::Json => {
                         let rows: Vec<String> = statuses
                             .iter()
-                            .map(|s| serde_json::to_string(s))
+                            .map(serde_json::to_string)
                             .collect::<Result<Vec<_>, _>>()?;
                         println!("[{}]", rows.join(","));
                     }
@@ -2132,9 +2131,9 @@ fn run() -> Result<()> {
                     println!("{toml_str}");
                 }
                 Some(ConfigCommands::Set { pair }) => {
-                    let (key, value) = pair.split_once('=').ok_or_else(|| {
-                        exit::FatalError::usage("expected KEY=VALUE format")
-                    })?;
+                    let (key, value) = pair
+                        .split_once('=')
+                        .ok_or_else(|| exit::FatalError::usage("expected KEY=VALUE format"))?;
                     let key = key.trim();
                     let value = value.trim();
 

@@ -408,11 +408,7 @@ fn probes_github_api(remote: &str, base_uri: Option<&str>) -> bool {
     }
     match base_uri {
         Some(h) => {
-            let configured = h
-                .split("://")
-                .last()
-                .unwrap_or(h)
-                .trim_end_matches('/');
+            let configured = h.split("://").last().unwrap_or(h).trim_end_matches('/');
             host == configured
         }
         None => false,
@@ -1621,7 +1617,7 @@ layout = \"flat\"
             .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
             .collect();
         assert_eq!(backups.len(), 1, "exactly one backup, got: {backups:?}");
-        let backup_bytes = fs::read(&backups[0].path()).unwrap();
+        let backup_bytes = fs::read(backups[0].path()).unwrap();
         assert_eq!(
             backup_bytes, b"this is not a database, not even a little bit",
             "the backup must be the original file, byte for byte"

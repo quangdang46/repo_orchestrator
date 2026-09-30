@@ -215,7 +215,10 @@ fn remove_delete_refuses_a_nested_registered_repo() {
     ro_testkit::worktree::run(&child_path, &["init", "-q", "-b", "main"]);
     ro_testkit::worktree::run(&child_path, &["config", "user.email", "t@example.invalid"]);
     ro_testkit::worktree::run(&child_path, &["config", "user.name", "T"]);
-    ro_testkit::worktree::run(&child_path, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    ro_testkit::worktree::run(
+        &child_path,
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    );
 
     t.cmd().arg("add").arg(parent.path()).assert().success();
     t.cmd().arg("add").arg(&child_path).assert().success();
@@ -226,7 +229,13 @@ fn remove_delete_refuses_a_nested_registered_repo() {
     let parent_label = rows
         .iter()
         .find(|r| r["local_path"].as_str() == Some(parent.path().to_str().unwrap()))
-        .map(|r| format!("{}/{}", r["owner"].as_str().unwrap(), r["name"].as_str().unwrap()))
+        .map(|r| {
+            format!(
+                "{}/{}",
+                r["owner"].as_str().unwrap(),
+                r["name"].as_str().unwrap()
+            )
+        })
         .expect("the parent row must be registered");
 
     t.cmd()

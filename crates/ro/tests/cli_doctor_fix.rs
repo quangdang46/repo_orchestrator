@@ -40,6 +40,17 @@ impl Test {
             .arg(self.config_dir.path())
             .arg("--state-dir")
             .arg(self.state_dir.path());
+        // The doctor's `github_auth` check reads `GH_TOKEN`/`GITHUB_TOKEN`
+        // from the environment, and a miss is a **Required** failure — so it
+        // changes the exit code and the "N failed" count that every count
+        // assertion in this file depends on.
+        //
+        // Left to the ambient environment, these tests pass on a laptop that
+        // happens to have a token exported and fail on a CI runner that does
+        // not, for a reason that has nothing to do with the state under test.
+        // A dummy value pins the check to "ok" without contacting GitHub:
+        // `discover_token` only reads the variable, it never calls out.
+        cmd.env("GH_TOKEN", "test-token-not-used");
         cmd
     }
 
@@ -436,7 +447,7 @@ fn fix_refuses_to_replace_a_registry_it_could_not_back_up() {
         check["applied_fix"]
     );
     assert_eq!(
-        std::fs::read(&t.db()).unwrap(),
+        std::fs::read(t.db()).unwrap(),
         b"not a database",
         "the original must be untouched"
     );
@@ -474,7 +485,7 @@ fn fix_refuses_a_state_dir_that_is_not_ros() {
         "the refusal must name the file it refused to touch; got: {message}"
     );
     assert_eq!(
-        std::fs::read(&t.db()).unwrap(),
+        std::fs::read(t.db()).unwrap(),
         b"not a database",
         "the file must be untouched"
     );

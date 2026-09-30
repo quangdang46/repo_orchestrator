@@ -93,7 +93,6 @@ pub fn finalize_run(conn: &Connection, run_id: &str, exit_code: i32) -> Result<(
     Ok(())
 }
 
-
 fn now_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

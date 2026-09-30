@@ -173,7 +173,13 @@ pub fn v5_add_repo_config(conn: &Connection) -> Result<()> {
 /// `runs` and `sync_results` stay. `ro sync` opens a run and finalises it with
 /// the fleet's exit code, so those have live writers.
 fn v6_drop_unread_tables(conn: &Connection) -> Result<()> {
-    for table in ["jobs", "job_events", "failures", "audit_log", "context_cache"] {
+    for table in [
+        "jobs",
+        "job_events",
+        "failures",
+        "audit_log",
+        "context_cache",
+    ] {
         conn.execute_batch(&format!("DROP TABLE IF EXISTS {table};"))
             .with_context(|| format!("dropping unread table {table}"))?;
     }

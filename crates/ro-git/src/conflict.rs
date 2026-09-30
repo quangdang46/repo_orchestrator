@@ -753,12 +753,18 @@ mod tests {
         let a = tmp.path().join("a");
         init_repo_at(&a);
         commit(&a, "shared.txt", "line1\nline2\nline3\n");
-        run_git(&a, &["remote", "add", "origin", &remote.display().to_string()]);
+        run_git(
+            &a,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
         run_git(&a, &["push", "-q", "origin", "main"]);
 
         // A clone of `remote` into `tmp` lands in `tmp/b`.
         let b = tmp.path().join("b");
-        run_git(tmp.path(), &["clone", "-q", &remote.display().to_string(), "b"]);
+        run_git(
+            tmp.path(),
+            &["clone", "-q", &remote.display().to_string(), "b"],
+        );
         run_git(&b, &["config", "user.email", "test@example.com"]);
         run_git(&b, &["config", "user.name", "Test"]);
         commit(&b, "shared.txt", "line1\nREMOTE-VERSION\nline3\n");
@@ -845,7 +851,9 @@ mod tests {
         let git_dir = find_git_dir(&p).unwrap();
         assert_eq!(detect_op(&git_dir).unwrap(), None);
 
-        let state = detect(&p).unwrap().expect("a conflicting stash apply is a conflict");
+        let state = detect(&p)
+            .unwrap()
+            .expect("a conflicting stash apply is a conflict");
         assert_eq!(state.op, ConflictOp::StashPop);
         assert_eq!(state.unmerged, vec!["f.txt".to_string()]);
     }
@@ -1025,7 +1033,10 @@ mod tests {
             .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .unwrap();
-        assert!(detect(&p).unwrap().is_some(), "the rebase must have conflicted");
+        assert!(
+            detect(&p).unwrap().is_some(),
+            "the rebase must have conflicted"
+        );
 
         // Resolve and continue. git 2.53 keeps REBASE_HEAD afterwards.
         run_git(&p, &["add", "."]);
@@ -1044,7 +1055,9 @@ mod tests {
         // person. `detect` still reports the marker — it is the
         // *emptiness* that exempts it, which is the whole reason
         // `is_empty` reads the index and not just the file list.
-        let state = detect(&p).unwrap().expect("detect still reports the marker");
+        let state = detect(&p)
+            .unwrap()
+            .expect("detect still reports the marker");
         assert!(state.is_empty());
         assert_eq!(
             state.op,
@@ -1069,12 +1082,18 @@ mod tests {
         let a = tmp.path().join("a");
         init_repo_at(&a);
         commit(&a, "shared.txt", "line1\nline2\nline3\n");
-        run_git(&a, &["remote", "add", "origin", &remote.display().to_string()]);
+        run_git(
+            &a,
+            &["remote", "add", "origin", &remote.display().to_string()],
+        );
         run_git(&a, &["push", "-q", "origin", "main"]);
 
         // A clone of `remote` into `tmp` lands in `tmp/b`.
         let b = tmp.path().join("b");
-        run_git(tmp.path(), &["clone", "-q", &remote.display().to_string(), "b"]);
+        run_git(
+            tmp.path(),
+            &["clone", "-q", &remote.display().to_string(), "b"],
+        );
         run_git(&b, &["config", "user.email", "test@example.com"]);
         run_git(&b, &["config", "user.name", "Test"]);
         commit(&b, "shared.txt", "line1\nREMOTE-VERSION\nline3\n");
@@ -1152,7 +1171,10 @@ mod tests {
             unmerged: vec!["a.txt".into()],
         };
         let text = explain(&state);
-        assert!(text.contains("merge --abort"), "a merge can be aborted: {text}");
+        assert!(
+            text.contains("merge --abort"),
+            "a merge can be aborted: {text}"
+        );
     }
 
     /// `abort` refuses rather than running a command that cannot work.

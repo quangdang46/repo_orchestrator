@@ -268,7 +268,13 @@ fn a_v5_database_upgrades_to_v6_and_keeps_what_is_still_read() {
 
     // Preconditions, so a typo in this fixture fails here rather than
     // making the assertions below prove nothing.
-    for present in ["jobs", "job_events", "failures", "audit_log", "context_cache"] {
+    for present in [
+        "jobs",
+        "job_events",
+        "failures",
+        "audit_log",
+        "context_cache",
+    ] {
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -294,7 +300,13 @@ fn a_v5_database_upgrades_to_v6_and_keeps_what_is_still_read() {
     migrate::run(&conn).unwrap();
     assert_eq!(migrate::current_version(&conn).unwrap(), 6);
 
-    for gone in ["jobs", "job_events", "failures", "audit_log", "context_cache"] {
+    for gone in [
+        "jobs",
+        "job_events",
+        "failures",
+        "audit_log",
+        "context_cache",
+    ] {
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -313,7 +325,10 @@ fn a_v5_database_upgrades_to_v6_and_keeps_what_is_still_read() {
     let sync_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM sync_results", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(sync_rows, 1, "a sync result that already happened is history");
+    assert_eq!(
+        sync_rows, 1,
+        "a sync result that already happened is history"
+    );
     let run_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
         .unwrap();
