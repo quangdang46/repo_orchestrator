@@ -28,6 +28,28 @@ ro-git.workspace = true
 # format definition that drifts from the one the real output uses.
 serde_json.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# A Windows Job Object, so a killed engine takes its **descendants** with it.
+#
+# `taskkill /T` walks the live process list looking for children of a PID, so
+# it can only ever reach a tree whose root is still running. By the time the
+# deadline fires the direct child has usually been reaped, and a descendant it
+# started is then unreachable: it keeps the inherited pipe handles open, and
+# the run blocks on a join that can never return. A Job Object is the only
+# Windows construct that ties the whole tree to a handle this process holds.
+#
+# The four features are exactly the four API families that needs, and nothing
+# pulls `Win32` as a whole: `Foundation` for `HANDLE` and `CloseHandle`,
+# `JobObjects` for the job itself, `Threading` for the process handle, and
+# `Security` because `CreateJobObjectW` takes a `SECURITY_ATTRIBUTES` even
+# when it is passed null.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 # The trait references FailureClass, so a test that builds a Failed outcome
 # needs the enum itself.

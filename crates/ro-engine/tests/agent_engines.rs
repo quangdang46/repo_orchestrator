@@ -779,46 +779,50 @@ fn an_agent_filling_stderr_while_stdout_is_quiet_does_not_hang_the_run() {
 /// out of memory; a thread plus `recv_timeout` turns "ro never came back"
 /// into a red line naming the deadline.
 ///
-/// # On Windows the run cannot be cut short, and that is a production gap
+/// # On Windows, and the Job Object that closed the gap
 ///
 /// Unix returns in well under a second: `killpg` reaches the background job
 /// because it is still in the child's process group, so killing the group
-/// closes the write ends and the join returns. Windows has no equivalent.
-/// `kill_tree` runs `taskkill /T /F /PID <child>`, and by the time it is
-/// called `try_wait` has already **reaped** the direct child — the code path
-/// this test exercises is the one where the child has exited. `taskkill /T`
-/// walks the *live* child list, the child is gone, and it reports "the
-/// specified process does not exist" and kills nothing. The descendant is
-/// reparented and unreachable, so the pipes stay open and
-/// `run_with_deadline`'s final, unconditional `reader.join()` blocks for as
-/// long as the descendant lives.
+/// closes the write ends and the join returns.
 ///
-/// A probe on this machine shows it exactly: a `ping -n 300` whose
-/// `ParentProcessId` is a `cmd.exe` that has already exited and been reaped.
+/// Windows has no process group in that sense, and `kill_tree` used to reach
+/// for `taskkill /T /F /PID <child>`. By the time it ran, `try_wait` had
+/// already **reaped** the direct child — the code path this test exercises is
+/// the one where the child has exited. `taskkill /T` walks the *live* child
+/// list, the child is gone, and it reported "the specified process does not
+/// exist" and killed nothing. The descendant was reparented and unreachable,
+/// so the pipes stayed open and `run_with_deadline`'s final, unconditional
+/// `reader.join()` blocked for as long as the descendant lived. A probe on
+/// this machine showed it exactly: a `ping -n 300` whose `ParentProcessId`
+/// was a `cmd.exe` that had already exited and been reaped.
+///
 /// A Windows `ro` run against an agent that leaves a background process — a
-/// dev server, a watcher, a build — therefore blocks until that process
-/// finishes, which is the hang the module comment claims is fixed. Closing it
-/// needs a Job Object (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`), because that is
-/// the only Windows construct that ties a tree to a handle; it is a change to
-/// `agent.rs` and is reported rather than made here.
+/// dev server, a watcher, a build — therefore blocked until that process
+/// finished, which is the hang the module comment has been claiming was
+/// fixed.
 ///
-/// So the elapsed ceiling below is the descendant's lifetime on Windows, not
-/// a fixed short window. When the Job Object fix lands, drop the Windows arm
-/// back to the fixed bound it is holding today and the test starts asserting
-/// the real thing again.
+/// It is now. `run_with_deadline` puts the engine in a Job Object created
+/// with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` before it spawns, which is the
+/// only Windows construct that binds a **tree** to a handle: membership is
+/// not reached from the root, so it survives the root exiting, and closing
+/// the handle takes every member with it. `taskkill` is kept as the fallback
+/// for a host that refuses to nest jobs.
+///
+/// So this test asserts the real thing on both platforms again — a run that
+/// returns in seconds while the descendant holds the pipes for five minutes.
 #[test]
 fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run() {
     // The descendant holds the pipes well past any honest bound, and long
     // enough that a run which simply *waits* on them is still waiting when
     // the hard stop fires.
     //
-    // `hold_secs` cannot be 300 on both platforms any more, because on
-    // Windows it is the length of the test: nothing kills the descendant, so
-    // the run lasts about as long as it holds. `ping -n N` lives for N-1
-    // seconds, so four is a shade over three — still an order of magnitude
-    // above the sub-second window a run that drains properly returns in, and
-    // short enough to keep the suite quick.
-    let hold_secs: u32 = if cfg!(windows) { 4 } else { 300 };
+    // Back to 300 on both platforms now that the Job Object lands the tree.
+    // It was 4 on Windows while the kill could not reach the descendant,
+    // because then the descendant's lifetime *was* the test's runtime — a run
+    // that waited on the pipes came back at 4s, which is under the 10s
+    // ceiling, so the ceiling could not tell a fixed kill from a wait. The
+    // gap between 300 and the ceiling below is the assertion.
+    let hold_secs: u32 = 300;
 
     // The deadline is the other half of the shape and it is *not* the same
     // on both platforms. Its job in this test is only to be long enough that
@@ -885,11 +889,7 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
     // Both bounds are far from the sub-second figure a run that neither waited
     // nor hung lands on, so a fixture that has stopped reproducing the bug
     // fails here rather than sailing through.
-    let floor = if cfg!(windows) {
-        Duration::from_secs(1)
-    } else {
-        Duration::from_millis(100)
-    };
+    let floor = Duration::from_millis(100);
     assert!(
         elapsed >= floor,
         "the run finished in {elapsed:?}, which is what a run looks like when \
@@ -897,11 +897,17 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
          this is not the case under test"
     );
 
+    // The real assertion, and now the same on both platforms: the run returns
+    // in seconds while the descendant holds the pipes for five minutes. On
+    // Windows this is the line the Job Object turned green — a `taskkill /T`
+    // from a reaped PID kills nothing, so the join used to sit on those pipes
+    // for the descendant's full lifetime and the test binary took the 15s hard
+    // stop with it.
     assert!(
         elapsed < Duration::from_secs(10),
-        "the run took {elapsed:?}; a run that waited on a pipe a killed child \
-         never closed would take the whole deadline (and the descendant was \
-         only ever going to hold them for {hold_secs}s)"
+        "the run took {elapsed:?}; a run that waited on a pipe whose holder the \
+         kill never reached would take the descendant's whole {hold_secs}s \
+         lifetime, not a fraction of it"
     );
     assert!(
         matches!(

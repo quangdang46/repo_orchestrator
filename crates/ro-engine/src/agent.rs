@@ -1615,7 +1615,19 @@ fn run_with_deadline(
     // The pipes are taken with `stdout(Stdio::piped())` so the deadline can
     // be enforced while the child runs — `wait_with_output` alone blocks
     // forever, and `output()` has no timeout at all.
+    // Windows only: the job is created **before** the spawn so that the
+    // handle exists to adopt into, and it is held until this function
+    // returns — past the reader joins. Dropping it there is what kills an
+    // engine that left a background process behind, and the run cannot reach
+    // the joins at all if the job is not still open, because the thing
+    // blocking those joins is exactly what the job holds shut.
+    #[cfg(windows)]
+    let job = TreeJob::new();
     let mut child = cmd.spawn().map_err(RunError::Spawned)?;
+    #[cfg(windows)]
+    if let Some(j) = &job {
+        j.adopt(&child);
+    }
     if let Some(text) = stdin_text {
         if let Some(mut pipe) = child.stdin.take() {
             // Written on its own thread, and the reason is a deadlock.
@@ -1671,7 +1683,11 @@ fn run_with_deadline(
             // on a pipe nobody is going to drain. The output is dropped
             // rather than collected — a timed-out run has no stream to
             // classify, and the deadline is the fact the caller needs.
-            kill_tree(&mut child);
+            kill_tree(
+                &mut child,
+                #[cfg(windows)]
+                job.as_ref(),
+            );
             return Err(RunError::TimedOut);
         }
         std::thread::sleep(POLL);
@@ -1702,11 +1718,29 @@ fn run_with_deadline(
         readers_done = stdout_reader.is_finished() && stderr_reader.is_finished();
     }
     if !readers_done {
-        // The descendants are what is holding the pipes open, so the group
-        // is what has to die. `kill_tree` on the already-exited direct child
+        // The descendants are what is holding the pipes open, so the tree is
+        // what has to die.
+        //
+        // This used to read "kill_tree on the already-exited direct child
         // still reaches the group because the child was spawned with
-        // `process_group(0)`.
-        kill_tree(&mut child);
+        // `process_group(0)`" — true on Unix, where the group outlives its
+        // leader and `killpg` still names it, and **false on Windows**, which
+        // has no process groups in that sense. `process_group(0)` is not
+        // applied there at all, and `taskkill /T` walks the live process list
+        // from a PID whose process has already been reaped, so it found
+        // nothing and exited 0. The join below then blocked for as long as
+        // the descendant lived, with the deadline already spent — which is
+        // the exact hang this branch exists to prevent, reproduced by the
+        // sibling test that abandoned a `ping` behind and watched the whole
+        // binary serialize on the lock for its full timeout.
+        //
+        // The job is what makes the claim true on Windows: membership is not
+        // reached from the root, so it survives the root exiting.
+        kill_tree(
+            &mut child,
+            #[cfg(windows)]
+            job.as_ref(),
+        );
     }
 
     let stdout = stdout_reader.join().unwrap_or_default();
@@ -1735,9 +1769,135 @@ fn drain<P: std::io::Read + Send + 'static>(pipe: Option<P>) -> std::thread::Joi
     })
 }
 
-fn kill_tree(child: &mut std::process::Child) {
+/// A Windows Job Object that owns a whole process tree.
+///
+/// # Why this and not `taskkill /T`
+///
+/// The timeout path used to reach the descendants with
+/// `taskkill /T /F /PID <child>`, and the comment beside it claimed it worked
+/// "because the child was spawned with `process_group(0)`". That is a Unix
+/// mechanism and Windows has no equivalent: `taskkill /T` enumerates the
+/// **live** process list and kills what it finds parented to that PID. The
+/// case that matters is the one the surrounding comment is about — the
+/// direct child has already exited, and a background job it started is the
+/// thing still holding the pipe write ends. The root is gone, so there is
+/// nothing for `/T` to walk from, `taskkill` reports success having killed
+/// nothing, and the reader threads stay blocked until that descendant exits
+/// on its own. In a test that is minutes; against a real agent that left a
+/// dev server running, it is until the user noticed.
+///
+/// A Job Object is the only Windows construct that binds a **tree** to a
+/// handle this process holds. Membership survives the root exiting, and
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` means closing the handle takes every
+/// member with it.
+///
+/// # Why not create the child suspended and assign it before it runs
+///
+/// That is the race-free version — a child cannot spawn a descendant it was
+/// never in a job with — and it needs `CREATE_SUSPENDED` plus a
+/// `ResumeThread`, neither of which `std::process::Command` exposes. The
+/// window here is the gap between `CreateProcess` returning and the
+/// `AssignProcessToJobObject` below, during which a child could fork. It is
+/// microseconds against an engine that spends its first seconds starting a
+/// runtime, and the failure mode if it is ever lost is the old one, not a
+/// worse one. If assignment fails outright — a pre-Windows-8 host, or a
+/// parent job that refuses to nest — [`Self::adopt`] returns `false` and the
+/// caller keeps the `taskkill` path, so this is an improvement that degrades
+/// to the previous behaviour rather than a new way to fail.
+#[cfg(windows)]
+struct TreeJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl TreeJob {
+    /// A job whose members die with the handle, or `None` if Windows refused.
+    fn new() -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        // SAFETY: null security attributes and null name mean a job with
+        // default security and no name, which is exactly the ask. Both
+        // pointers are required to be valid-or-null and both are null.
+        let handle: HANDLE = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `info` is a live, correctly sized value and its length is
+        // its own size, which is what this API requires.
+        let ok = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: `handle` came back non-null from `CreateJobObjectW`
+            // and is not closed anywhere else.
+            unsafe { CloseHandle(handle) };
+            return None;
+        }
+        Some(TreeJob(handle))
+    }
+
+    /// Put `child` in the job. `false` means the caller should fall back.
+    fn adopt(&self, child: &std::process::Child) -> bool {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+        // SAFETY: `Child`'s raw handle is the process handle `CreateProcess`
+        // returned, which carries PROCESS_SET_QUOTA and PROCESS_TERMINATE —
+        // exactly what `AssignProcessToJobObject` requires of it.
+        let process = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        // SAFETY: both handles are live and owned by this process for the
+        // duration of the call.
+        unsafe { AssignProcessToJobObject(self.0, process) != 0 }
+    }
+
+    /// Every process in the tree, now.
+    fn kill(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: a live job handle; a failure means the job had no live
+        // members, which is the outcome wanted anyway.
+        unsafe {
+            TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TreeJob {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        // The limit set in `new` does the work: closing the last handle to a
+        // job with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE terminates what is
+        // still in it. This is what stops an engine that left a background
+        // process behind from outliving the run that spawned it.
+        //
+        // SAFETY: the handle is owned by this value and closed once.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+fn kill_tree(child: &mut std::process::Child, #[cfg(windows)] job: Option<&TreeJob>) {
     #[cfg(windows)]
     {
+        // The job first, because it is the only thing that reaches a
+        // descendant whose parent has already been reaped.
+        if let Some(j) = job {
+            j.kill();
+        }
+        // Kept as the fallback for the case `adopt` declined: a host that
+        // will not nest jobs, where the job is absent and `taskkill` is
+        // still the best available answer. It reaches nothing once the root
+        // is gone, which is the bug, but it costs one spawn and it is what
+        // handles a root that is still alive.
         let _ = std::process::Command::new("taskkill")
             .args(["/T", "/F", "/PID", &child.id().to_string()])
             .output();

@@ -10,6 +10,61 @@ a real defect — all at once.
 
 ---
 
+## [0.4.1] — 2026-09-30
+
+Two defects, both found by running the tool rather than reading it. One
+changes what the summary line claims; the other is a hang on Windows.
+
+### Fixed
+
+- **A push was reported as a commit.** `Summary::committed` counted every
+  `Pushed` row, on the reasoning that a push implies a commit. That holds for
+  the ordinary path — the engine commits and `ro` pushes what it wrote — and
+  fails for three ordinary ones: a clean worktree, where the engine had nothing
+  to group; a worktree whose every change the engine judged ephemeral, so it
+  declined all of them and left the work uncommitted; and a branch the remote
+  did not have, pushed at a commit that was already there. All three push
+  something real, so `pushed()` was never wrong. A run against a single
+  uncommitted scratch note printed `1 committed, 1 pushed, 0 failed` with the
+  note still untracked in the worktree and the branch on the remote
+  byte-identical to its base — a green summary over work that did not land,
+  which is the one thing a summary line must never be. `Pushed` now carries
+  `engine_committed`, set only where the engine actually reported a commit.
+- **`ro` hung on Windows when an engine left a background process.** The
+  timeout path reached the engine's descendants with `taskkill /T /F /PID
+  <child>`, and `taskkill /T` walks the *live* process list — so once the
+  direct child had been reaped, which is exactly the case the code path is
+  for, it found nothing, reported success and killed nothing. The descendant
+  kept the inherited pipe write ends open and the run blocked on a join that
+  could not return: an agent that leaves a dev server, a watcher or a build
+  running hung `ro` until that process finished on its own. A Windows Job
+  Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is now created before the
+  spawn and holds the tree, which is the only Windows construct that binds a
+  tree to a handle this process holds; `taskkill` remains as the fallback for
+  a host that will not nest jobs.
+
+### Changed
+
+- **The release pipeline now gates on CI.** It is tag-triggered, which meant it
+  ran on whatever commit the tag pointed at — including a red one. v0.4.0 was
+  cut from a commit whose Format, Clippy and all three Test jobs were failing,
+  and every job built an artifact from it anyway. A tag is a claim about a
+  commit and nothing was checking the claim. The gate reads CI's own conclusion
+  for the tagged SHA rather than re-running the suite, so it cannot disagree
+  with the run a developer already watched go green.
+
+### Tests
+
+- Six fixtures that could not pass on Windows or macOS, each of which had been
+  reporting a platform fact as a defect: two shims written as `#!/bin/sh` that
+  the platform refuses to execute at all, a `cmd.exe` batch script holding a
+  value in single quotes, two tests comparing a registry row against a raw
+  fixture path where `ro add` stores the canonicalized one, and a pull fixture
+  inheriting `core.autocrlf=true` from the machine and failing on a carriage
+  return nobody wrote.
+
+---
+
 ## [0.4.0] — 2026-09-30
 
 ### Security
@@ -34,6 +89,19 @@ a real defect — all at once.
 
 ### Fixed
 
+- **No git behind `ro` could open a password dialog.** `GIT_TERMINAL_PROMPT=0`
+  was the only credential-suppressing variable in the workspace, and it
+  suppresses a *terminal*, not a credential *helper*. A helper is a separate
+  program git runs before it ever considers prompting, and it is read from the
+  machine's own git config — a file `env_clear()` does not touch. On Windows
+  that helper is Git Credential Manager, whose prompt is a GUI window. Every
+  `ro sync` and `ro ship` against a remote `ro` had no credential for opened
+  one on the user's screen, mid-fleet, with no terminal attached to explain it;
+  and a helper that *can* answer is worse, because that is a fetch as the wrong
+  account. The helper list is now emptied rather than the prompt muted:
+  `-c credential.helper=` on every git `ro` runs, in the engine's own
+  environment, and in the test fixtures, which is where the dialog kept coming
+  back from.
 - **`ro ship` fetched anonymously, so it failed on every private repo.** Only
   the push carried the resolved credential. The fetch now carries it too,
   scoped to the row's actual scheme+host, for the invocation only.
