@@ -95,7 +95,13 @@ fn guards(plan: &RepoPlan, repo: &std::path::Path, opts: &RunOptions) -> Option<
         Err(e) => {
             return Some(RepoOutcome::Failed {
                 error: format!("could not read {}: {e:#}", plan.label),
-                class: ro_core::FailureClass::MissingProvider,
+                // A local read of the checkout failed. No provider is
+                // missing — the engine has not run — and `AuthError` is the
+                // taxonomy's bucket for "the cause could not be identified,
+                // so a human has to look". It used to say
+                // `missing_provider`, which sent the reader to install a
+                // binary that was never the problem.
+                class: ro_core::FailureClass::AuthError,
             });
         }
     }
@@ -520,7 +526,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             Ok(false) => RepoOutcome::NothingToCommit,
             Err(e) => RepoOutcome::Failed {
                 error: format!("could not read {}: {e:#}", plan.label),
-                class: ro_core::FailureClass::MissingProvider,
+                // As above: a local read failed, not a missing binary.
+                class: ro_core::FailureClass::AuthError,
             },
         };
     }
@@ -534,7 +541,9 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         Err(e) => {
             return RepoOutcome::Failed {
                 error: format!("could not lock {}: {e:#}", plan.label),
-                class: ro_core::FailureClass::MissingProvider,
+                // A lock that could not be taken is a local filesystem
+                // problem, and no provider is missing.
+                class: ro_core::FailureClass::AuthError,
             };
         }
     };
@@ -568,7 +577,12 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         Err(e) => {
             return RepoOutcome::Failed {
                 error: format!("credential: {e}"),
-                class: ro_core::FailureClass::MissingProvider,
+                // A credential **reference** that cannot be resolved is an
+                // authentication problem, and it is one of the few places
+                // the class is the whole answer: the engine has not run,
+                // the remote has not been touched, and the remedy is a
+                // working token.
+                class: ro_core::FailureClass::AuthError,
             };
         }
     };
@@ -587,6 +601,17 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         ) {
             Ok(r) if r.ok() => {}
             Ok(r) => {
+                // Classified from what git actually said. The class used to
+                // be `missing_provider` on every fetch failure, which told
+                // the reader that the `claude`/`codex` binary was missing —
+                // on a run whose engine was never dispatched, because the
+                // fetch is the step before it. A fetch that failed to
+                // authenticate, timed out, or hit a rate limit now says so.
+                let class = ro_core::FailureClass::classify(if r.stderr.trim().is_empty() {
+                    &r.stdout
+                } else {
+                    &r.stderr
+                });
                 return RepoOutcome::Failed {
                     error: format!(
                         "fetch failed: {}",
@@ -596,13 +621,16 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                             r.stderr.trim()
                         }
                     ),
-                    class: ro_core::FailureClass::MissingProvider,
+                    class,
                 };
             }
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: format!("fetch failed: {e:#}"),
-                    class: ro_core::FailureClass::MissingProvider,
+                    // The child could not be started at all, so there is no
+                    // stderr to classify. `MissingGit` is the honest class:
+                    // git is what failed, and it failed before it ran.
+                    class: ro_core::FailureClass::MissingGit,
                 };
             }
         }
@@ -663,12 +691,16 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                             }
                         }
                         crate::ship::resolve::Resolution::Failed { error } => RepoOutcome::Failed {
+                            // The engine's own words: "claude is not
+                            // installed" is a missing provider, "the engine
+                            // did not finish within 30s" is a timeout, and
+                            // both used to report as `missing_provider`.
+                            class: ro_core::FailureClass::classify(&error),
                             error,
-                            class: ro_core::FailureClass::MissingProvider,
                         },
                         _ => RepoOutcome::Failed {
                             error: "the rebase did not finish".to_string(),
-                            class: ro_core::FailureClass::MissingProvider,
+                            class: ro_core::FailureClass::MergeConflict,
                         },
                     };
                 }
@@ -680,7 +712,17 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: e.to_string(),
-                    class: ro_core::FailureClass::MissingProvider,
+                    // `RebaseError::Failed` carries git's own stderr, so the
+                    // cause is readable rather than guessed at. It used to
+                    // report `missing_provider`, which sent the reader
+                    // looking for a `claude`/`codex` binary while the engine
+                    // had not been dispatched yet.
+                    class: match &e {
+                        RebaseError::Failed { stderr, .. } => {
+                            ro_core::FailureClass::classify(stderr)
+                        }
+                        _ => ro_core::FailureClass::AuthError,
+                    },
                 };
             }
         }
@@ -731,7 +773,7 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             None => {
                 return RepoOutcome::Failed {
                     error: "the engine reported a commit with no commit id".into(),
-                    class: ro_core::FailureClass::MissingProvider,
+                    class: ro_core::FailureClass::AuthError,
                 };
             }
         },
@@ -750,13 +792,13 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
                 Ok(None) => {
                     return RepoOutcome::Failed {
                         error: "there is work to push but HEAD does not resolve".into(),
-                        class: ro_core::FailureClass::MissingProvider,
+                        class: ro_core::FailureClass::AuthError,
                     };
                 }
                 Err(e) => {
                     return RepoOutcome::Failed {
                         error: format!("could not read HEAD: {e:#}"),
-                        class: ro_core::FailureClass::MissingProvider,
+                        class: ro_core::FailureClass::AuthError,
                     };
                 }
             }
@@ -771,14 +813,19 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         EngineOutcome::TimedOut { after } => {
             return RepoOutcome::Failed {
                 error: format!("the engine did not finish within {after:?} and was killed"),
-                class: ro_core::FailureClass::MissingProvider,
+                // A kill is not a refusal. The engine's own doc says so:
+                // "a timeout means 'try again'".
+                class: ro_core::FailureClass::NetworkTimeout,
             };
         }
-        EngineOutcome::Failed { error, .. } => {
-            return RepoOutcome::Failed {
-                error,
-                class: ro_core::FailureClass::MissingProvider,
-            };
+        EngineOutcome::Failed { error, class } => {
+            // The engine **already classified this**. It read the agent's
+            // stderr and stdout and worked out whether the cause was a
+            // rate limit, an auth problem, or a missing binary — and the
+            // orchestrator was throwing that answer away and replacing it
+            // with `missing_provider`, which is how a rate-limited agent
+            // run came to be reported as a missing binary.
+            return RepoOutcome::Failed { error, class };
         }
     };
 
@@ -807,7 +854,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             Err(e) => {
                 return RepoOutcome::Failed {
                     error: format!("amending HEAD failed: {e:#}"),
-                    class: ro_core::FailureClass::MissingProvider,
+                    // A local git operation failed. No provider is missing.
+                    class: ro_core::FailureClass::AuthError,
                 };
             }
         }
@@ -871,11 +919,20 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         },
         Ok(r) => RepoOutcome::Failed {
             error: format!("push failed: {}", r.stderr.trim()),
-            class: ro_core::FailureClass::MissingProvider,
+            // Classified from git's own words. This was hardcoded to
+            // `missing_provider`, so **every** rejected push was reported
+            // as "the `claude`/`codex` binary is missing" — including the
+            // common case, a branch the remote had moved past, which git
+            // rejects as non-fast-forward and which is a divergence rather
+            // than a missing anything. The class is what a script reads, so
+            // a wrong one sends it down the wrong recovery path.
+            class: ro_core::FailureClass::classify(&r.stderr),
         },
         Err(e) => RepoOutcome::Failed {
             error: format!("push failed: {e:#}"),
-            class: ro_core::FailureClass::MissingProvider,
+            // The child could not be started, so there is no stderr to
+            // classify and git is what failed.
+            class: ro_core::FailureClass::MissingGit,
         },
     }
 }

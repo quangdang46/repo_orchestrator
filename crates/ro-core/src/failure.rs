@@ -73,6 +73,26 @@ impl FailureClass {
             FailureClass::RateLimited
         } else if s.contains("merge conflict") || s.contains("conflict in") {
             FailureClass::MergeConflict
+        } else if s.contains("non-fast-forward")
+            || s.contains("updates were rejected")
+            || s.contains("fetch first")
+            || s.contains("stale info")
+        {
+            // A push the remote rejected because the branch moved under us.
+            //
+            // The divergence is a conflict in the sense the taxonomy means:
+            // two histories that have to be reconciled, and a rebase onto the
+            // new base is the reconciliation. `MergeConflict` is the class
+            // that says so, and it is retryable — which is exactly what a
+            // non-fast-forward is.
+            //
+            // This matters because the text a rejected push produces
+            // contains none of the words the classes above look for. Left
+            // unclassified it fell through to the conservative default, so a
+            // divergence was reported as `auth_error` — a credential
+            // problem, on a repository the tool had just fetched from
+            // successfully.
+            FailureClass::MergeConflict
         } else if s.contains("dirty")
             || s.contains("uncommitted changes")
             || s.contains("your local changes")
@@ -81,15 +101,25 @@ impl FailureClass {
         } else if s.contains("timed out")
             || s.contains("connection refused")
             || s.contains("network")
+            || s.contains("did not finish within")
+            || s.contains("was killed")
         {
             FailureClass::NetworkTimeout
-        } else if s.contains("git: not found") || s.contains("'git' is not recognized") {
+        } else if s.contains("git: not found")
+            || s.contains("'git' is not recognized")
+            || s.contains("git is not installed")
+        {
             FailureClass::MissingGit
         } else if s.contains("quality gate") || s.contains("clippy") || s.contains("test failed") {
             FailureClass::QualityGateFailed
         } else if s.contains("secret") || s.contains("blocked by secret scan") {
             FailureClass::SecretScanBlocked
-        } else if s.contains("provider") && (s.contains("not found") || s.contains("missing")) {
+        } else if s.contains("is not installed")
+            || (s.contains("provider") && (s.contains("not found") || s.contains("missing")))
+        {
+            // "the engine is not installed" is the shape the message
+            // actually takes — it names the binary, not the word
+            // "provider" — so the phrase on its own is enough.
             FailureClass::MissingProvider
         } else {
             // Nothing matched. AuthError is the conservative default: it is the
@@ -152,6 +182,70 @@ mod tests {
         ] {
             assert!(!permanent.is_retryable(), "{permanent} must not retry");
         }
+    }
+
+    /// A push the remote rejected as non-fast-forward is a **divergence**.
+    ///
+    /// This is the classification that was missing, and its absence had a
+    /// visible cost: every rejected push was reported as
+    /// `missing_provider` — "the `claude`/`codex` binary is missing" — on a
+    /// run whose engine had never been dispatched, because the push is the
+    /// step after it. The user was sent to install a binary that was
+    /// already installed.
+    ///
+    /// `MergeConflict` is the honest class: two histories that have to be
+    /// reconciled, and a rebase onto the new base is the reconciliation.
+    #[test]
+    fn a_non_fast_forward_push_is_a_divergence() {
+        let stderr = "To /tmp/origin.git
+ ! [rejected]        HEAD -> feature/x (non-fast-forward)
+error: failed to push some refs to '/tmp/origin.git'
+hint: Updates were rejected because the tip of your current branch is behind
+its remote counterpart. If you want to integrate the remote changes,
+use 'git pull' before pushing again.
+hint: See the 'Note about fast-forwards' in 'git push --help' for details.";
+        assert_eq!(
+            FailureClass::classify(stderr),
+            FailureClass::MergeConflict,
+            "a branch that moved under us is a divergence, not a missing binary"
+        );
+        assert!(
+            FailureClass::MergeConflict.is_retryable(),
+            "rebasing onto the new base is the retry"
+        );
+    }
+
+    /// A push the remote refused for want of permission is not a
+    /// divergence, and must not be classified as one.
+    ///
+    /// The negative control for the test above: a rule that matched every
+    /// rejected push would pass it too.
+    #[test]
+    fn a_push_refused_for_permission_is_not_a_divergence() {
+        let stderr = "remote: Permission to owner/repo.git denied to user.
+fatal: unable to access 'https://github.com/owner/repo.git/': The requested URL returned error: 403";
+        assert_eq!(
+            FailureClass::classify(stderr),
+            FailureClass::GithubPermissionDenied,
+            "a 403 from github is a permission problem, and the class that \
+             sends the reader to the credentials is the useful one"
+        );
+    }
+
+    /// "the engine is not installed" is a missing provider.
+    ///
+    /// The message names the binary, not the word "provider", so a rule
+    /// that required the word would have missed the one case the class was
+    /// written for.
+    #[test]
+    fn an_uninstalled_binary_is_a_missing_provider() {
+        assert_eq!(
+            FailureClass::classify(
+                "resolving the conflict: ro-test-agent is not installed. \
+                 `ro-test-agent` is not on PATH."
+            ),
+            FailureClass::MissingProvider
+        );
     }
 
     /// Unclassified output stops rather than retries. Retrying something whose
