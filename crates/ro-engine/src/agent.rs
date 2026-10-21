@@ -2011,7 +2011,7 @@ mod tests {
         std::fs::write(work.join("a.txt"), "agent work\n").unwrap();
         run_git(&work, &["add", "-A"]);
         run_git(&work, &["commit", "-q", "-m", "agent commit"]);
-        // By URL, so no `refs/remotes/origin/...` ref is created.
+        // By URL, so the push is not to a **named** remote.
         run_git(
             &work,
             &[
@@ -2020,6 +2020,26 @@ mod tests {
                 &bare.to_string_lossy(),
                 "HEAD:refs/heads/agent-published",
             ],
+        );
+
+        // And with no tracking ref, which is the whole point of the fixture.
+        //
+        // Git used to create no tracking ref for a push by URL, and this
+        // test relied on that: the commit was on the remote and
+        // `git branch -r --contains` could not see it, which is the shape
+        // `stranded` has to answer correctly. Git 2.55 and later create the
+        // ref **opportunistically** when the push URL matches a configured
+        // remote's URL — and this fixture pushes to the same bare repo
+        // `origin` points at — so the precondition stopped holding and the
+        // fixture stopped reproducing the case.
+        //
+        // The precondition is established rather than assumed. Deleting a
+        // ref that is not there is a no-op, so this works on every git: the
+        // state under test is the same on 2.54 and on 2.56, instead of
+        // depending on which one the runner image ships.
+        run_git(
+            &work,
+            &["update-ref", "-d", "refs/remotes/origin/agent-published"],
         );
 
         let tip = head_oid(&work).expect("HEAD resolves");
