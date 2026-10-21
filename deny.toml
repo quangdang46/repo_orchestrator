@@ -32,19 +32,17 @@ feature-depth = 1
 [advisories]
 version = 2
 yanked = "deny"
-# Tracked exceptions:
-# RUSTSEC-2025-0140 — `gix-date` <= 0.9.x is yanked/unmaintained, transitive
-# via `gix 0.71.x`. Revisit when gix bumps to a release that pulls in
-# gix-date >= 0.12.0.
-# Two advisories are no longer listed because nothing in the graph names them:
+# No exceptions are tracked, and that is the point: an ignore naming
+# nothing in the graph is at best noise and at worst a hard failure on the
+# next cargo-deny version bump, so each one is removed the day the
+# dependency it named leaves the graph.
+#
+# Three advisories have been removed this way:
 #   - RUSTSEC-2024-0436 (`paste`) left with `rmcp` when the AI sidecar was cut.
 #   - RUSTSEC-2025-0119 (`number_prefix`) left with `indicatif` when the unused
 #     progress-bar dependencies were dropped from `ro-sync`.
-# An ignore naming nothing in the graph is at best noise and at worst a hard
-# failure on the next cargo-deny version bump, so both were removed.
-ignore = [
-    "RUSTSEC-2025-0140",
-]
+#   - RUSTSEC-2025-0140 (`gix-date` <= 0.9.x, unmaintained) left when `gix`
+#     went from 0.71.x to 0.88.0, which pulls in `gix-date` >= 0.12.0.
 
 # ---------------------------------------------------------------------------
 # Licenses: only allow well-known permissive / copyleft-compatible licenses.

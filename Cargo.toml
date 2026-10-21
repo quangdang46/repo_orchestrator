@@ -92,7 +92,6 @@ wiremock        = "0.6"
 assert_cmd      = "2.0"
 predicates       = "3.1"
 globset         = "0.4"
-serde_yaml      = "0.9"
 
 # cargo-dist release configuration.
 # Drives the `Release` GitHub Actions workflow (see `.github/workflows/release.yml`).
