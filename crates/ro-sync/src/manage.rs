@@ -422,6 +422,35 @@ pub fn add_from_input(
             if opts.branch.is_some() {
                 spec.branch = opts.branch.clone();
             }
+
+            // The duplicate check, **before** the clone.
+            //
+            // It used to live in `register`, which runs after the clone. So
+            // adding a repo that was already tracked meant: clone the whole
+            // thing over the network, then refuse — and the refusal left
+            // the clone on disk with no row pointing at it. The user was
+            // left with a directory full of git history that `ro` did not
+            // know about and that `ro remove` would not clean up.
+            //
+            // Worse, the *first* thing that failed was the destination
+            // check, not the duplicate check: the default destination for an
+            // already-tracked repo is the directory it was cloned into, so
+            // the user was told "that path already exists — pass
+            // `--clone-to` to choose another destination". Following that
+            // advice cloned the repo a second time and stranded it.
+            //
+            // The answer is the one the user meant to ask for: it is
+            // already tracked.
+            if let Some(existing_id) = already_tracked(conn, &spec) {
+                bail!(
+                    "repo {}/{} is already tracked (id={}). \
+                     `ro remove` it first if you want to enrol it again.",
+                    spec.owner,
+                    spec.name,
+                    existing_id
+                );
+            }
+
             // The same `core.layout` reading as `resolve_local_path`, so
             // the path the row is written with and the path the clone
             // happens into cannot disagree. See the comment there.
@@ -494,10 +523,58 @@ pub fn add_from_input(
                 );
             }
 
-            register(conn, &spec, &dest.to_string_lossy(), opts)
+            // The clone landed but the row did not: the repo was enrolled
+            // by something else between the check above and this call, or
+            // the insert itself failed. Either way the directory on disk is
+            // a full clone that **no row points at** — the mirror image of
+            // "tracked but not cloned", and the state nothing else in the
+            // tool knows how to clean up.
+            //
+            // The clone is the expensive half, so it is the half that gets
+            // removed. Leaving it behind would spend a full network clone
+            // to produce a directory the user has to delete by hand.
+            match register(conn, &spec, &dest.to_string_lossy(), opts) {
+                Ok(repo) => Ok(repo),
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&dest);
+                    Err(e)
+                }
+            }
         }
         AddSource::Local { path, owner, name } => {
             let remote = git_remote_url(&path)?;
+
+            // The same **repository** must not be enrolled twice, whatever
+            // directory it is checked out in.
+            //
+            // The row's identity is `(host, owner, name)`, and for an
+            // adopted checkout the owner and the name come from the
+            // **directory layout** — `~/projects/<owner>/<name>` — because
+            // that is the shape a local fleet uses. So the same repository
+            // cloned into two directories produced two identities, and
+            // `register`'s duplicate check let both through: two rows for
+            // one remote, each pointing at a different working copy, and
+            // `ro ship` pushing the same branch twice.
+            //
+            // The remote is the repository's identity, and the row already
+            // records it. So it is compared too, and the second enrolment
+            // is refused with the row that already holds the repository.
+            //
+            // The comparison is on the **normalised** URL, so a checkout
+            // made over SSH and one made over HTTPS are the same
+            // repository. A fork is a different URL and stays a different
+            // repository, which is right: a fork is a different thing to
+            // push to.
+            if let Some(existing) = tracked_by_remote(conn, &remote) {
+                bail!(
+                    "the remote {remote} is already tracked as {}/{} (id={}). \\
+                     `ro remove` it first if you want to enrol this checkout.",
+                    existing.owner,
+                    existing.name,
+                    existing.id
+                );
+            }
+
             let spec = RepoSpec {
                 host: "github.com".to_string(),
                 owner,
@@ -509,6 +586,22 @@ pub fn add_from_input(
             register(conn, &spec, &path.to_string_lossy(), opts)
         }
     }
+}
+
+/// Is this remote already tracked?
+///
+/// The answer is about the **repository**, not the directory it was cloned
+/// into, so the comparison is on the normalised URL. See the call site for
+/// why the row's own identity key is not enough.
+fn tracked_by_remote(conn: &Connection, remote: &str) -> Option<TrackedRepo> {
+    let normalised = ro_core::repo_spec::normalize_remote_url(remote);
+    if normalised.is_empty() {
+        return None;
+    }
+    list(conn, None)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|r| ro_core::repo_spec::normalize_remote_url(&r.clone_url) == normalised)
 }
 
 /// The origin URL of a local checkout, or a synthesised one.
@@ -540,6 +633,26 @@ fn git_remote_url(path: &Path) -> Result<String> {
     Ok(format!("https://github.com/{owner}/{name}.git"))
 }
 
+/// Is this repository already tracked?
+///
+/// One question with one answer, asked in two places: once in
+/// `add_from_input`, **before** the clone, and once in `register`, as the
+/// last thing before the insert. Two copies of the check would be two
+/// answers waiting to disagree, and the disagreement is a clone on disk
+/// that no row points at.
+///
+/// The key is `(host, owner, name)` — the repository's identity, not the
+/// directory it was cloned into. A repo enrolled twice under two different
+/// destinations is one repo, and the second one is refused.
+fn already_tracked(conn: &Connection, spec: &RepoSpec) -> Option<String> {
+    conn.query_row(
+        "SELECT id FROM repos WHERE host = ?1 AND owner = ?2 AND name = ?3",
+        params![spec.host, spec.owner, spec.name],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
 /// Insert the row. Shared by both branches so the column list, the duplicate
 /// check and the defaults live in exactly one place.
 fn register(
@@ -548,14 +661,7 @@ fn register(
     local_path: &str,
     opts: &AddOptions,
 ) -> Result<TrackedRepo> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT id FROM repos WHERE host = ?1 AND owner = ?2 AND name = ?3",
-            params![spec.host, spec.owner, spec.name],
-            |r| r.get(0),
-        )
-        .ok();
-    if let Some(existing_id) = &existing {
+    if let Some(existing_id) = already_tracked(conn, spec) {
         bail!(
             "repo {}/{} already tracked (id={})",
             spec.owner,
@@ -622,7 +728,10 @@ fn register(
 
 /// Remove a tracked repo by `owner/name` or alias. Returns the removed repo.
 pub fn remove(conn: &Connection, key: &str) -> Result<TrackedRepo> {
-    let repo = find_repo(conn, key).context("repo not found")?;
+    // `find_repo` already says "repo '<key>' not found". Wrapping it in a
+    // second "repo not found" context produced "repo not found: repo 'x'
+    // not found" — the same fact twice, in two grammars.
+    let repo = find_repo(conn, key)?;
     delete_repo_cascade(conn, &repo.id).context("deleting repo from state DB")?;
     Ok(repo)
 }
@@ -722,7 +831,9 @@ pub const REPO_CONFIG_KEYS: &[(&str, bool)] = &[
 /// The validation lives here rather than in `ro config set` so that every
 /// writer gets it, including a future one.
 pub fn set_repo_config(conn: &Connection, repo: &str, config_key: &str, value: &str) -> Result<()> {
-    let target = find_repo(conn, repo).with_context(|| format!("repo not found: {repo}"))?;
+    // As in `remove`: `find_repo` names the repo it could not find, so
+    // there is nothing to add around it.
+    let target = find_repo(conn, repo)?;
 
     let Some((column, is_credential)) = REPO_CONFIG_KEYS
         .iter()

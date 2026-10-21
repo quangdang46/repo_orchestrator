@@ -690,39 +690,10 @@ fn working_tree_root(dir: &std::path::Path) -> std::result::Result<std::path::Pa
 /// credential in place would refuse every such checkout, and printing the
 /// credential to explain why would put a secret on stderr.
 fn origin_matches(origin: &str, clone_url: &str) -> bool {
-    /// `git@host:owner/repo`, `ssh://git@host/owner/repo` and
-    /// `https://host/owner/repo` all reduce to `host/owner/repo`.
-    ///
-    /// The scp-like form is the reason this function is not a `trim` pair:
-    /// it has no scheme and separates host from path with a colon, so a
-    /// `://`-only normalization leaves `github.com:acme/api` to be compared
-    /// against `github.com/acme/api` and never matches. Git accepts both
-    /// spellings for the same remote, so a gate that rejected one of them
-    /// would refuse a `git clone` of it — a checkout made with the SSH key
-    /// rather than a token.
-    fn normalize(url: &str) -> String {
-        let trimmed = url.trim();
-        // `.git` is a repository-name suffix, not part of the name, and
-        // either side may or may not carry it.
-        let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-        // No scheme means the scp-like spelling, where a colon separates the
-        // host from the path. With a scheme, a colon is a port and must be
-        // left alone.
-        let (after_scheme, scp_form) = match trimmed.find("://") {
-            Some(i) => (&trimmed[i + 3..], false),
-            None => (trimmed, true),
-        };
-        let no_credentials = match after_scheme.rfind('@') {
-            Some(i) => &after_scheme[i + 1..],
-            None => after_scheme,
-        };
-        let slash_form = match (scp_form, no_credentials.find(':')) {
-            (true, Some(i)) => format!("{}/{}", &no_credentials[..i], &no_credentials[i + 1..]),
-            _ => no_credentials.to_string(),
-        };
-        slash_form.trim_matches('/').to_ascii_lowercase()
-    }
-    normalize(origin) == normalize(clone_url)
+    // The normalisation lives in `ro-core`, because the registry needs the
+    // same answer when it refuses to enrol the same remote twice. One
+    // normaliser, one answer.
+    ro_core::repo_spec::same_remote(origin, clone_url)
 }
 
 /// Fold `--tag <T>` into the single filter string the resolver takes.

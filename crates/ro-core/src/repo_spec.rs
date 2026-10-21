@@ -228,6 +228,52 @@ impl RepoSpec {
     }
 }
 
+/// Reduce a remote URL to the identity of the repository it names.
+///
+/// `git@host:owner/repo`, `ssh://git@host/owner/repo` and
+/// `https://host/owner/repo` all reduce to `host/owner/repo`.
+///
+/// The scp-like form is the reason this is not a `trim` pair: it has no
+/// scheme and separates host from path with a colon, so a `://`-only
+/// normalization leaves `github.com:acme/api` to be compared against
+/// `github.com/acme/api` and never matches. Git accepts both spellings for
+/// the same remote, so a comparison that rejected one of them would call
+/// two clones of one repository two repositories.
+///
+/// This lives here rather than in the binary because **two** places need
+/// the same answer: the gate that refuses to delete a working copy whose
+/// origin is not the row's, and the check that refuses to enrol the same
+/// repository twice. One normaliser, one answer — a second copy would be
+/// two answers waiting to disagree, and the disagreement is two rows for
+/// one remote.
+pub fn normalize_remote_url(url: &str) -> String {
+    let trimmed = url.trim();
+    // `.git` is a repository-name suffix, not part of the name, and
+    // either side may or may not carry it.
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    // No scheme means the scp-like spelling, where a colon separates the
+    // host from the path. With a scheme, a colon is a port and must be
+    // left alone.
+    let (after_scheme, scp_form) = match trimmed.find("://") {
+        Some(i) => (&trimmed[i + 3..], false),
+        None => (trimmed, true),
+    };
+    let no_credentials = match after_scheme.rfind('@') {
+        Some(i) => &after_scheme[i + 1..],
+        None => after_scheme,
+    };
+    let slash_form = match (scp_form, no_credentials.find(':')) {
+        (true, Some(i)) => format!("{}/{}", &no_credentials[..i], &no_credentials[i + 1..]),
+        _ => no_credentials.to_string(),
+    };
+    slash_form.trim_matches('/').to_ascii_lowercase()
+}
+
+/// Do two remote URLs name the same repository?
+pub fn same_remote(a: &str, b: &str) -> bool {
+    normalize_remote_url(a) == normalize_remote_url(b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -454,30 +454,35 @@ fn add_the_same_repo_twice_is_a_usage_error() {
         "the duplicate must not write a second row"
     );
 
-    // Known gap, in `ro-sync/src/manage.rs` (not owned by this change): the
-    // clone is made *before* `register` discovers the duplicate, so the
-    // refused add leaves a fully-cloned directory behind claiming a repo ro
-    // will never register. `add_from_input` already has the pattern that
-    // fixes it — the failed-clone arm does `let _ = std::fs::remove_dir_all(&dest);`
-    // before bailing — and the duplicate needs the same. Asserted here as a
-    // record of the bug rather than skipped: when the fix lands, this test
-    // is the one that should start passing.
+    // The duplicate is refused **before** the clone, so the refused add
+    // leaves nothing behind.
+    //
+    // It used to clone first and refuse afterwards, on the reasoning that
+    // "already tracked" was a fact only the registry knew — which the
+    // registry still knows, just earlier. The cost of the old order was a
+    // full network clone of a repo that was then thrown away, and a
+    // directory of git history sitting on disk that no row pointed at and
+    // no `ro remove` would clean up: the mirror image of "tracked but not
+    // cloned", and just as unusable.
     assert!(
-        elsewhere.join(".git").exists(),
-        "KNOWN GAP: the refused duplicate leaves a cloned directory behind. \
-         When `add_from_input` cleans up `dest` on a `register` failure, \
-         change this assertion to `assert!(!elsewhere.exists())`."
+        !elsewhere.exists(),
+        "the refused duplicate must not leave a cloned directory behind"
     );
 }
 
-/// Re-adding the same repo to the same destination is refused by the
-/// destination guard, and says which of the two things is in the way.
+/// Re-adding the same repo is refused, and says the repo is **already
+/// tracked**.
 ///
-/// A user who runs `ro add` twice and reads "already tracked" would go
-/// looking in the registry; the message they actually got names the path,
-/// which is where the problem is.
+/// The refusal used to name the *destination* — "that path already exists,
+/// pass `--clone-to` to choose another destination" — because the
+/// destination guard ran before the duplicate check. That was the wrong
+/// answer to give, and following it was actively harmful: `--clone-to`
+/// would have cloned the repo a second time and stranded that clone.
+///
+/// The answer the user meant to ask for is "it is already tracked", and
+/// that is what the message says.
 #[test]
-fn re_adding_to_the_same_destination_names_the_path() {
+fn re_adding_the_same_repo_says_it_is_already_tracked() {
     let t = Test::new();
     let (_remote, gitconfig) = Remote::new();
 
@@ -490,10 +495,66 @@ fn re_adding_to_the_same_destination_names_the_path() {
         .args(["add", "acme/api"])
         .assert()
         .code(64)
-        .stderr(predicate::str::contains("already exists"))
-        .stderr(predicate::str::contains("api"));
+        .stderr(predicate::str::contains("already tracked"))
+        .stderr(predicate::str::contains("acme/api"));
 
     assert_eq!(t.rows().len(), 1);
+}
+
+/// The same **repository** must not be enrolled twice.
+///
+/// The row's identity is `(host, owner, name)`, and for an adopted
+/// checkout the owner and the name come from the **directory layout** —
+/// `~/projects/<owner>/<name>` — because that is the shape a local fleet
+/// uses. So one repository cloned into two directories produced two
+/// identities, and the duplicate check let both through: two rows for one
+/// remote, each pointing at a different working copy, and `ro ship` pushing
+/// the same branch twice.
+///
+/// The remote is the repository's identity, and the row already records it,
+/// so it is compared too.
+#[test]
+fn the_same_remote_is_not_enrolled_twice() {
+    let t = Test::new();
+    let (_remote, gitconfig) = Remote::new();
+
+    // Two checkouts of one remote, in two different directories.
+    let root = TempDir::new().unwrap();
+    for dir in ["alpha/api", "beta/api"] {
+        let path = root.path().join(dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut cmd = std::process::Command::new(ro_testkit::git_path());
+        cmd.args(["clone", "-q", "https://github.com/acme/api.git"])
+            .arg(&path)
+            .env("GIT_CONFIG_GLOBAL", &gitconfig)
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let out = cmd.output().expect("git runs");
+        assert!(
+            out.status.success(),
+            "the clone failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    t.cmd_with_remote(&gitconfig)
+        .args(["add"])
+        .arg(root.path().join("alpha/api"))
+        .assert()
+        .success();
+
+    t.cmd_with_remote(&gitconfig)
+        .args(["add"])
+        .arg(root.path().join("beta/api"))
+        .assert()
+        .code(64)
+        .stderr(predicate::str::contains("already tracked"));
+
+    assert_eq!(
+        t.rows().len(),
+        1,
+        "one repository must produce one row, however many directories it is \
+         checked out in"
+    );
 }
 
 /// A clone into a path that already exists is refused.
