@@ -10,6 +10,83 @@ a real defect — all at once.
 
 ---
 
+## [0.4.2] — 2026-10-21
+
+Seven defects, found by installing the released binary and running it against
+real repositories — real clones, real remotes, real branches that had moved.
+One of them made the tool's own safety machinery unreachable, and the rest
+made it say the wrong thing.
+
+### Fixed
+
+- **`ro ship` rebased onto the wrong branch, so a conflict was never handed
+  over.** The rebase base was the remote's `HEAD` — where the work *came
+  from* — while the push landed on the checkout's own branch, where the work
+  is *going*. The two differ in the case that happens most: a colleague
+  pushes to your branch. Then the rebase was a no-op, the push was rejected
+  non-fast-forward, and the row read `failed (missing_provider): push failed:
+  … (non-fast-forward)` — with the real conflict sitting in the tree,
+  unreported. The documented path, "a conflict is a hand-over, not a
+  failure", was unreachable for exactly the case it exists for. The base is
+  now the branch the push lands on.
+- **Every failure was reported as a missing provider.** All twenty-one
+  failure sites in the orchestrator hardcoded `FailureClass::MissingProvider`
+  — "the `claude`/`codex` binary is missing" — whatever had actually gone
+  wrong, and `FailureClass::classify`, the function that reads what a process
+  said, was never called. The engine computed the right class and the
+  orchestrator threw it away: a rate-limited agent run was reported as a
+  missing binary. A rejected push is now `merge_conflict`, which is what it
+  is, and which is the one class here that is retryable.
+- **`ro list --format json` and `ro status --format json` printed the whole
+  list once per repo.** Five repos produced the same five-element array five
+  times — 9,110 bytes instead of 1,822 — and `json.load(stdout)` raised
+  "Extra data: line 2 column 1". The comment on that arm named the error as
+  one that had been fixed; the fix had been put in the wrong place, with the
+  `println!` left inside the per-repo loop. `ro sync` had the same bug and
+  had it fixed properly, and the fix was never carried across.
+- **`ro add` cloned before it refused a duplicate, and left the clone
+  behind.** The duplicate check ran after the clone, so adding a repo that was
+  already tracked meant a full network clone followed by a refusal — and the
+  clone stayed on disk, with no row pointing at it and no `ro remove` to
+  clean it up. The first thing to fail was the *destination* check, so the
+  message was "that path already exists — pass `--clone-to`", and following
+  that advice cloned the repo a second time and stranded it.
+- **One repository could be tracked twice.** The row's identity is
+  `(host, owner, name)`, and for an adopted checkout the owner and the name
+  come from the directory layout, so the same remote checked out in two
+  directories produced two identities and two rows — and `ro ship` pushed the
+  same branch twice. The remote is the repository's identity, and the row
+  already records it, so it is compared too.
+- **Two `ro-engine` tests had a deadline too tight for a loaded machine.**
+  Both reported `TimedOut` for a child that was about to exit 0, because
+  300 ms is not always enough for a shell to start and exit on a CI box
+  running the whole suite in parallel. The deadline's own job — "long enough
+  that the direct child can get as far as exiting" — is now what it does.
+- **CI was red on `main`, for four separate reasons.** The lints Rust 1.96
+  added (`clippy -D warnings` is eight errors, one of them a test with no
+  `#[test]` on it, so an assertion was not running at all); five dependency
+  advisories, four of them in `rustls` and one in `rustls-webpki`, plus an
+  unmaintained `unsafe-libyaml` that was in the graph only because
+  `serde_yaml` was declared in `ro-config` and never used; a `deny.toml`
+  ignore naming an advisory that had left the graph when `gix` went from
+  0.71 to 0.88; and a fixture that stopped reproducing its case when Git
+  2.55 started creating remote-tracking refs opportunistically.
+
+### Changed
+
+- **`rustls` 0.23.45 → 0.23.46 and `rustls-webpki` 0.103.15 → 0.103.16.**
+  Four advisories in `rustls` (RUSTSEC-2026-0346/0347/0348/0349 — a
+  certificate decompression that can allocate up to 1 GiB before
+  authentication, a ServerHello that can downgrade later connections to
+  classical key exchange, and two more) and one in `rustls-webpki`
+  (RUSTSEC-2026-0382 — certificate verification may accept distrusted
+  intermediates). Both are transitive, through `octocrab`.
+- **`serde_yaml` is gone from `ro-config`.** It was declared as a dependency
+  and never used in a single source file, and it was what pulled the
+  unmaintained `unsafe-libyaml` into the graph.
+
+---
+
 ## [0.4.1] — 2026-09-30
 
 Two defects, both found by running the tool rather than reading it. One
