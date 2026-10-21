@@ -625,6 +625,7 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         match rebase_onto_remote_base(
             repo,
             plan.onto.as_deref(),
+            &plan.base_branch,
             plan.host_for_extraheader().as_deref(),
             credential.as_ref(),
         ) {
@@ -763,6 +764,7 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         EngineOutcome::Unavailable { binary, hint } => {
             return RepoOutcome::Failed {
                 error: format!("{binary} is not installed. {hint}"),
+                // The one place `missing_provider` is literally true.
                 class: ro_core::FailureClass::MissingProvider,
             };
         }
@@ -1470,17 +1472,53 @@ fn absolute_git_dir(repo: &Path) -> Option<PathBuf> {
 ///
 /// `--onto` names it, and names it as a **remote** branch — the work is
 /// going to land there, and rebasing onto anything else builds a push the
-/// remote will reject. Without `--onto` it is the remote's own HEAD: the
-/// branch the clone was made from, and therefore the one a plain `ro ship`
-/// means.
+/// remote will reject. Without `--onto` it is the branch the push will land
+/// on, which is the checkout's own branch.
 ///
 /// `None` means there is nothing to rebase onto. A local-only repo is that,
 /// and it is an ordinary state rather than a failure.
-fn base_for(repo: &Path, onto: Option<&str>) -> Option<String> {
+///
+/// # Why the target branch and not `origin/HEAD`
+///
+/// The rebase base and the push destination have to be the **same branch**.
+/// `push_refspec` writes `HEAD:refs/heads/<target>`, so the push lands on
+/// `<target>`, and a rebase onto anything else leaves the branch that the
+/// remote moved past sitting underneath the work.
+///
+/// This used to answer `origin/HEAD` — the branch the clone was made from,
+/// `main` on most clones — because that is where the *work came from*. It
+/// is not where the work is *going*, and the two differ in the case that
+/// matters:
+///
+/// ```text
+///   origin/main      A ────────────────▶ A'
+///   origin/feature   B ────▶ B'        (B' is the branch being shipped)
+///   local feature        C              (C is on top of B)
+/// ```
+///
+/// With `origin/main` as the base, the rebase is a **no-op** — `C` already
+/// contains `A'` — so the run went on to push `C` onto a remote branch
+/// holding `B'`, and the remote rejected it as non-fast-forward. The
+/// conflict was real and sitting in the tree, but it never became one:
+/// `ro ship` reported `failed (missing_provider): push failed: …
+/// (non-fast-forward)` instead of the `needs you:` hand-over the whole
+/// conflict machinery exists to produce.
+///
+/// The base is the remote-tracking ref for `<target>`, which is what the
+/// fetch just before this step refreshed. When the remote does not have
+/// that branch yet there is nothing to rebase onto — the push is what
+/// creates it — and `origin/HEAD` is the best answer available.
+fn base_for(repo: &Path, onto: Option<&str>, target_branch: &str) -> Option<String> {
     let remote_head = ro_git::primitives::symbolic_ref(repo, "refs/remotes/origin/HEAD")
         .ok()
         .flatten();
     let Some(onto) = onto.map(str::trim).filter(|b| !b.is_empty()) else {
+        // The branch the push lands on. Its remote-tracking ref is the base
+        // that makes the push a fast-forward.
+        if ro_git::primitives::remote_tracking_exists(repo, target_branch) {
+            return Some(format!("origin/{target_branch}"));
+        }
+        // A branch the remote does not have yet: nothing to rebase onto.
         return remote_head;
     };
     // A branch the remote does not have yet is not an error: the push is
@@ -1588,6 +1626,7 @@ fn head_is_on_remote(repo: &Path, branch: &str) -> bool {
 fn rebase_onto_remote_base(
     repo: &Path,
     onto: Option<&str>,
+    target_branch: &str,
     host: Option<&str>,
     credential: Option<&SecretString>,
 ) -> Result<RebaseState, RebaseError> {
@@ -1611,7 +1650,7 @@ fn rebase_onto_remote_base(
         credential,
     );
 
-    let Some(base) = base_for(repo, onto) else {
+    let Some(base) = base_for(repo, onto, target_branch) else {
         return Ok(RebaseState::NoRemote);
     };
     // `--autostash` is the whole mechanism: git stashes, rebases, and pops
@@ -1932,7 +1971,7 @@ mod rebase_tests {
         f.force_remote_file("shared.txt", "remote version\n");
         run_git(f.repo(), &["fetch", "-q", "origin"]);
 
-        let state = rebase_onto_remote_base(f.repo(), None, None, None);
+        let state = rebase_onto_remote_base(f.repo(), None, "main", None, None);
 
         match state {
             Err(RebaseError::Conflicted { .. }) => {}
@@ -1962,7 +2001,7 @@ mod rebase_tests {
         f.other_clone_commits("remote moved on");
         run_git(f.repo(), &["fetch", "-q", "origin"]);
 
-        let state = rebase_onto_remote_base(f.repo(), None, None, None);
+        let state = rebase_onto_remote_base(f.repo(), None, "main", None, None);
         assert!(
             matches!(state, Ok(RebaseState::Rebased)),
             "a clean pop must be a rebase; got {state:?}"
@@ -1972,6 +2011,102 @@ mod rebase_tests {
             "no conflict markers may be left behind: {}",
             f.local_porcelain()
         );
+    }
+
+    /// The rebase base is the branch being **shipped**, not `origin/HEAD`.
+    ///
+    /// The base and the push destination have to be the same branch.
+    /// `push_refspec` writes `HEAD:refs/heads/<target>`, so the push lands
+    /// on `<target>` — and a rebase onto anything else leaves the branch
+    /// the remote moved past sitting underneath the work.
+    ///
+    /// The base used to be `origin/HEAD`, which on most clones is
+    /// `origin/main`. That is where the work *came from*; it is not where
+    /// the work is *going*. The difference only shows up when the branch
+    /// being shipped is the one that moved — and then it is the difference
+    /// between a conflict the user is handed and a push the remote
+    /// rejects.
+    #[test]
+    fn the_base_is_the_remote_tracking_ref_for_the_branch_being_shipped() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feature/x"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feature/x"]);
+        run_git(f.repo(), &["fetch", "-q", "origin"]);
+
+        assert_eq!(
+            base_for(f.repo(), None, "feature/x").as_deref(),
+            Some("origin/feature/x"),
+            "the base must be the branch the push lands on"
+        );
+    }
+
+    /// A branch the remote does not have yet has nothing to rebase onto.
+    ///
+    /// The push is what creates it, so there is no remote-tracking ref to
+    /// name and the remote's own HEAD is the best answer available.
+    #[test]
+    fn a_branch_the_remote_does_not_have_falls_back_to_the_remote_head() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "local-only"]);
+        run_git(f.repo(), &["fetch", "-q", "origin"]);
+
+        assert_eq!(
+            base_for(f.repo(), None, "local-only").as_deref(),
+            Some("origin/main"),
+            "a local-only branch has nothing to rebase onto"
+        );
+    }
+
+    /// The whole bug, end to end: the branch being shipped moves on the
+    /// remote, and the run must hand the conflict to the user.
+    ///
+    /// `origin/main` does not move here — only `origin/feature/x` does. So
+    /// a rebase onto `origin/HEAD` is a **no-op**: the local branch already
+    /// contains `origin/main`, nothing conflicts, and the run goes on to
+    /// push a branch the remote has moved past. The remote rejects it as
+    /// non-fast-forward, and the row reads `failed` — with the real
+    /// conflict sitting in the tree, never reported as one.
+    ///
+    /// With the base being the branch being shipped, the rebase lands on
+    /// `origin/feature/x`, conflicts for real, and the row reads
+    /// `needs you:` — which is the outcome FEATURES.md documents and the
+    /// one the whole conflict machinery exists to produce.
+    #[test]
+    fn a_moved_shipped_branch_is_handed_over_as_a_conflict() {
+        let f = Fixture::new();
+
+        // Both sides start on `feature/x`, off the shared root commit.
+        run_git(f.repo(), &["checkout", "-q", "-b", "feature/x"]);
+        run_git(f.repo(), &["push", "-q", "-u", "origin", "feature/x"]);
+
+        // The local side changes the file…
+        f.write_local("shared.txt", "local version\n");
+        run_git(f.repo(), &["add", "-A"]);
+        run_git(f.repo(), &["commit", "-q", "-m", "local side"]);
+
+        // …and the remote moves `feature/x` with a conflicting change.
+        // `origin/main` is untouched, which is the point: the branch that
+        // moved is the one being shipped.
+        run_git(f.other(), &["fetch", "-q", "origin"]);
+        run_git(
+            f.other(),
+            &["checkout", "-q", "-B", "feature/x", "origin/feature/x"],
+        );
+        std::fs::write(f.other().join("shared.txt"), "remote version\n").unwrap();
+        run_git(f.other(), &["add", "-A"]);
+        run_git(f.other(), &["commit", "-q", "-m", "remote side"]);
+        run_git(f.other(), &["push", "-q", "origin", "feature/x"]);
+
+        run_git(f.repo(), &["fetch", "-q", "origin"]);
+
+        let state = rebase_onto_remote_base(f.repo(), None, "feature/x", None, None);
+        match state {
+            Err(RebaseError::Conflicted { .. }) => {}
+            other => panic!(
+                "the shipped branch moved, so the rebase must conflict and be \
+                 handed over; got {other:?}"
+            ),
+        }
     }
 
     /// The rebase happens **before** the engine, so the tree comes back
@@ -1990,7 +2125,8 @@ mod rebase_tests {
         // normally invoked in.
         f.write_local("feature.txt", "work in progress\n");
 
-        let state = rebase_onto_remote_base(f.repo(), None, None, None).expect("the rebase runs");
+        let state =
+            rebase_onto_remote_base(f.repo(), None, "main", None, None).expect("the rebase runs");
         assert!(
             matches!(state, RebaseState::Rebased),
             "a dirty tree on a moved remote must rebase, got {state:?}"
@@ -2017,7 +2153,8 @@ mod rebase_tests {
         // Nothing local is dirty.
         assert!(f.local_porcelain().trim().is_empty());
 
-        let state = rebase_onto_remote_base(f.repo(), None, None, None).expect("the rebase runs");
+        let state =
+            rebase_onto_remote_base(f.repo(), None, "main", None, None).expect("the rebase runs");
         assert!(matches!(state, RebaseState::Rebased), "got {state:?}");
         assert!(f.local_contains("remote moved on"));
     }
@@ -2026,7 +2163,8 @@ mod rebase_tests {
     #[test]
     fn an_already_current_branch_is_up_to_date() {
         let f = Fixture::new();
-        let state = rebase_onto_remote_base(f.repo(), None, None, None).expect("the rebase runs");
+        let state =
+            rebase_onto_remote_base(f.repo(), None, "main", None, None).expect("the rebase runs");
         assert!(
             matches!(state, RebaseState::Rebased | RebaseState::NoRemote),
             "a fresh fixture must not fail, got {state:?}"
@@ -2044,7 +2182,7 @@ mod rebase_tests {
         std::fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "-q", "-b", "main"]);
         assert_eq!(
-            rebase_onto_remote_base(&repo, None, None, None).expect("must not fail"),
+            rebase_onto_remote_base(&repo, None, "main", None, None).expect("must not fail"),
             RebaseState::NoRemote,
             "a local-only repo has no base to rebase onto, and that is a fact"
         );
@@ -2064,8 +2202,8 @@ mod rebase_tests {
         f.force_remote_file("shared.txt", "remote version\n");
         f.write_local("shared.txt", "local version\n");
 
-        let err =
-            rebase_onto_remote_base(f.repo(), None, None, None).expect_err("must fail loudly");
+        let err = rebase_onto_remote_base(f.repo(), None, "main", None, None)
+            .expect_err("must fail loudly");
         let msg = err.to_string();
         assert!(
             msg.contains("rebase --abort") || msg.contains("rebase --continue"),
@@ -2724,13 +2862,17 @@ mod protected_tests {
         let outcome = run_one(&plan, &opts);
 
         match &outcome {
-            RepoOutcome::Failed {
-                error,
-                class: ro_core::FailureClass::MissingProvider,
-            } => {
+            RepoOutcome::Failed { error, class } => {
                 assert!(
                     error.contains("fetch failed"),
                     "the failure must name the fetch, got: {error}"
+                );
+                assert!(
+                    !matches!(class, ro_core::FailureClass::MissingProvider),
+                    "a fetch that failed is not a missing provider binary — the \
+                     engine was never dispatched. It used to report \
+                     `missing_provider`, which sent the reader to install a \
+                     binary that was never the problem, got: {class:?}"
                 );
             }
             other => panic!("a failed fetch must be a failure, got {other:?}"),
@@ -3061,7 +3203,7 @@ mod protected_tests {
         // The outcome is not the point. The fetch inside it always runs, and
         // its result is deliberately ignored, so a remote that cannot be
         // authenticated is not by itself a reason to skip the rebase.
-        let _ = rebase_onto_remote_base(f.repo(), None, Some(&host), Some(&token));
+        let _ = rebase_onto_remote_base(f.repo(), None, "main", Some(&host), Some(&token));
 
         let headers = remote.headers();
         assert!(
@@ -3140,13 +3282,16 @@ mod protected_tests {
         };
 
         match &outcome {
-            RepoOutcome::Failed {
-                error,
-                class: ro_core::FailureClass::MissingProvider,
-            } => {
+            RepoOutcome::Failed { error, class } => {
                 assert!(
                     error.contains("credential"),
                     "the failure must name the credential, got: {error}"
+                );
+                assert_eq!(
+                    *class,
+                    ro_core::FailureClass::AuthError,
+                    "a credential that cannot be resolved is an authentication \
+                     problem, not a missing provider binary"
                 );
             }
             other => panic!("an unresolvable credential must be a failure, got {other:?}"),
@@ -3459,7 +3604,7 @@ mod onto_tests {
         let f = Fixture::new();
         release_line_moves_on(&f);
 
-        let state = rebase_onto_remote_base(f.repo(), Some("release"), None, None)
+        let state = rebase_onto_remote_base(f.repo(), Some("release"), "main", None, None)
             .expect("the rebase onto a named branch runs");
         assert!(matches!(state, RebaseState::Rebased), "got {state:?}");
         // The commit that exists **only** on `release`. Asserting on one

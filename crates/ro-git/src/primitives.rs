@@ -287,6 +287,35 @@ pub fn branch_exists(repo: &Path, name: &str) -> bool {
     .unwrap_or(false)
 }
 
+/// Does the **local remote-tracking ref** for `name` exist?
+///
+/// `refs/remotes/origin/<name>`, which is a different question from
+/// [`branch_exists`] — that one asks about `refs/heads/<name>`, a branch
+/// that lives on this machine. The remote-tracking ref is what the branch
+/// looked like the last time this checkout fetched, and it is the thing a
+/// rebase can name as its base.
+///
+/// It is deliberately a **local** check, with no network round trip: the
+/// answer it gives is "what this checkout last saw", which is the same
+/// question the rebase base is about. Asking the remote instead (see
+/// `remote_branch_exists` in the orchestrator) answers a different question
+/// — what the remote has *now* — and a ref the remote has but the local
+/// checkout has not fetched is not something `git rebase` can name.
+pub fn remote_tracking_exists(repo: &Path, name: &str) -> bool {
+    run_in(
+        Some(repo),
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/origin/{name}"),
+        ],
+        &RunOpts::none(),
+    )
+    .map(|o| o.ok())
+    .unwrap_or(false)
+}
+
 /// Every local branch, without the `*` marker or the detached-HEAD row.
 pub fn list_branches(repo: &Path) -> Result<Vec<String>> {
     let out = run_in(
