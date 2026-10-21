@@ -372,10 +372,7 @@ mod tests {
         for (key, site, replaces) in READERS {
             assert!(
                 has_reader(
-                    key.split_once('.')
-                        .map(|(t, k)| (t, k))
-                        .unwrap_or(("", key))
-                        .0,
+                    key.split_once('.').unwrap_or(("", key)).0,
                     key.split_once('.').map(|(_, k)| k).unwrap_or(key),
                 ),
                 "READERS claims {key} is read at `{site}` (replacing {replaces}), but \

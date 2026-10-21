@@ -83,7 +83,6 @@ mod tests {
         assert!(err.contains("github.auth"));
     }
 
-    #[test]
     /// `[agent].engine` is the one key `ro config set` used to write without
     /// checking. Every sibling is refused at write time, so a typo here was
     /// accepted at exit 0 and then failed the **next fleet run**, once per
@@ -108,6 +107,13 @@ mod tests {
         validate(&cfg).expect("the shipped default validates");
     }
 
+    /// Zero is not a number of workers.
+    ///
+    /// It carried no `#[test]`, so it was a helper nothing called: the
+    /// assertion it makes — that a parallel count of zero is refused at
+    /// write time — was not running at all. The attribute is what it was
+    /// always meant to have.
+    #[test]
     fn zero_parallel_rejected() {
         let mut cfg = AppConfig::default();
         cfg.core.parallel = 0;

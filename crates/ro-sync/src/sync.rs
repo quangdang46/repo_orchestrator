@@ -3766,7 +3766,10 @@ mod dry_run_preview {
             !real_args.contains("dry_run"),
             "a real run must not be recorded as a dry one, got: {real_args}"
         );
-        let dry = sync_all(
+        // The rows it returns are not what this test is about — the run
+        // **row** it records is. So the result is dropped and the call is
+        // made for what it writes.
+        sync_all(
             &conn,
             &SyncOptions {
                 dry_run: true,

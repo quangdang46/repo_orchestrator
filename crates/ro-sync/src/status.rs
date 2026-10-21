@@ -534,7 +534,10 @@ pub fn status_all_with(conn: &Connection, fetch_first: bool) -> Result<Vec<RepoS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ro_testkit::{BareRemote, Worktree};
+    // `BareRemote` is not named here: the tests below reach it as
+    // `ro_testkit::BareRemote::ephemeral()`, and importing the name as
+    // well left an import nothing used.
+    use ro_testkit::Worktree;
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -1459,8 +1462,8 @@ mod tests {
         assert_eq!(status.ahead, Some(0), "there is nothing to be ahead of");
         assert_eq!(status.behind, Some(0), "there is nothing to be behind");
         assert_eq!(status.unmeasurable_reason, None, "this is not a failure");
-        assert_eq!(
-            status.has_upstream, false,
+        assert!(
+            !status.has_upstream,
             "the row must be able to say the repo has no origin"
         );
         assert_eq!(
@@ -1533,8 +1536,8 @@ mod tests {
         .unwrap();
 
         let status = status_repo(&conn, &repo.id).unwrap();
-        assert_eq!(
-            status.has_upstream, true,
+        assert!(
+            status.has_upstream,
             "a repo with an origin must not be told apart from one without"
         );
         assert_eq!(status.measured_against.as_deref(), Some("origin/main"));
@@ -1561,7 +1564,7 @@ mod tests {
 
         let status = status_repo(&conn, &repo.id).unwrap();
         assert_eq!(status.branch, None, "a detached HEAD has no branch");
-        assert_eq!(status.has_upstream, false);
+        assert!(!status.has_upstream);
         assert_eq!(status.ahead, Some(0));
         assert_eq!(status.behind, Some(0));
     }
