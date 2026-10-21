@@ -9,7 +9,8 @@ pub mod schema;
 pub mod validate;
 
 pub use loader::{
-    KeyVerdict, classify_key, load_config, load_default, set_key_in_file, write_default,
+    KeyVerdict, UnwritableSetting, classify_key, load_config, load_default, set_key_in_file,
+    write_default,
 };
 pub use paths::{ConfigPaths, default_config_toml, expand_tilde};
 pub use schema::AppConfig;

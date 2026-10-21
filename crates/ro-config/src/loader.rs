@@ -354,6 +354,33 @@ fn unknown_table_warning(table: &str, dotted_key: &str) -> String {
 /// No `.bak` is written. A backup per assignment is noise that does not fix the
 /// loss — the loss is now structural, so there is nothing to recover. A backup
 /// belongs on the one genuinely destructive operation, the migrations.
+/// A setting ro will not write, because the **caller** named something ro
+/// does not read.
+///
+/// The distinction is the exit code. `ro config set` that names a key ro
+/// does not read, or a value that is not a TOML value, is a mistyped command
+/// line — `exit.rs` calls that 64, "you named something that matched
+/// nothing". A config file that will not parse, or a disk that will not
+/// read, is a broken installation, and that is 70.
+///
+/// Both used to reach the top-level handler as a bare `anyhow` error, which
+/// finds no `FatalError` to downcast to and reports 70 — so a typo read as
+/// a broken install. The same mistake was already found and fixed on three
+/// other verbs; this is the fourth.
+///
+/// The message is the whole payload: the caller wraps it with the key that
+/// was asked for, and the reader wants the sentence, not a type name.
+#[derive(Debug, Clone)]
+pub struct UnwritableSetting(pub String);
+
+impl std::fmt::Display for UnwritableSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UnwritableSetting {}
+
 pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result<()> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading config from {}", path.display()))?;
@@ -363,7 +390,9 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
 
     let segments: Vec<&str> = dotted_key.split('.').collect();
     if segments.iter().any(|s| s.is_empty()) {
-        anyhow::bail!("config key {dotted_key:?} has an empty path segment");
+        anyhow::bail!(UnwritableSetting(format!(
+            "config key {dotted_key:?} has an empty path segment"
+        )));
     }
 
     // The key is checked before the document is touched, so a rejected write
@@ -386,11 +415,11 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
             // warns about on the next run, so the file would contradict
             // itself within one command. This is also the shape FEATURES.md
             // walks a user into with `checkpoint.secret_scan`.
-            anyhow::bail!(
+            anyhow::bail!(UnwritableSetting(format!(
                 "[{table}] is no longer read — {migrate_to}. \
                  `ro config set {dotted_key}` would write a setting that has no effect, \
                  so it is refused; edit the file by hand if you need it for a different version."
-            );
+            )));
         }
         KeyVerdict::UnknownKey {
             dotted,
@@ -402,11 +431,11 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
             if let Some(s) = suggestion {
                 msg.push_str(&format!(" Did you mean {s}?"));
             }
-            anyhow::bail!(
+            anyhow::bail!(UnwritableSetting(format!(
                 "{msg} Nothing was written. A key that no longer exists and one that \
                  was never read look identical from the outside, so this is an error \
                  rather than a silent no-op."
-            );
+            )));
         }
     }
 
@@ -414,7 +443,9 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
     // one segment — but this is the path a user-supplied key walks, and an
     // error costs nothing where a panic would be a stack trace.
     let Some((leaf, parents)) = segments.split_last() else {
-        anyhow::bail!("config key {dotted_key:?} has no path segment");
+        anyhow::bail!(UnwritableSetting(format!(
+            "config key {dotted_key:?} has no path segment"
+        )));
     };
 
     // Walk or create each parent table. A key like `core.layout` on a file that
@@ -424,16 +455,20 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
         let entry = table
             .entry(segment)
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()));
-        table = entry
-            .as_table_mut()
-            .ok_or_else(|| anyhow::anyhow!("{dotted_key:?} is not a table path"))?;
+        table = entry.as_table_mut().ok_or_else(|| {
+            anyhow::anyhow!(UnwritableSetting(format!(
+                "{dotted_key:?} is not a table path"
+            )))
+        })?;
     }
 
     // Parse the value as TOML so `4` becomes an integer and `true` a boolean,
     // rather than every assignment landing as a string the schema then rejects.
-    let value: toml_edit::Value = raw_value
-        .parse()
-        .map_err(|e| anyhow::anyhow!("{raw_value:?} is not a valid TOML value: {e}"))?;
+    let value: toml_edit::Value = raw_value.parse().map_err(|e| {
+        anyhow::anyhow!(UnwritableSetting(format!(
+            "{raw_value:?} is not a valid TOML value: {e}"
+        )))
+    })?;
     table.insert(leaf, toml_edit::value(value));
 
     let updated = doc.to_string();

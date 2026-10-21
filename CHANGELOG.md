@@ -12,7 +12,7 @@ a real defect — all at once.
 
 ## [0.4.2] — 2026-10-21
 
-Seven defects, found by installing the released binary and running it against
+Eight defects, found by installing the released binary and running it against
 real repositories — real clones, real remotes, real branches that had moved.
 One of them made the tool's own safety machinery unreachable, and the rest
 made it say the wrong thing.
@@ -57,6 +57,14 @@ made it say the wrong thing.
   directories produced two identities and two rows — and `ro ship` pushed the
   same branch twice. The remote is the repository's identity, and the row
   already records it, so it is compared too.
+- **`ro config set` reported a mistyped command line as a broken install.**
+  `exit.rs` draws the line at 64 for "you named something that matched
+  nothing" and 70 for fatal. A typo'd key, a value that is not TOML, a
+  setting ro no longer reads and a repo that does not exist are all the
+  first kind — but they reached the top-level handler as bare `anyhow`
+  errors, found no `FatalError` to downcast to, and came out as 70. The
+  argument-shape error already answered correctly; the **content** errors
+  did not. `ro-config` now says which of its failures are the caller's.
 - **Two `ro-engine` tests had a deadline too tight for a loaded machine.**
   Both reported `TimedOut` for a child that was about to exit 0, because
   300 ms is not always enough for a shell to start and exit on a CI box

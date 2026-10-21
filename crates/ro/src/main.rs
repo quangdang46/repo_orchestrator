@@ -2136,20 +2136,43 @@ fn run() -> Result<()> {
                     // a backup, and does not litter a working tree.
                     if let Some(rest) = key.strip_prefix("repos.") {
                         let (repo, config_key) = rest.split_once('.').ok_or_else(|| {
-                            anyhow::anyhow!("expected repos.<name>.<key>, got: {key}")
+                            exit::FatalError::usage(format!(
+                                "expected repos.<name>.<key>, got: {key}"
+                            ))
                         })?;
                         if repo.is_empty() || config_key.is_empty() {
-                            anyhow::bail!("expected repos.<name>.<key>, got: {key}");
+                            return Err(exit::FatalError::usage(format!(
+                                "expected repos.<name>.<key>, got: {key}"
+                            ))
+                            .into());
                         }
                         let conn = ro_state::open_db(&db_path).map_err(|e| {
                             exit::FatalError::new(format!("opening state database: {e}"))
                         })?;
-                        manage::set_repo_config(&conn, repo, config_key, value)
-                            .with_context(|| format!("setting {key}"))?;
+                        // A repo that matched nothing, or a key ro does not
+                        // read, is a mistyped command line — 64, "you named
+                        // something that matched nothing" — and not a broken
+                        // install, which is what 70 means. Every other verb
+                        // that names a repo already answers that way; this
+                        // one did not, because the error reached the
+                        // top-level handler as a bare `anyhow` error and
+                        // found no `FatalError` to downcast to.
+                        manage::set_repo_config(&conn, repo, config_key, value).map_err(|e| {
+                            exit::FatalError::usage(format!("setting {key}: {e:#}"))
+                        })?;
                         eprintln!("Set {key} = {value} in the registry");
                     } else {
-                        ro_config::set_key_in_file(&cfg_path, key, value)
-                            .with_context(|| format!("setting {key}"))?;
+                        // The same split, and the same reason: `ro-config`
+                        // says which of its failures are the caller's.
+                        ro_config::set_key_in_file(&cfg_path, key, value).map_err(|e| {
+                            match e.downcast_ref::<ro_config::UnwritableSetting>() {
+                                Some(u) => exit::FatalError::usage(format!("setting {key}: {u}")),
+                                // A config file that will not parse, or a
+                                // disk that will not read it, is a broken
+                                // installation. That is what 70 is for.
+                                None => exit::FatalError::new(format!("setting {key}: {e:#}")),
+                            }
+                        })?;
                         eprintln!("Set {key} = {value}");
                     }
                 }

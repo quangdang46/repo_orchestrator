@@ -198,6 +198,71 @@ fn a_malformed_config_set_argument_exits_usage() {
     );
 }
 
+/// `ro config set` that names something ro does not read is a **usage**
+/// error, not a broken installation.
+///
+/// `exit.rs` draws the line at 64 for "you named something that matched
+/// nothing" and 70 for fatal. A typo'd key, a value that is not TOML, a
+/// setting ro no longer reads and a repo that does not exist are all the
+/// first kind — a mistyped command line, which the same comment says must
+/// not read as a broken install.
+///
+/// The argument-shape error already answered that way; the **content**
+/// errors did not, because they reached the top-level handler as bare
+/// `anyhow` errors and found no `FatalError` to downcast to. That is the
+/// mistake the test file's own header describes, already found and fixed on
+/// three other verbs.
+#[test]
+fn a_config_set_that_names_nothing_is_a_usage_error() {
+    let t = Test::initialised();
+    for args in [
+        // A bare word is not a TOML value.
+        vec!["config", "set", "agent.engine=codex"],
+        // A key ro does not read.
+        vec!["config", "set", "core.paralel=4"],
+        // A setting ro no longer reads.
+        vec!["config", "set", "checkpoint.secret_scan=\"warn\""],
+        // A repo that does not exist.
+        vec!["config", "set", "repos.nosuch.engine=\"git\""],
+        // A malformed per-repo key.
+        vec!["config", "set", "repos..engine=\"git\""],
+    ] {
+        let out = t.cmd().args(&args).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(64),
+            "a mistyped command line must not read as a broken install: ro {args:?}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// And a config file that will not parse **is** a broken installation, so
+/// it keeps the fatal code.
+///
+/// The negative control for the test above: a rule that made every
+/// `ro config set` failure a usage error would pass it too.
+#[test]
+fn a_broken_config_file_is_still_fatal() {
+    let t = Test::initialised();
+    std::fs::write(
+        t.config_dir.path().join("config.toml"),
+        "this is not [ valid toml\n",
+    )
+    .unwrap();
+    let out = t
+        .cmd()
+        .args(["config", "set", "core.parallel=4"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(70),
+        "a config file that will not parse is a broken install: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ── `--format json` is a document ───────────────────────────────────────
 //
 // The bug was quadratic: the `Json` arm sat inside `for r in &results` and
