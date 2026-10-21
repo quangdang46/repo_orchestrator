@@ -1614,9 +1614,9 @@ fn run() -> Result<()> {
             if repos.is_empty() && !selector_given {
                 eprintln!("No tracked repos. Use 'ro add <spec>' to add one.");
             } else {
-                for repo in &repos {
-                    match format {
-                        OutputFormat::Text => {
+                match format {
+                    OutputFormat::Text => {
+                        for repo in &repos {
                             // The path is the thing you paste into `cd`, and
                             // `ro list` is where you go to find out where a
                             // repo is. Behind a flag it is one more thing to
@@ -1628,21 +1628,33 @@ fn run() -> Result<()> {
                                 println!("{}", repo);
                             }
                         }
-                        // `json` is a document and `ndjson` is a stream.
-                        // They shared one `println!`, so the flag named
-                        // `json` produced ndjson and a consumer doing
-                        // `json.load(stdout)` on it raised "Extra data:
-                        // line 2 column 1".
-                        OutputFormat::Json => {
-                            let rows: Vec<String> = repos
-                                .iter()
-                                .map(serde_json::to_string)
-                                .collect::<Result<Vec<_>, _>>()?;
-                            println!("[{}]", rows.join(","));
-                        }
-                        // One object per line, so a consumer can read the
-                        // first repo without waiting for the last.
-                        OutputFormat::Ndjson => {
+                    }
+                    // `json` is a **document**, and it is printed **once**.
+                    //
+                    // It used to sit inside the per-repo loop and re-print
+                    // the ENTIRE list once per repo: five repos printed the
+                    // same five-element array five times, and a consumer
+                    // doing `json.load(stdout)` on it raised "Extra data:
+                    // line 2 column 1" — the very error the comment on this
+                    // arm was written to record as fixed.
+                    //
+                    // The comment was right about the cause and the fix was
+                    // put in the wrong place: the *whole array* was
+                    // serialised instead of the one repo, and the `println!`
+                    // stayed inside the loop. `ro sync` had the same bug and
+                    // had it fixed properly — its document is printed after
+                    // the loop — and the fix was never carried back here.
+                    OutputFormat::Json => {
+                        let rows: Vec<String> = repos
+                            .iter()
+                            .map(serde_json::to_string)
+                            .collect::<Result<Vec<_>, _>>()?;
+                        println!("[{}]", rows.join(","));
+                    }
+                    // One object per line, so a consumer can read the
+                    // first repo without waiting for the last.
+                    OutputFormat::Ndjson => {
+                        for repo in &repos {
                             println!("{}", serde_json::to_string(&repo)?);
                         }
                     }
@@ -2018,22 +2030,22 @@ fn run() -> Result<()> {
                             ),
                         }
                     }
-                    // A **document**, not a stream. `--format json` and
-                    // `--format ndjson` were the same `println!`, so a
-                    // consumer doing `json.load(stdout)` on the flag named
-                    // `json` — the obvious thing to do — raised
-                    // "Extra data: line 2 column 1". The help text gives
-                    // ndjson its own description ("One JSON object per
-                    // line, for a consumer that reads a stream"), which was
-                    // the behaviour `json` also had: a flag that changed
-                    // nothing, under two names.
-                    OutputFormat::Json => {
-                        let rows: Vec<String> = statuses
-                            .iter()
-                            .map(serde_json::to_string)
-                            .collect::<Result<Vec<_>, _>>()?;
-                        println!("[{}]", rows.join(","));
-                    }
+                    // A **document**, not a stream — and it is printed
+                    // once, after the loop, below. Nothing in this match
+                    // handles it.
+                    //
+                    // The arm used to build the whole array and print it
+                    // *inside* the per-repo loop, so N repos printed N
+                    // copies of the entire fleet and a consumer doing
+                    // `json.load(stdout)` on the flag named `json` — the
+                    // obvious thing to do — raised "Extra data: line 2
+                    // column 1". The comment this replaced recorded that
+                    // error as fixed; the fix had been put in the wrong
+                    // place, and the whole array was serialised instead of
+                    // the one repo. `ro sync` had the same bug and had it
+                    // fixed properly, by printing the document after the
+                    // loop; the fix was never carried across.
+                    OutputFormat::Json => {}
                     // One object per line, no wrapping array. The point
                     // is that a consumer can start reading before the
                     // last repo has been walked, which a JSON array of
@@ -2042,6 +2054,16 @@ fn run() -> Result<()> {
                         println!("{}", serde_json::to_string(s)?);
                     }
                 }
+            }
+
+            // `json` is a **document**, so it is printed once, after the
+            // loop. See the arm above for what it used to do here.
+            if let OutputFormat::Json = format {
+                let rows: Vec<String> = statuses
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<Vec<_>, _>>()?;
+                println!("[{}]", rows.join(","));
             }
         }
 

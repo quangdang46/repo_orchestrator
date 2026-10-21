@@ -230,6 +230,97 @@ fn sync_json_is_one_parseable_document_over_a_fleet() {
     assert_eq!(rows.len(), 3, "one row per repo: {text}");
 }
 
+/// The same for `ro list`: `json` is a document, printed once.
+///
+/// The `Json` arm sat inside the per-repo loop and re-printed the whole
+/// list once per repo. Five repos printed the same five-element array five
+/// times, so `json.load(stdout)` raised "Extra data: line 2 column 1" — and
+/// the output grew quadratically with the fleet.
+///
+/// The comment on that arm named the error as one that had been fixed. The
+/// fix had been put in the wrong place: the *whole array* was serialised
+/// instead of the one repo, and the `println!` stayed inside the loop.
+/// `ro sync` had the same bug and had it fixed properly; the fix was never
+/// carried across.
+#[test]
+fn list_json_is_one_parseable_document_over_a_fleet() {
+    let t = Test::initialised();
+    for _ in 0..3 {
+        enrolled(&t);
+    }
+
+    let out = t.cmd().args(["list", "--format", "json"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!(
+            "`ro list --format json` must emit ONE JSON document, but \
+             json.load() failed: {e}\n\
+             stdout was {} bytes with {} top-level arrays — the Json arm is \
+             inside the per-repo loop, so N repos print N copies of the list.",
+            text.len(),
+            text.lines()
+                .filter(|l| l.trim_start().starts_with('['))
+                .count(),
+        )
+    });
+    let rows = value.as_array().expect("a list of repos is an array");
+    assert_eq!(rows.len(), 3, "one row per repo: {text}");
+}
+
+/// And `ro status`, which had the identical bug in the identical shape.
+#[test]
+fn status_json_is_one_parseable_document_over_a_fleet() {
+    let t = Test::initialised();
+    for _ in 0..3 {
+        enrolled(&t);
+    }
+
+    let out = t
+        .cmd()
+        .args(["status", "--format", "json"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| {
+        panic!(
+            "`ro status --format json` must emit ONE JSON document, but \
+             json.load() failed: {e}\n\
+             stdout was {} bytes with {} top-level arrays — the Json arm is \
+             inside the per-repo loop, so N repos print N copies of the list.",
+            text.len(),
+            text.lines()
+                .filter(|l| l.trim_start().starts_with('['))
+                .count(),
+        )
+    });
+    let rows = value.as_array().expect("a list of statuses is an array");
+    assert_eq!(rows.len(), 3, "one row per repo: {text}");
+}
+
+/// The negative control for the two tests above: `ndjson` is a stream, so
+/// it is one object per line and the two arms cannot be the same code.
+#[test]
+fn list_ndjson_is_one_object_per_line() {
+    let t = Test::initialised();
+    for _ in 0..3 {
+        enrolled(&t);
+    }
+    let out = t
+        .cmd()
+        .args(["list", "--format", "ndjson"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 3, "one line per repo: {text}");
+    for line in &lines {
+        serde_json::from_str::<serde_json::Value>(line)
+            .unwrap_or_else(|e| panic!("ndjson line is not a JSON object: {e}\n{line}"));
+    }
+}
+
 /// `ndjson` is a stream and is the negative control: one object per line,
 /// which is why the two arms cannot be the same code.
 #[test]
