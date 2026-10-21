@@ -2360,9 +2360,27 @@ mod tests {
     #[test]
     fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang() {
         let dir = tempfile::TempDir::new().expect("the fixture dir is creatable");
-        // The descendant holds the pipes for 300 s. The deadline is 300 ms,
-        // so a run that honours it returns in well under a second and a run
-        // that waits on the pipes is still waiting when the hard stop fires.
+        // The descendant holds the pipes for 300 s. The deadline is 2 s, so
+        // a run that honours it returns in seconds and a run that waits on
+        // the pipes is still waiting when the hard stop fires.
+        //
+        // The deadline's only job here is to be **long enough that the
+        // direct child can get as far as exiting**. It was 300 ms, on the
+        // reasoning that "the child is `sh`, which is running by the time
+        // `execve` returns, so 300 ms is an eternity" — and that is true
+        // of an idle machine and false of a loaded one. `sh` still has to
+        // fork `sleep` and exit, and on a CI box running the whole suite
+        // in parallel that can take longer than 300 ms. When it did, the
+        // deadline fired before the child was ever observed exiting, the
+        // tree was killed, and the run reported `TimedOut` for a child that
+        // was about to exit 0 — a flake, and one that reads as a product
+        // bug when it is the test's own deadline being too tight.
+        //
+        // Two seconds is the same budget the sibling integration test
+        // gives on Windows, for the same reason: there the child is
+        // `cmd.exe` launching `ping`, which is two process creations, and
+        // "a run that fires the deadline is not 'slow', it is 'the child
+        // never finished starting'".
         //
         // The script is written under the **name the engine looks for**,
         // for the same reason the integration fixture does: `FakeBinary::at`
@@ -2386,11 +2404,7 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run_with_deadline(
-                &mut cmd,
-                Duration::from_millis(300),
-                None,
-            ));
+            let _ = tx.send(run_with_deadline(&mut cmd, Duration::from_secs(2), None));
         });
 
         let out = rx

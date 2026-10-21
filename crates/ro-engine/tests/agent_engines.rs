@@ -841,11 +841,23 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
     // Pinning the deadline itself is `a_short_context_timeout_really_does_fire`'s
     // job, and it does it with a child that really does hang, so nothing is
     // lost by not measuring it here.
-    let deadline = if cfg!(windows) {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_millis(300)
-    };
+    //
+    // Unix used to get 300 ms here, on the reasoning that "the child is
+    // `sh`, which is running by the time `execve` returns, so 300 ms is an
+    // eternity". That is true of an idle machine and false of a loaded one:
+    // `sh` still has to fork `sleep` and exit, and on a CI box running the
+    // whole suite in parallel that can take longer than 300 ms. When it
+    // did, the deadline fired before the child was observed exiting and the
+    // run came back `TimedOut { after: 300ms }` — the deadline working
+    // exactly as designed, against a child that had not started yet.
+    //
+    // So Unix gets the same two seconds Windows does. The deadline's job
+    // here is only to be long enough that the direct child can get as far
+    // as exiting; pinning the deadline itself is
+    // `a_short_context_timeout_really_does_fire`'s job, and it does it
+    // with a child that really does hang, so nothing is lost by not
+    // measuring it here.
+    let deadline = Duration::from_secs(2);
 
     let dir = tempfile::TempDir::new().expect("the shim dir is creatable");
     let shim = pipe_holding_agent(dir.path(), "claude", hold_secs);
@@ -855,7 +867,12 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
     // stop is `'static`, so it owns whatever it runs, and a closure that
     // borrowed the worktree or the shim from the test thread could not be
     // moved onto it.
-    let outcome = with_a_hard_stop(Duration::from_secs(15), move || {
+    //
+    // The hard stop is the backstop for a hang, so it has to sit above the
+    // ceiling above — otherwise a slow-but-correct run on a loaded machine
+    // is killed by the very mechanism meant to catch a wedged one, and the
+    // test reports "the run did not return" for a run that was merely slow.
+    let outcome = with_a_hard_stop(Duration::from_secs(60), move || {
         let w = Worktree::with_one_commit();
         w.write("a.txt", "x\n");
         let engine = engine_for(&shim, ro_engine::EngineKind::Claude);
@@ -889,7 +906,18 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
     // Both bounds are far from the sub-second figure a run that neither waited
     // nor hung lands on, so a fixture that has stopped reproducing the bug
     // fails here rather than sailing through.
-    let floor = Duration::from_millis(100);
+    //
+    // The floor separates the two cases the ceiling cannot: a run where the
+    // descendant really held the pipes waits out the whole deadline and
+    // comes back at ~2 s, and a run where the descendant never started gets
+    // an EOF the instant the child exits and comes back in milliseconds.
+    //
+    // It was 100 ms against a 300 ms deadline, so it sat a third of the way
+    // up the interval the deadline defines. With a two-second deadline the
+    // same shape wants the floor a second in — still an order of magnitude
+    // above the milliseconds a run that never waited produces, and still
+    // well under the deadline it is measuring.
+    let floor = Duration::from_secs(1);
     assert!(
         elapsed >= floor,
         "the run finished in {elapsed:?}, which is what a run looks like when \
@@ -903,8 +931,15 @@ fn a_child_that_exits_while_a_descendant_holds_the_pipes_does_not_hang_the_run()
     // from a reaped PID kills nothing, so the join used to sit on those pipes
     // for the descendant's full lifetime and the test binary took the 15s hard
     // stop with it.
+    //
+    // The ceiling is 30 s, against a descendant that holds the pipes for
+    // {hold_secs} s. It was 10 s, and the run legitimately takes the
+    // deadline plus the time to kill the tree and join the readers — which
+    // on a loaded machine is not instant. A run that *waited* on the pipes
+    // would take the descendant's whole 300 s, so the gap between the two
+    // is what does the work; 30 s keeps that gap a factor of ten.
     assert!(
-        elapsed < Duration::from_secs(10),
+        elapsed < Duration::from_secs(30),
         "the run took {elapsed:?}; a run that waited on a pipe whose holder the \
          kill never reached would take the descendant's whole {hold_secs}s \
          lifetime, not a fraction of it"
