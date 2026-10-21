@@ -36,7 +36,7 @@ ro schema
 # Status of all tracked repos
 ro status --format json
 
-# What is tracked, one JSON object per line
+# What is tracked, one JSON array
 ro list --format json
 
 # A whole fleet: fetch, rebase, commit, push. One line per repo, then counts.

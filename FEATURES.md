@@ -98,6 +98,19 @@ clone URL and the local path it will live at. `--name` sets the alias,
 `--engine` pins a per-repo engine, `--author` names an `[identity.*]`
 profile, `--tag` tags at enrolment.
 
+**A repository is enrolled once.** Adding one that is already tracked is
+refused, and it is refused *before* the clone — so a refused duplicate
+leaves no directory behind, and a full network clone of a repo that was
+never going to be registered is not spent on it.
+
+For a checkout adopted by path, "already tracked" is decided by the
+**remote**, not by the directory: the same repository checked out in two
+places is one repository, and the second enrolment is refused. The row's
+own identity is `(host, owner, name)`, and for an adopted checkout the
+owner and the name come from the directory layout — `~/projects/<owner>/
+<name>` — so the directory alone cannot tell two copies of one remote
+apart. A fork is a different remote and stays a different repository.
+
 ### `ro remove <KEY>`
 Stop tracking a repo. Cascades through dependent rows so the foreign keys stay
 consistent. `--delete` also removes the working copy on disk; that is gated
@@ -109,8 +122,9 @@ before the removal, and an interactive run asks.
 ### `ro list [--owner <OWNER>] [--tag <T>] [--paths]`
 Print the inventory. `--paths` adds each repo's local path, which is the
 thing you paste into `cd`. Use `--format json` to read it from a script or an
-agent. Output is one JSON object per line under both `json` and `ndjson`,
-which makes it streamable and append-friendly.
+agent. `--format json` is **one JSON array**, and `--format ndjson` is one
+JSON object per line — the same objects, framed two ways. Reach for
+`ndjson` when you want to read the first repo without waiting for the last.
 
 ### `ro tag <REPO> <TAG>…` · `ro untag <REPO> <TAG>…` · `ro tags [<REPO>]`
 
@@ -165,18 +179,22 @@ Per-repo state: current branch, whether the worktree is dirty, and how far
 ahead or behind the remote it is. Omit the repos to get every tracked repo.
 
 **`ahead` and `behind` are measured against the local remote-tracking ref, not
-the remote.** `ro status` does not fetch — `measured_after_fetch` is `false`
-in the JSON — so the number answers "how far is HEAD from `origin/<branch>`
-*as this checkout last saw it*". In the documented loop, `ro status` runs
-*before* `ro sync`, so that ref is whatever yesterday's fetch left behind, and
-`behind=0` there means nobody has looked since. The row names its base rather
-than hiding the staleness inside a zero:
+the remote.** `ro status` does not fetch by default — `measured_after_fetch`
+is `false` in the JSON — so the number answers "how far is HEAD from
+`origin/<branch>` *as this checkout last saw it*". In the documented loop,
+`ro status` runs *before* `ro sync`, so that ref is whatever yesterday's fetch
+left behind, and `behind=0` there means nobody has looked since. The row names
+its base rather than hiding the staleness inside a zero:
+
+> **`ro status --fetch` fetches first**, and then `measured_after_fetch` is
+> `true`. That is the flag to reach for when the number has to be current
+> rather than last week's; without it the default is unchanged.
 
 | JSON field | What it tells you |
 |---|---|
 | `measured_against` | The ref the counts were taken against, e.g. `origin/main`. |
 | `measured_against_updated_at` | When that ref last moved, Unix seconds. `null` when there is no reflog to read. |
-| `measured_after_fetch` | Whether *this* call fetched first. Always `false` today. |
+| `measured_after_fetch` | Whether *this* call fetched first. `false` unless `--fetch` was passed. |
 | `unmeasurable_reason` | Why the counts are `null` — e.g. the branch has no upstream ref. |
 
 To refresh the base, run `ro sync`, or fetch in the working copy, then read
@@ -235,7 +253,12 @@ build, because nothing runs the build.
 ### There is no `ro conflict` verb
 A conflict is a **stage inside `ro ship` and `ro push`**, not a namespace.
 `ro commit` does not touch the remote and so does not rebase. Both verbs
-rebase onto the remote's base before the engine runs, and when that rebase
+rebase onto the remote's base before the engine runs — and the base is the
+branch the push will land on, which is the checkout's own branch unless
+`--onto` names another. That is not a detail: a rebase onto some other
+branch (`origin/HEAD`, say) is a no-op whenever the branch being shipped is
+the one that moved on the remote, and the push that follows is rejected
+non-fast-forward instead of the conflict being handed over. When that rebase
 conflicts the run stops there: the row reads `needs you: …`, the files are
 named, and nothing was committed or pushed. It does not resolve the conflict
 for you, because the file a conflict lands in is a decision only you can
@@ -376,14 +399,24 @@ There is no `toon` renderer, and no other fourth format: `--format toon` is
 rejected by clap before ro sees it.
 
 `json` and `ndjson` carry the same objects; the only difference is the
-framing. `ro list` emits one object per line under **both** — it streams
-rather than emitting a single array, so a consumer can read the first repo
-without waiting for the last. The fleet verbs and `ro status` differ:
-`ro ship --format json` prints `{"repos": [...], "summary": {...}}`, while
-`--format ndjson` prints one row per line and a final line carrying
-`"summary": true` — the same counts, framed so twenty repos do not have to
-be held in memory at once. `ro doctor` emits one object under both, since a
-report is a single document.
+framing.
+
+- `ro list`, `ro sync` and `ro status` print **one JSON array** under
+  `json`, and **one object per line** under `ndjson`. Reach for `ndjson`
+  when you want to read the first repo without waiting for the last.
+- `ro ship`, `ro push` and `ro commit` print
+  `{"repos": [...], "summary": {...}}` under `json`, and one row per line
+  plus a final line carrying `"summary": true` under `ndjson` — the same
+  counts, framed so twenty repos do not have to be held in memory at once.
+- `ro doctor` emits one object under both, since a report is a single
+  document.
+
+> `json` is a **document**, and a document is emitted **once**. The `json`
+> arm used to sit inside the per-repo loop on `ro list`, `ro sync` and
+> `ro status`, so N repos printed N concatenated copies of the whole array
+> and `json.load(stdout)` raised "Extra data: line 2 column 1". `ro sync`
+> was fixed first; `ro list` and `ro status` carried the same bug and were
+> fixed with it.
 
 ---
 
