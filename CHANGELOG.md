@@ -10,6 +10,43 @@ a real defect — all at once.
 
 ---
 
+## [0.4.3] — 2026-11-10
+
+A hardening patch on top of 0.4.2. Two classes of defect: places where the
+tool silently did the wrong thing because a check ran against the wrong
+identity, and dead or unreachable machinery that made failures look like
+successes.
+
+### Fixed
+
+- **`ro ship --onto` was a no-op that also bypassed branch protection.** The
+  flag named the branch the commit should land on, but the checkout never
+  moved — the commit stayed on the original branch, the push went to the
+  remote's default, and the protected-branch check ran against the wrong
+  name. The checkout is now moved to the named branch before the push.
+- **The repo lock was per-process, not per-repo.** Two `ro` invocations
+  against the same clone could interleave sync/ship mutations because the
+  lock lived in memory; the lock file is now taken across processes.
+- **`ro ship` asked the remote about branches with the wrong credential.**
+  The "does this branch already exist on the remote" probe used ambient
+  credentials instead of the credential stored on the repo row, so a private
+  repo could report its branch missing (or present) incorrectly.
+- **The secret sweep skipped UTF-16/UTF-32 files.** A token written as
+  UTF-16 — what PowerShell's `Out-File` and `>` redirection produce by
+  default on Windows — was invisible to the sweep. Those encodings are now
+  decoded before scanning.
+- **Config errors were swallowed and misreported.** A run of fixes across
+  `ship`/`git`/`github`: config parse failures that were logged-and-ignored
+  now surface, bare config strings are typed, and a mistyped command line no
+  longer reads as a broken install.
+- **Cleanup pass.** Dead APIs and unused dependencies removed, corrupt-DB
+  initialization handled, untag/exit-code/EPIPE edge cases fixed, and
+  `clone_url` reconciled against the remote.
+- **The dead `sync` prune module is gone.** It was unreachable code with
+  destructive intent; it has been deleted rather than left as a footgun.
+
+---
+
 ## [0.4.2] — 2026-10-21
 
 Eight defects, found by installing the released binary and running it against
