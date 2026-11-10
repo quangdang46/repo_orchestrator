@@ -44,7 +44,7 @@ its own; see "Working copies" below.
 | `--message <MSG>` | One commit per repo, with this subject. |
 | `--prompt <TEXT>` | The instruction handed to the agent, replacing the built-in one. |
 | `--amend` | *(commit only)* Fold the work into HEAD rather than adding a commit. |
-| `--onto <BRANCH>` | Land the work on a branch other than the current one. |
+| `--onto <BRANCH>` | Land the work on a branch other than the current one: the checkout moves to it (created at HEAD if it does not exist locally), the commit is made there, and the push lands there. It is also the way off a protected branch — the destination itself must not be protected. |
 | `--resolve` | Let the engine resolve a merge conflict, then continue the rebase. |
 | `--engine <NAME>` | `claude`, `codex` or `git`, for this run only. |
 | `--engine-bin <PATH>` | A binary under another name — a nightly, or one outside `PATH`. |

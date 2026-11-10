@@ -211,16 +211,19 @@ fn guards(plan: &RepoPlan, repo: &std::path::Path, opts: &RunOptions) -> Option<
     // Lives here with the other guards rather than at the amend site, so the
     // dry run and the real run reach the same conclusion — the property this
     // function exists for.
-    if opts.amend && head_is_on_remote(repo, &plan.base_branch) {
+    // The branch HEAD will be on when the amend runs: `--onto` moves the
+    // checkout before the engine, so the published-history question is
+    // about the *destination* branch, not the one the run started on.
+    let amend_branch = onto.unwrap_or(plan.base_branch.as_str());
+    if opts.amend && head_is_on_remote(repo, amend_branch) {
         return Some(RepoOutcome::Refused {
-            branch: plan.base_branch.clone(),
+            branch: amend_branch.to_string(),
             reason: format!(
-                "{} is already on the remote. Amending it rewrites history \
+                "{amend_branch} is already on the remote. Amending it rewrites history \
                  someone else may have seen, under a message that no longer \
                  describes it. Push the new work as a new commit instead, \
                  or use --force-with-lease if you are certain nobody else \
-                 has fetched it.",
-                plan.base_branch
+                 has fetched it."
             ),
         });
     }
@@ -641,6 +644,58 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         }
     }
 
+    // (c1b) `--onto` moves the checkout onto the branch the work lands on,
+    // **before** the rebase and the engine.
+    //
+    // The flag used to be read in exactly one place — the push refspec —
+    // so `ro commit --onto feat/x` committed onto the *current* branch
+    // and the flag did nothing at all, while the protected-branch guard
+    // read the flag as "the work is going somewhere else" and let a commit
+    // land on `main`. A flag that only changes where the push points is
+    // not "land the work on that branch"; the commit the engine writes
+    // has to be made *on* it, locally and remotely. Standing on the
+    // branch first is also what makes the rebase below correct: the
+    // `--autostash` rebase then moves **that** branch onto its remote
+    // base, instead of moving the branch the user was standing on and
+    // leaving `onto` pointing at the pre-rebase tip.
+    //
+    // The name was already validated in `guards` — protected branches
+    // refused, refspec shapes refused — so this is a checkout, not a
+    // second opinion about what the branch is called.
+    let onto_branch = plan
+        .onto
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty());
+    // Where the checkout stood before `--onto` moved it, and whether the
+    // branch was invented by this run. Both are needed by the
+    // `NothingToCommit` exits below: a run that produced nothing must not
+    // publish a branch it invented, and should not leave the user standing
+    // on one either.
+    let mut onto_previous: Option<String> = None;
+    let mut onto_created = false;
+    // The commit the invented `--onto` branch started from. "Does this
+    // run have anything to send" for such a branch is "did HEAD move off
+    // this base" — which sees a rebase rewrite as well as an engine
+    // commit, where `head_before`-based `moved` sees only the latter.
+    let mut onto_fresh_base: Option<String> = None;
+    if let Some(onto) = onto_branch {
+        onto_previous = ro_git::primitives::current_branch(repo);
+        onto_fresh_base = ro_git::read::head_oid(repo).ok().flatten();
+        match stand_on_onto_branch(repo, onto) {
+            Ok(created) => onto_created = created,
+            Err(why) => {
+                return RepoOutcome::Failed {
+                    error: format!("--onto {onto}: {why}"),
+                    // A checkout git refused — almost always uncommitted
+                    // changes that would be overwritten — classifies from
+                    // git's own words like every other local failure here.
+                    class: ro_core::FailureClass::classify(&why),
+                };
+            }
+        }
+    }
+
     // (c2) Rebase onto the remote's base, **before** the engine.
     //
     // The tree is dirty, so git stashes, rebases and pops; it comes back
@@ -736,7 +791,13 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     // (d) The engine. `ro commit` returns after this.
     let ctx = EngineContext {
         repo_root: repo,
-        base_branch: plan.base_branch.clone(),
+        // The branch the engine is actually standing on — `--onto` when
+        // the run moved the checkout, the snapshot otherwise. Reporting
+        // the pre-`--onto` branch would tell the agent it is working from
+        // a branch it is not on.
+        base_branch: onto_branch
+            .map(str::to_string)
+            .unwrap_or_else(|| plan.base_branch.clone()),
         identity: plan.identity.as_ref(),
         timeout: opts.timeout,
         // Two flags, two fields. `--prompt` is the agent's brief and
@@ -786,17 +847,34 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
         // The rebase above may have rewritten the branch onto the remote's
         // base, and that commit is on the remote only if we push it.
         EngineOutcome::NothingToCommit => {
+            // A `--onto` branch this run invented, over a run that
+            // produced nothing, is undone here: the checkout goes back
+            // and the branch is deleted before the outcome is reported,
+            // so "nothing to commit" also means "nothing changed".
+            let nothing = |repo: &Path| {
+                if onto_created {
+                    if let Some(onto) = onto_branch {
+                        unmake_onto_branch(repo, onto, onto_previous.as_deref());
+                    }
+                }
+                RepoOutcome::NothingToCommit
+            };
             if !opts.how_far.pushes() {
-                return RepoOutcome::NothingToCommit;
+                return nothing(repo);
             }
             if !has_commits_to_push(
                 repo,
                 &push_target,
                 head_before,
+                if onto_created {
+                    onto_fresh_base.as_deref()
+                } else {
+                    None
+                },
                 plan.host_for_extraheader().as_deref(),
                 credential.as_ref(),
             ) {
-                return RepoOutcome::NothingToCommit;
+                return nothing(repo);
             }
             match ro_git::read::head_oid(repo) {
                 Ok(Some(oid)) => oid,
@@ -1096,6 +1174,89 @@ fn validate_onto(onto: &str) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
+}
+
+/// Stand on the branch `--onto` named, creating it when it does not exist.
+///
+/// Three cases, in order:
+///
+///  * already on it — nothing to do;
+///  * a local branch — check it out. Git carries uncommitted changes
+///    across when they do not collide and refuses when they do, which is
+///    the honest answer: ro does not get to decide which side of a
+///    collision wins;
+///  * no local branch — create it **at HEAD**. Starting at `origin/<onto>`
+///    would be the quieter bug: the commits this run exists to land are on
+///    HEAD, and a branch rooted at the remote tip does not contain them —
+///    the engine then finds a clean tree and the push sends a branch with
+///    none of the work on it. The rebase that follows moves the new branch
+///    onto `origin/<onto>` when the remote has it, which is where the
+///    remote's commits get incorporated instead.
+///
+/// An `onto` that exists **locally** keeps its own line: checking it out
+/// and rebasing moves *its* commits onto the remote base, and the work
+/// this run produces — the dirty files the engine commits — lands on top.
+/// Commits that were already on the previous branch stay there; merging
+/// two lines of history is not what a branch name is for.
+///
+/// `Ok(true)` means the branch did not exist and was created here;
+/// `Ok(false)` means the checkout already stood on it or switched to an
+/// existing one. The caller needs the distinction: a branch this run
+/// invented out of a clean tree must not be pushed, and a run that
+/// produced nothing should not leave the user standing on it.
+///
+/// `Err` is git's own stderr, for the caller to classify.
+fn stand_on_onto_branch(repo: &Path, onto: &str) -> Result<bool, String> {
+    if ro_git::primitives::current_branch(repo).as_deref() == Some(onto) {
+        return Ok(false);
+    }
+    if ro_git::primitives::branch_exists(repo, onto) {
+        return ro_git::primitives::checkout(repo, onto)
+            .map_err(|e| format!("{e:#}"))
+            .map(|()| false);
+    }
+    let out = std::process::Command::new("git")
+        .args(["checkout", "-b", onto])
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|e| format!("running git checkout -b {onto}: {e}"))?;
+    if out.status.success() {
+        Ok(true)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Undo a `--onto` branch this run created when the run produced nothing.
+///
+/// `checkout -b` moved the user's checkout and the rebase may have
+/// rewritten the new branch, but with `engine_committed == false` every
+/// commit on it is either the previous tip itself or a rebase copy of
+/// commits the previous branch still holds — so deleting it loses no
+/// work. The checkout goes back first; if that fails the branch is left
+/// alone rather than deleting the branch the user is standing on.
+fn unmake_onto_branch(repo: &Path, onto: &str, previous: Option<&str>) {
+    let back = match previous {
+        Some(branch) => {
+            let out = std::process::Command::new("git")
+                .args(["checkout", branch])
+                .current_dir(repo)
+                .output();
+            out.map(|o| o.status.success()).unwrap_or(false)
+        }
+        // Detached HEAD before the run: there is no branch name to go
+        // back to, and inventing one is worse than staying put.
+        None => false,
+    };
+    if !back {
+        return;
+    }
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", onto])
+        .current_dir(repo)
+        .output();
 }
 
 /// Turn a `credential_ref` into a secret.
@@ -3542,6 +3703,7 @@ fn has_commits_to_push(
     repo: &Path,
     refspec: &str,
     head_before: Option<&str>,
+    fresh_branch_base: Option<&str>,
     host: Option<&str>,
     credential: Option<&SecretString>,
 ) -> bool {
@@ -3599,6 +3761,24 @@ fn has_commits_to_push(
         // first one alone published a branch off `main` for a run with no
         // work in it at all.
         (false, false) => moved,
+        // A local branch the remote lacks, invented by this run's `--onto`
+        // at `fresh_branch_base`. Same rule as `(false, false)`, measured
+        // against the base rather than `head_before`: a rebase rewrite
+        // moves HEAD off the base without the engine committing anything,
+        // and that rebased work is exactly what the push exists to send.
+        // A pre-existing local branch keeps the old answer — `true` —
+        // because "local commits nobody has pushed yet" is work too.
+        (true, false) if fresh_branch_base.is_some() => {
+            match (
+                fresh_branch_base,
+                ro_git::read::head_oid(repo).ok().flatten(),
+            ) {
+                (Some(base), Some(head)) => head != base,
+                // An unreadable comparison is unknown, not empty — the
+                // same answer every other undecidable arm gives.
+                _ => true,
+            }
+        }
         // Undecidable, and deliberately so: the branch exists on one side
         // only, so there is no ref to compare against. A rebase the caller
         // resolved with `--resolve` lands here — the resolved commit is HEAD,
@@ -4244,6 +4424,102 @@ mod onto_tests {
             !String::from_utf8_lossy(&upstream.stdout).contains("ghost"),
             "the checkout's upstream must not be repointed: {}",
             String::from_utf8_lossy(&upstream.stdout)
+        );
+    }
+
+    /// `ro commit --onto feat/new` on a dirty `main` lands the commit on
+    /// `feat/new` — locally, not only in the push refspec.
+    ///
+    /// This is the bug the flag had: `--onto` was read in exactly one
+    /// place, the push refspec, so the engine committed onto whatever
+    /// branch the checkout happened to be on. On `main` — a protected
+    /// branch the guard would otherwise refuse — the run reported
+    /// success while the commit sat on `main`, and `--onto` was the
+    /// bypass that made the refusal meaningless.
+    #[test]
+    fn commit_onto_a_new_branch_lands_the_commit_on_it_not_on_main() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "main"]);
+        let main_before = run_git_out(f.repo(), &["rev-parse", "main"]);
+        assert!(
+            main_before.status.success(),
+            "the fixture has a main: {}",
+            String::from_utf8_lossy(&main_before.stderr)
+        );
+        let main_tip = String::from_utf8_lossy(&main_before.stdout)
+            .trim()
+            .to_string();
+
+        f.write_local("f.txt", "work\n");
+        assert!(f.local_is_dirty(), "the run needs work to commit");
+
+        let plan = plan_on(&f, "main", Some("feat/new"));
+        let mut opts = opts_for(&f);
+        opts.how_far = HowFar::Commit;
+        let outcome = run_one(&plan, &opts);
+
+        assert!(
+            matches!(outcome, RepoOutcome::Committed { .. }),
+            "the dirty tree must produce a commit, got {outcome:?}"
+        );
+
+        // The checkout moved: HEAD is `feat/new`, and the commit is on it.
+        let head = run_git_out(f.repo(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            "feat/new",
+            "the run must stand on the branch it commits to"
+        );
+        let ahead = run_git_out(f.repo(), &["rev-list", "--count", "main..feat/new"]);
+        assert_eq!(
+            String::from_utf8_lossy(&ahead.stdout).trim(),
+            "1",
+            "exactly the engine's commit must sit on feat/new ahead of main"
+        );
+
+        // And `main` — the protected branch the escape was taken from —
+        // did not move.
+        let main_after = run_git_out(f.repo(), &["rev-parse", "main"]);
+        assert_eq!(
+            String::from_utf8_lossy(&main_after.stdout).trim(),
+            main_tip,
+            "main must be untouched by a commit --onto feat/new"
+        );
+    }
+
+    /// The same escape, onto a branch that already exists locally: the
+    /// commit lands on that branch's own line, not on a branch recreated
+    /// at HEAD.
+    #[test]
+    fn commit_onto_an_existing_local_branch_uses_its_own_history() {
+        let f = Fixture::new();
+        run_git(f.repo(), &["checkout", "-q", "-b", "feat/existing"]);
+        f.write_local("e.txt", "existing line\n");
+        run_git(f.repo(), &["add", "-A"]);
+        run_git(f.repo(), &["commit", "-q", "-m", "the existing line"]);
+        let existing_tip = run_git_out(f.repo(), &["rev-parse", "feat/existing"]);
+        let existing_tip = String::from_utf8_lossy(&existing_tip.stdout)
+            .trim()
+            .to_string();
+        run_git(f.repo(), &["checkout", "-q", "main"]);
+
+        f.write_local("f.txt", "work\n");
+        let plan = plan_on(&f, "main", Some("feat/existing"));
+        let mut opts = opts_for(&f);
+        opts.how_far = HowFar::Commit;
+        let outcome = run_one(&plan, &opts);
+
+        assert!(
+            matches!(outcome, RepoOutcome::Committed { .. }),
+            "the dirty tree must produce a commit, got {outcome:?}"
+        );
+        // `feat/existing` is the parent of the new commit — the work
+        // joined its line rather than re-rooting it at main's tip.
+        let parent = run_git_out(f.repo(), &["rev-parse", "feat/existing^"]);
+        assert_eq!(
+            String::from_utf8_lossy(&parent.stdout).trim(),
+            existing_tip,
+            "the new commit must sit on feat/existing's own history"
         );
     }
 }

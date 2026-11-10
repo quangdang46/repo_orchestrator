@@ -107,14 +107,21 @@ pub fn run(plans: &[RepoPlan], opts: &RunOptions) -> Summary {
 /// writes the same branch, and a plan that has not run yet has written
 /// nothing.
 ///
-/// A run that never pushed — a refusal, a conflict, a failure — has no
-/// branch it wrote to, and the checkout's name is then the honest answer:
-/// it is where the work is, and it is the branch the next run will start
-/// from. The distinction is drawn by the outcome, not by a flag, so a
-/// `Pushed` row and a `Refused` row from the same plan cannot disagree
-/// about what happened.
+/// A run that produced nothing the branch can keep — a refusal, a
+/// conflict, a failure before the engine wrote — reports the checkout's
+/// name, which is where the work still is and the branch the next run
+/// will start from. `Committed` counts as written even without a push:
+/// `ro commit --onto` makes its commit on the branch `--onto` moved the
+/// checkout to. The distinction is drawn by the outcome, not by a flag,
+/// so rows from the same plan cannot disagree about what happened.
 fn written_branch(plan: &RepoPlan, outcome: &RepoOutcome) -> String {
-    if matches!(outcome, RepoOutcome::Pushed { .. }) {
+    // `Pushed` wrote to the refspec's destination and `Committed` wrote
+    // the engine's commit on the checkout `--onto` moved to — in both
+    // cases the branch the work is on is `onto` when it was given.
+    if matches!(
+        outcome,
+        RepoOutcome::Pushed { .. } | RepoOutcome::Committed { .. }
+    ) {
         return plan
             .onto
             .as_deref()
@@ -412,6 +419,22 @@ mod tests {
             written_branch(&plan_onto(Some("release")), &refused),
             "work",
             "a refused run wrote nothing; the checkout is where the work is"
+        );
+    }
+
+    /// `ro commit --onto` writes a commit without pushing, and the row
+    /// still has to name the branch that commit is on — `onto`, not the
+    /// checkout it was made from.
+    #[test]
+    fn a_committed_row_names_the_branch_the_commit_landed_on() {
+        let committed = RepoOutcome::Committed {
+            oid: "bbb".into(),
+            message: String::new(),
+        };
+        assert_eq!(
+            written_branch(&plan_onto(Some("feat/new")), &committed),
+            "feat/new",
+            "the commit was made on the --onto branch; the row must say so"
         );
     }
 
