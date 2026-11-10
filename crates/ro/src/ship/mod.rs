@@ -76,7 +76,16 @@ pub fn run_verb(
     // the three. Never a silent fall-through to `git`: a user who asked
     // for an agent and got the raw backend would get one commit per repo
     // and have no way to tell why.
-    let config = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
+    // A config that exists but will not parse must fail the run, not fall
+    // back to defaults — the fleet would then act on settings nobody
+    // wrote. Absent still means defaults (`load_config` handles that).
+    let config = match ro_config::load_config(&paths.config_toml()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: loading config: {e:#}");
+            std::process::exit(crate::exit::EX_FATAL as i32);
+        }
+    };
     // The engine the user named, else the config, else `claude`.
     //
     // The default is `claude` and deliberately **not** `git`. A silent

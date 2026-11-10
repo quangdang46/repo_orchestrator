@@ -29,6 +29,18 @@
 //! move the exit code. `ro prune` hard-exits 3. Applying the fleet table
 //! to every command would read a failed environment check as a partial
 //! run.
+//!
+//! # Skips and hand-overs are not failures
+//!
+//! A repo stopped by a merge conflict (`SkippedConflict`) or left for a
+//! human by the resolve stage (`HandedOver`) counts as **neither**
+//! success nor failure, so a fleet where every repo needs a person still
+//! exits 0. That is deliberate: ro did not fail — it declined, and the
+//! summary's ", N skipped (need a human)" tail is the signal a script or
+//! a reader is meant to key on. Making it an attention exit would collide
+//! with `EX_PARTIAL`'s meaning ("some repos failed") and there is no
+//! fourth fleet code to give it; if one is ever added, this is the row
+//! it belongs to.
 
 /// Bad usage. The clap-adjacent convention (`EX_USAGE`).
 pub const EX_USAGE: u8 = 64;

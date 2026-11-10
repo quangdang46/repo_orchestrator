@@ -56,7 +56,21 @@ pub fn run(plans: &[RepoPlan], opts: &RunOptions) -> Summary {
                 // DB handle crosses this boundary, which is the whole
                 // reason the coordinator exists.
                 for (offset, plan) in group.iter().enumerate() {
-                    let outcome = run_one(plan, opts);
+                    // One repo's panic must not take the fleet down with it:
+                    // the panic becomes this repo's `Failed` row and the
+                    // loop continues. (This needs an unwinding runtime —
+                    // the release profile sets `panic = "unwind"` for
+                    // exactly this reason.)
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_one(plan, opts)
+                    }))
+                    .unwrap_or_else(|payload| RepoOutcome::Failed {
+                        class: ro_core::FailureClass::MissingProvider,
+                        error: format!(
+                            "worker panicked while running this repo: {}",
+                            panic_message(&payload)
+                        ),
+                    });
                     let mut slots = outcomes.lock().unwrap_or_else(|e| e.into_inner());
                     // The index, not the repo id: a repo id is a UUID and
                     // parsing one as a slot number would be a silent
@@ -95,6 +109,18 @@ pub fn run(plans: &[RepoPlan], opts: &RunOptions) -> Summary {
         .collect();
 
     Summary::new(rows)
+}
+
+/// Render a panic payload without leaking internals: the payload is
+/// usually a `&str`/`String`, anything else is reported as unknown.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
 }
 
 /// The branch a run wrote to, for the summary row.

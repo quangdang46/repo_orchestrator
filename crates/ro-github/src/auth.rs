@@ -70,9 +70,22 @@ impl AuthToken {
 ///   exist — there is no `token` key, in any layer, in any version after the
 ///   credential reference landed. It was reachable and always empty.
 pub fn discover_token(strategy: &str) -> Result<AuthToken> {
+    discover_token_for_host(strategy, None)
+}
+
+/// [`discover_token`] with the host the `gh` CLI should answer for.
+///
+/// `gh auth token` with no `--hostname` returns the token for whichever
+/// account `gh` considers default. On a machine logged into both
+/// github.com and a GitHub Enterprise host — or into two github.com
+/// accounts — that can be the wrong one, and ro would then send a token
+/// to a host it was never issued for. `host` is a hostname
+/// (`github.com`, `ghe.example.com`); `None` keeps the old behaviour.
+/// `env` ignores it: environment variables name no host.
+pub fn discover_token_for_host(strategy: &str, host: Option<&str>) -> Result<AuthToken> {
     match strategy {
         "env" => from_env(),
-        "gh" => from_gh_cli(),
+        "gh" => from_gh_cli(host),
         other => bail!(
             "unknown auth strategy: {other}\n\
              expected 'env' (read GH_TOKEN or GITHUB_TOKEN) or 'gh' (run \
@@ -117,10 +130,23 @@ fn from_env() -> Result<AuthToken> {
     )
 }
 
-fn from_gh_cli() -> Result<AuthToken> {
-    let output = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
+fn from_gh_cli(host: Option<&str>) -> Result<AuthToken> {
+    // `gh` knows hosts by name, not API URL: `api.github.com` is the same
+    // account as `github.com`, so the API spelling is folded back.
+    let host = host.map(|h| {
+        if h == "api.github.com" {
+            "github.com"
+        } else {
+            h
+        }
+    });
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(["auth", "token"])
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    if let Some(h) = host.filter(|h| !h.is_empty()) {
+        cmd.args(["--hostname", h]);
+    }
+    let output = cmd
         .output()
         .context("failed to run `gh auth token` — is `gh` installed?")?;
     if !output.status.success() {

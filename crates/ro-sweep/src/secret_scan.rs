@@ -6,6 +6,7 @@
 use anyhow::Result;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -162,18 +163,48 @@ pub fn scan_text(path: &str, text: &str) -> Vec<SecretFinding> {
     out
 }
 
+/// Files larger than this are skipped rather than read into memory whole:
+/// a multi-GB worktree file would otherwise turn a preflight scan into an
+/// OOM. The skip is loud — a file the scan never saw must not read as
+/// "scanned clean".
+pub const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Scan a file on disk. Binary-looking content is skipped silently —
 /// **except** UTF-16/UTF-32 text, which is ~50% NUL bytes by construction
 /// and would otherwise bypass the scan entirely: a `ghp_` token in a
 /// UTF-16 file is a credential the moment it is committed, and the NUL
 /// density test cannot tell it from a PNG.
 pub fn scan_file(path: &Path) -> Result<Vec<SecretFinding>> {
-    let bytes = std::fs::read(path)?;
+    if let Ok(meta) = path.metadata() {
+        if meta.len() > MAX_SCAN_BYTES {
+            warn_skipped(path, meta.len());
+            return Ok(Vec::new());
+        }
+    }
+    // `take` bounds the read even when metadata lies (or is unavailable),
+    // so a pathological file can never allocate more than the cap.
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_SCAN_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_SCAN_BYTES {
+        warn_skipped(path, bytes.len() as u64);
+        return Ok(Vec::new());
+    }
     let Some(text) = text_for_scan(&bytes) else {
         return Ok(Vec::new());
     };
     let label = path.to_string_lossy().to_string();
     Ok(scan_text(&label, &text))
+}
+
+fn warn_skipped(path: &Path, size: u64) {
+    let msg = format!(
+        "secret scan skipped {}: {size} bytes exceeds the {MAX_SCAN_BYTES}-byte cap",
+        path.display()
+    );
+    tracing::warn!("{msg}");
+    eprintln!("warning: {msg}");
 }
 
 /// The text a file's bytes should be scanned as, or `None` when the file

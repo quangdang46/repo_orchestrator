@@ -982,7 +982,13 @@ pub fn commit(repo: &Path, files: &[PathBuf], message: &str) -> Result<String> {
     if !add.ok() {
         bail!("git add failed: {}", add.stderr.trim());
     }
-    let commit_args = vec!["commit", "--no-gpg-sign", "-m", message];
+    // `--no-gpg-sign` stays a fallback for repos that never asked for
+    // signing; when `commit.gpgsign` is set, the user's policy wins.
+    let mut commit_args = vec!["commit"];
+    if !crate::primitives::commit_gpg_sign_enabled(repo) {
+        commit_args.push("--no-gpg-sign");
+    }
+    commit_args.extend(["-m", message]);
     let commit = run_in(Some(repo), &commit_args, &RunOpts::none())?;
     if !commit.ok() {
         bail!("git commit failed: {}", commit.stderr.trim());

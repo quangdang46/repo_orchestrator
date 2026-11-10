@@ -147,7 +147,9 @@ lto = "thin"
 strip = "symbols"
 opt-level = 3
 codegen-units = 16
-panic = "abort"
+# `unwind`, not `abort`: a panic in one repo's worker must become that
+# repo's `Failed` row, not kill the whole fleet. `emit` catches per plan.
+panic = "unwind"
 debug = false
 
 [profile.dev]
@@ -165,5 +167,7 @@ lto = "thin"
 strip = "symbols"
 opt-level = 3
 codegen-units = 16
-panic = "abort"
+# Same reason as `[profile.release]`: one repo's panic must not abort
+# the fleet.
+panic = "unwind"
 debug = false

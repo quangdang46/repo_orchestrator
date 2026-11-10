@@ -32,7 +32,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use ro_config::{ConfigPaths, loader::load_config, paths::default_config_toml};
-use ro_github::auth::discover_token;
 use ro_state::open_db;
 
 /// Outcome of a single doctor check.
@@ -234,7 +233,25 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
         })
     });
 
-    checks.push(check_github_auth(&paths));
+    // The config is loaded **once** here, and a file that exists but will
+    // not parse is a finding — not a silent default. Every consumer below
+    // used to call `load_config(...).unwrap_or_default()`, so a malformed
+    // `config.toml` was diagnosed as "everything is fine" on exactly the
+    // paths that exist to catch a broken config.
+    let config = load_config(&paths.config_toml());
+    checks.push(match &config {
+        Ok(cfg) => check_github_auth(cfg),
+        // The parse failure is already the `config` check's Required
+        // finding; a second Required failure for the same root cause
+        // would count one broken file twice. Auth simply cannot be
+        // probed without the file that names the strategy.
+        Err(_) => CheckResult::warn(
+            "github_auth",
+            Severity::Optional,
+            "not probed: the config file will not parse",
+            None,
+        ),
+    });
     let (cfg_check, applied_fix_count) = check_and_optionally_fix_config(&paths, opts.fix);
     checks.push(cfg_check);
 
@@ -265,8 +282,13 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
             // right host. `ro_github::auth::build_client` already takes
             // `Option<&str>` and builds `https://{host}/api/v3` for a host
             // that is not `github.com`; it was simply never given one.
-            let host = github_host(&paths);
-            checks.extend(check_repo_write_access(&conn, host.as_deref()));
+            // A config that will not parse is already reported above;
+            // probing a guessed host on top of it would add a second,
+            // wrong answer to a question that was never asked.
+            if let Ok(cfg) = &config {
+                let host = github_host(cfg);
+                checks.extend(check_repo_write_access(&conn, host.as_deref()));
+            }
         }
     }
 
@@ -613,8 +635,7 @@ fn check_repo_write_access(
 ///
 /// `None` is what `build_client` wants for the public API, so a default
 /// install takes the same path it always did.
-fn github_host(paths: &ro_config::ConfigPaths) -> Option<String> {
-    let cfg = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
+fn github_host(cfg: &ro_config::AppConfig) -> Option<String> {
     match cfg.github.host.as_str() {
         "" | "github.com" | "api.github.com" => None,
         other => Some(other.to_string()),
@@ -640,22 +661,28 @@ fn github_auth_strategy(configured: &str) -> &'static str {
     }
 }
 
-fn check_github_auth(paths: &ro_config::ConfigPaths) -> CheckResult {
+fn check_github_auth(cfg: &ro_config::AppConfig) -> CheckResult {
     // `github.auth` is read here. It was hardcoded to `env` then `gh`, so
     // all four settings produced byte-identical output — and a user who
     // wrote `github.auth = "env"` **specifically to pin the credential
     // source** got a `gh` credential anyway, which is exactly the silent
     // fallback `discover_token`'s own error text says ro forbids.
-    let configured = ro_config::load_config(&paths.config_toml())
-        .unwrap_or_default()
-        .github
-        .auth;
+    let configured = cfg.github.auth.clone();
     let pinned = matches!(configured.as_str(), "env" | "gh");
-    let env_result = discover_token(github_auth_strategy(&configured));
+    // `gh auth token` answers for one host; pass `github.host` so a
+    // machine logged into github.com *and* an Enterprise host — or into
+    // two github.com accounts — cannot hand ro the wrong account's token.
+    // The API spelling folds back to the account name `gh` knows.
+    let gh_host = match cfg.github.host.as_str() {
+        "" | "api.github.com" => "github.com",
+        h => h,
+    };
+    let env_result =
+        ro_github::auth::discover_token_for_host(github_auth_strategy(&configured), Some(gh_host));
     // A **pinned** strategy is not allowed to fall through. An unpinned one
     // still gets the second source, and the result says which answered.
     let gh_result = if env_result.is_err() && !pinned {
-        discover_token("gh").err()
+        ro_github::auth::discover_token_for_host("gh", Some(gh_host)).err()
     } else {
         None
     };

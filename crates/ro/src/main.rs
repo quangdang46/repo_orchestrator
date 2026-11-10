@@ -942,7 +942,27 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let paths = resolve_paths(&cli)?;
     let db_path = paths.state_db();
-    let config = ro_config::load_config(&paths.config_toml()).unwrap_or_default();
+    // A config that exists but will not parse must fail the run, not fall
+    // back to defaults: every verb below would then act on settings the
+    // user never wrote. `load_config` already maps "absent" to defaults;
+    // only real errors reach this arm.
+    //
+    // `ro doctor` is the exception: it is the command you run *because*
+    // something may be broken, and its config check is the one that names
+    // the file and the parse error. It loads the file itself, so here a
+    // parse failure only means "use defaults for the fields this arm
+    // never reads".
+    let is_doctor = matches!(cli.command, Commands::Doctor { .. });
+    let config = match ro_config::load_config(&paths.config_toml()) {
+        Ok(config) => config,
+        Err(e) if is_doctor => {
+            let _ = e;
+            ro_config::AppConfig::default()
+        }
+        Err(e) => {
+            return Err(exit::FatalError::new(format!("loading config: {e:#}")).into());
+        }
+    };
     // `core.projects_dir` and `core.layout` are read here, once, and every
     // verb that needs a projects directory asks for it. Both used to be
     // ignored: four call sites did `paths.state_dir.join("projects")` and

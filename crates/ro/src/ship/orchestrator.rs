@@ -1929,6 +1929,12 @@ fn head_is_on_remote(repo: &Path, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A rebase that has not finished in ten minutes is hung on something no
+/// amount of waiting fixes — a credential prompt that slipped past the
+/// environment hardening, a wedged filesystem. Same bound the engine gets
+/// by default.
+const REBASE_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Rebase onto the remote's base — or onto the one `--onto` named — with
 /// the worktree's changes preserved.
 ///
@@ -1971,18 +1977,26 @@ fn rebase_onto_remote_base(
     // `--autostash` is the whole mechanism: git stashes, rebases, and pops
     // in one command, so a failure to pop fails the whole rebase rather
     // than leaving a half-popped tree behind for ro to walk away from.
-    let out = std::process::Command::new("git")
-        .args(["rebase", "--autostash", &base])
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|e| RebaseError::Failed {
-            base: base.clone(),
-            stderr: format!("running git rebase --autostash: {e}"),
-        })?;
+    //
+    // It goes through `run_in`, not a bare `Command`: the same `--no-pager`,
+    // `GIT_TERMINAL_PROMPT=0`, `GCM_*=Never`, `LC_ALL=C` hardening every
+    // other git call gets, plus a timeout — a rebase hung on a credential
+    // prompt or a wedged filesystem used to block the worker forever.
+    let out = ro_git::mutation::run_in(
+        Some(repo),
+        &["rebase", "--autostash", base.as_str()],
+        &ro_git::mutation::RunOpts {
+            env: &[],
+            timeout: Some(REBASE_TIMEOUT),
+            program: None,
+        },
+    )
+    .map_err(|e| RebaseError::Failed {
+        base: base.clone(),
+        stderr: e.to_string(),
+    })?;
 
-    if out.status.success() {
+    if out.ok() {
         // **The exit code is not the outcome.** `git rebase --autostash`
         // returns 0 when the rebase itself succeeds and the *pop* that
         // follows conflicts — verified against the real git, not assumed:
@@ -2004,7 +2018,7 @@ fn rebase_onto_remote_base(
         }
         return Ok(RebaseState::Rebased);
     }
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    let stderr = out.stderr;
     // A conflict is a stage, not a failure, and the two are told apart
     // here rather than by the caller reading the message.
     if stderr.contains("CONFLICT") || stderr.contains("could not apply") {

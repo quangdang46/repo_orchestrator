@@ -196,18 +196,26 @@ pub fn commit_all(repo: &Path, message: &str) -> Result<String> {
 pub fn commit_all_as(repo: &Path, message: &str, author: Option<(&str, &str)>) -> Result<String> {
     let mut argv: Vec<String> = Vec::new();
     if let Some((name, email)) = author {
+        // The values become `-c user.name=...` argv entries: a newline in
+        // either would inject additional config keys or split the command.
+        for (label, value) in [("user.name", name), ("user.email", email)] {
+            if value.contains('\n') || value.contains('\r') {
+                bail!("{label} must not contain newlines");
+            }
+        }
         // `-c` is a git-wide option and has to precede the subcommand.
         argv.push("-c".to_string());
         argv.push(format!("user.name={name}"));
         argv.push("-c".to_string());
         argv.push(format!("user.email={email}"));
     }
-    argv.extend([
-        "commit".to_string(),
-        "--no-gpg-sign".to_string(),
-        "-m".to_string(),
-        message.to_string(),
-    ]);
+    argv.push("commit".to_string());
+    // `commit.gpgsign` is the user's policy; `--no-gpg-sign` is only a
+    // fallback for repos that never asked for signing.
+    if !commit_gpg_sign_enabled(repo) {
+        argv.push("--no-gpg-sign".to_string());
+    }
+    argv.extend(["-m".to_string(), message.to_string()]);
 
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let out = run_in(Some(repo), &argv, &RunOpts::none())?;
@@ -215,6 +223,22 @@ pub fn commit_all_as(repo: &Path, message: &str, author: Option<(&str, &str)>) -
         bail!("git commit failed: {}", out.stderr.trim());
     }
     head_short(repo)
+}
+
+/// Does this repo's effective git config ask for signed commits?
+///
+/// Read through the same `run_in` path as the commit itself, so the answer
+/// sees the same `GIT_CONFIG_*` environment the commit will. An unset or
+/// unreadable value means "not asked", which keeps the historical
+/// `--no-gpg-sign` default.
+pub(crate) fn commit_gpg_sign_enabled(repo: &Path) -> bool {
+    run_in(
+        Some(repo),
+        &["config", "--type=bool", "--get", "commit.gpgsign"],
+        &RunOpts::none(),
+    )
+    .map(|o| o.ok() && o.stdout.trim() == "true")
+    .unwrap_or(false)
 }
 
 /// The short OID of HEAD.
@@ -1110,6 +1134,65 @@ mod author_tests {
             "per-invocation `-c` must not write anything to .git/config"
         );
     }
+
+    /// `commit.gpgsign = true` is the user's policy, and the commit must
+    /// *try* to sign: a signer that cannot sign (`gpg.program` pointing at
+    /// `/bin/false`) fails the commit. If `--no-gpg-sign` were still
+    /// hardcoded, the same repo would commit unsigned and sail through —
+    /// the flag would have silently overridden the one setting that asks
+    /// for a signature.
+    #[test]
+    fn a_repo_that_asks_for_signing_is_not_forced_unsigned() {
+        let (_tmp, p) = repo_with_a_contrary_config();
+        for args in [
+            ["config", "commit.gpgsign", "true"],
+            ["config", "gpg.program", "/bin/false"],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .output()
+                .unwrap();
+            assert!(ok.status.success(), "git {args:?} failed");
+        }
+        std::fs::write(p.join("signed.txt"), "x\n").unwrap();
+        stage_all(&p).unwrap();
+        let err = commit_all_as(&p, "must attempt a signature", None)
+            .expect_err("a repo that asks for signing must not commit unsigned");
+        assert!(
+            format!("{err:#}").contains("git commit failed"),
+            "the failure must come from git refusing the unsigned commit, got: {err:#}"
+        );
+    }
+
+    /// And the flip side: the same broken signer on a repo that never asked
+    /// for signatures still commits, because `--no-gpg-sign` is the
+    /// fallback for exactly that case.
+    #[test]
+    fn a_repo_that_never_asked_still_commits_unsigned() {
+        let (_tmp, p) = repo_with_a_contrary_config();
+        let ok = std::process::Command::new("git")
+            .args(["config", "gpg.program", "/bin/false"])
+            .current_dir(&p)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .unwrap();
+        assert!(ok.status.success());
+        commit_file(&p, "plain.txt", "unsigned is fine here", None);
+        assert_eq!(author_of(&p).0, "Configured");
+    }
+
+    /// A newline in the identity is a forged trailer, not a name.
+    #[test]
+    fn an_author_with_a_newline_is_refused() {
+        let (_tmp, p) = repo_with_a_contrary_config();
+        std::fs::write(p.join("a.txt"), "x\n").unwrap();
+        stage_all(&p).unwrap();
+        let err = commit_all_as(&p, "msg", Some(("Dev\nInjected: yes", "d@e.st")))
+            .expect_err("a newline in user.name must be refused");
+        assert!(format!("{err:#}").contains("newlines"), "got: {err:#}");
+    }
 }
 
 /// Replace the **tree** of the last commit, keeping its position in history.
@@ -1139,18 +1222,23 @@ pub fn amend_tree(
 
     let mut argv: Vec<String> = Vec::new();
     if let Some((name, email)) = author {
+        // Same guard as `commit_all_as`: a newline in the identity is a
+        // forged trailer waiting to happen.
+        for (label, value) in [("user.name", name), ("user.email", email)] {
+            if value.contains('\n') || value.contains('\r') {
+                bail!("{label} must not contain newlines");
+            }
+        }
         argv.push("-c".to_string());
         argv.push(format!("user.name={name}"));
         argv.push("-c".to_string());
         argv.push(format!("user.email={email}"));
     }
-    argv.extend([
-        "commit".to_string(),
-        "--amend".to_string(),
-        "--no-gpg-sign".to_string(),
-        "-m".to_string(),
-        subject.to_string(),
-    ]);
+    argv.extend(["commit".to_string(), "--amend".to_string()]);
+    if !commit_gpg_sign_enabled(repo) {
+        argv.push("--no-gpg-sign".to_string());
+    }
+    argv.extend(["-m".to_string(), subject.to_string()]);
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
     let out = run_in(Some(repo), &argv, &RunOpts::none())?;
     if !out.ok() {

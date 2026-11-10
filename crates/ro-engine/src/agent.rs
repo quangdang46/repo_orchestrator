@@ -662,6 +662,15 @@ impl AgentEngine {
 
         let mut commits = Vec::new();
         for group in subjects {
+            // An empty group is a plan artifact, not work: staging it
+            // fails ("requires at least one path") and used to report the
+            // whole run failed **after** earlier groups had already
+            // committed — the worst possible place to learn the plan had
+            // a hole in it. Skip it; the files it named nothing for were
+            // never going to be committed anyway.
+            if group.files.is_empty() {
+                continue;
+            }
             // Each group is staged on its own, so the split the agent
             // reasoned about is the split that lands. Committing the whole
             // index N times — which is what this did before — takes every
@@ -694,6 +703,13 @@ impl AgentEngine {
             });
         }
 
+        if commits.is_empty() {
+            // Every group was empty. The tree is still dirty — the agent
+            // wrote something and named none of it — but there is no
+            // commit to report, and `Committed` with zero commits reads
+            // as success-with-nothing-done downstream.
+            return EngineOutcome::NothingToCommit;
+        }
         EngineOutcome::Committed { commits }
     }
 
