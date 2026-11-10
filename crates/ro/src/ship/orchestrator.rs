@@ -784,7 +784,13 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             if !opts.how_far.pushes() {
                 return RepoOutcome::NothingToCommit;
             }
-            if !has_commits_to_push(repo, &push_target, head_before) {
+            if !has_commits_to_push(
+                repo,
+                &push_target,
+                head_before,
+                plan.host_for_extraheader().as_deref(),
+                credential.as_ref(),
+            ) {
                 return RepoOutcome::NothingToCommit;
             }
             match ro_git::read::head_oid(repo) {
@@ -894,7 +900,12 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     //
     // Attached only on success, so a push that failed published nothing and
     // says nothing about publishing.
-    let onto_warning = onto_created_warning(repo, plan.onto.as_deref());
+    let onto_warning = onto_created_warning(
+        repo,
+        plan.onto.as_deref(),
+        plan.host_for_extraheader().as_deref(),
+        credential.as_ref(),
+    );
 
     let push = ro_git::mutation::push_with_credential(
         repo,
@@ -957,14 +968,25 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
 /// The negative control is the point: a branch the remote already had is
 /// not a surprise, and without this early return the warning fires on
 /// every `--onto` run and stops being read.
-fn onto_created_warning(repo: &Path, onto: Option<&str>) -> Vec<String> {
+fn onto_created_warning(
+    repo: &Path,
+    onto: Option<&str>,
+    host: Option<&str>,
+    credential: Option<&SecretString>,
+) -> Vec<String> {
     let Some(onto) = onto.map(str::trim).filter(|b| !b.is_empty()) else {
         return Vec::new();
     };
     // A branch the remote already had is not a surprise, and it is the
     // negative control the whole warning rests on: without this early return
     // the warning fires on every `--onto` run and stops being read.
-    if remote_branch_exists(repo, onto) {
+    //
+    // Only a **confirmed** absence warns. `Unknown` — an unreachable or
+    // unauthenticated remote — is suppressed: the old credential-blind
+    // ls-remote read every private repo as "absent" and answered this
+    // warning with `git push origin --delete` advice aimed at a branch
+    // that existed. Warning on a guess is worse than not warning.
+    if remote_branch_state(repo, onto, host, credential) != RemoteBranch::Missing {
         return Vec::new();
     }
     vec![format!(
@@ -1565,7 +1587,13 @@ fn absolute_git_dir(repo: &Path) -> Option<PathBuf> {
 /// fetch just before this step refreshed. When the remote does not have
 /// that branch yet there is nothing to rebase onto — the push is what
 /// creates it — and `origin/HEAD` is the best answer available.
-fn base_for(repo: &Path, onto: Option<&str>, target_branch: &str) -> Option<String> {
+fn base_for(
+    repo: &Path,
+    onto: Option<&str>,
+    target_branch: &str,
+    host: Option<&str>,
+    credential: Option<&SecretString>,
+) -> Option<String> {
     let remote_head = ro_git::primitives::symbolic_ref(repo, "refs/remotes/origin/HEAD")
         .ok()
         .flatten();
@@ -1582,60 +1610,124 @@ fn base_for(repo: &Path, onto: Option<&str>, target_branch: &str) -> Option<Stri
     // what creates it, and there is nothing to rebase onto. Falling back
     // to the remote's HEAD keeps the branch current with where the work
     // came from, which is the best answer available.
-    if remote_branch_exists(repo, onto) {
+    //
+    // Only a **confirmed** presence rebases onto `origin/<onto>`. `Missing`
+    // means there is genuinely nothing to rebase onto, and `Unknown` — an
+    // unreachable or unauthenticated remote — must not be read as either:
+    // the credential-blind ls-remote this replaces answered "absent" for
+    // every private repo, and the fallback below then built a push the
+    // remote rejected non-fast-forward. Both non-`Exists` answers take the
+    // remote's HEAD, which is the best base that certainly exists.
+    if remote_branch_state(repo, onto, host, credential) == RemoteBranch::Exists {
         Some(format!("origin/{onto}"))
     } else {
         remote_head
     }
 }
 
+/// What the remote's branch list can honestly say about `branch`.
+///
+/// Three answers, not two, because "the remote does not have it" and "the
+/// question could not be answered" are different facts and the callers act
+/// on them differently. `Missing` is the only answer that may produce the
+/// "ro created this branch, delete it if you did not mean to" warning —
+/// advising `git push origin --delete` on a branch the remote *does* have
+/// is the dangerous direction, and an unreachable or unauthenticated
+/// remote must never be read as `Missing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteBranch {
+    /// The remote has the branch.
+    Exists,
+    /// The remote answered, and the branch is not there.
+    Missing,
+    /// The question could not be answered: unreachable, or refused.
+    Unknown,
+}
+
 /// Does the **remote** have this branch?
 ///
-/// Two questions have been asked here under this name, and the wrong one is
-/// the dangerous one. `git show-ref --verify refs/remotes/origin/<branch>`
-/// reads the **local remote-tracking refs**, so on any clone that is not a
-/// full clone — `--single-branch`, `--depth`, or merely stale — the answer
-/// was "no" for a branch the remote has had since before the clone was made.
-/// Both callers then act on that answer: `base_for` rebases onto the wrong
-/// base and the push is rejected non-fast-forward, and the "remote does not
-/// have it" warning fires on a branch that was **overwritten** rather than
-/// created, advising `git push origin --delete <branch>` on somebody else's
-/// work.
+/// Two sources, in order, because they answer at different costs and with
+/// different authority:
 ///
-/// `ls-remote --heads` asks the remote. It is one more round trip on a
-/// network the caller is already using, and it is the only question whose
-/// answer is about the remote.
+///  1. `refs/remotes/origin/<branch>` — the local remote-tracking ref. Every
+///     caller reaches this *after* a credentialed fetch has just refreshed
+///     it, so a present ref is a fresh, authenticated answer for free. This
+///     is what fixes the credential-blindness: a private repo's fetch
+///     succeeds with the row's token, the tracking ref appears, and the
+///     question is answered without a second network call.
 ///
-/// A remote that cannot be reached answers `false`. That is the old answer,
-/// and it is the conservative one for the warning — claiming a branch was
-/// created when the remote was unreachable would be the claim that cannot be
-/// walked back.
-fn remote_branch_exists(repo: &Path, branch: &str) -> bool {
-    std::process::Command::new("git")
-        // The two global `-c` options, and the reason this is not a raw
-        // `ls-remote`: without them git consults the machine's credential
-        // helper, which on Windows is Git Credential Manager and opens a
-        // **window** asking for a password. This is the one question here
-        // that touches the network, so it was the one place on this path
-        // where `GIT_TERMINAL_PROMPT=0` did not help — that silences a
-        // terminal, not a helper. An unreachable remote answers `false`
-        // below either way, so refusing to authenticate costs this check
-        // nothing and saves the user a dialog.
-        .args(["-c", "credential.helper=", "-c", "core.askPass="])
-        .args([
-            "ls-remote",
-            "--heads",
-            "origin",
-            &format!("refs/heads/{branch}"),
-        ])
-        .current_dir(repo)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "Never")
-        .env("GCM_UI", "Never")
-        .env("LC_ALL", "C")
-        .output()
-        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-        .unwrap_or(false)
+///  2. `ls-remote --heads`, now **with the same credential** the fetch and
+///     push carry — scoped through `http.<host>.extraheader`, exactly like
+///     them. The old version ran it with `credential.helper=` and no
+///     header, so on a private repo it could only fail, and the failure was
+///     folded into `false`: `base_for` then rebased onto the wrong base and
+///     `onto_created_warning` advised deleting a branch that existed.
+///
+/// `Unknown` is what an ls-remote that exits non-zero produces — auth
+/// refused, host unreachable, git missing. It is deliberately *not* `false`:
+/// the old code could not tell "the remote said no" from "the remote never
+/// answered", and every caller that treated the second as the first was
+/// one bad network away from dangerous advice.
+fn remote_branch_state(
+    repo: &Path,
+    branch: &str,
+    host: Option<&str>,
+    credential: Option<&SecretString>,
+) -> RemoteBranch {
+    // The tracking ref first: it is the answer the credentialed fetch just
+    // paid for, and it is the only one that cannot hang a run on a second
+    // round trip.
+    if ro_git::primitives::remote_tracking_exists(repo, branch) {
+        return RemoteBranch::Exists;
+    }
+    ls_remote_branch(repo, branch, host, credential)
+}
+
+/// Ask the remote directly, authenticated the same way the fetch and push
+/// on this row are.
+///
+/// `run_in` supplies the hardening the hand-rolled version had to spell
+/// out — `credential.helper=` and `core.askPass=` emptied, no terminal
+/// prompt, no GUI helper — plus the caller's env, which is where the
+/// per-host extraheader travels. With no credential there is no header and
+/// the request goes out anonymously, which is correct for a public remote
+/// and honest `Unknown` for a private one.
+fn ls_remote_branch(
+    repo: &Path,
+    branch: &str,
+    host: Option<&str>,
+    credential: Option<&SecretString>,
+) -> RemoteBranch {
+    // The env must outlive the `RunOpts` that borrows it, so it is bound
+    // before the match rather than inside it.
+    let env;
+    let run = match (credential, host) {
+        (Some(token), Some(h)) => {
+            env = ro_git::mutation::extraheader_env(h, token);
+            ro_git::mutation::RunOpts {
+                env: &env,
+                ..ro_git::mutation::RunOpts::none()
+            }
+        }
+        _ => ro_git::mutation::RunOpts::none(),
+    };
+    let pattern = format!("refs/heads/{branch}");
+    match ro_git::mutation::run_in(
+        Some(repo),
+        &["ls-remote", "--heads", "origin", pattern.as_str()],
+        &run,
+    ) {
+        Ok(r) if r.ok() => {
+            if r.stdout.trim().is_empty() {
+                RemoteBranch::Missing
+            } else {
+                RemoteBranch::Exists
+            }
+        }
+        // Spawn failure, non-zero exit, timeout: the remote did not answer
+        // the question, so the answer is Unknown — never Missing.
+        _ => RemoteBranch::Unknown,
+    }
 }
 
 /// Is the current `HEAD` already reachable from the remote-tracking branch
@@ -1707,7 +1799,7 @@ fn rebase_onto_remote_base(
         credential,
     );
 
-    let Some(base) = base_for(repo, onto, target_branch) else {
+    let Some(base) = base_for(repo, onto, target_branch, host, credential) else {
         return Ok(RebaseState::NoRemote);
     };
     // `--autostash` is the whole mechanism: git stashes, rebases, and pops
@@ -2091,7 +2183,7 @@ mod rebase_tests {
         run_git(f.repo(), &["fetch", "-q", "origin"]);
 
         assert_eq!(
-            base_for(f.repo(), None, "feature/x").as_deref(),
+            base_for(f.repo(), None, "feature/x", None, None).as_deref(),
             Some("origin/feature/x"),
             "the base must be the branch the push lands on"
         );
@@ -2108,7 +2200,7 @@ mod rebase_tests {
         run_git(f.repo(), &["fetch", "-q", "origin"]);
 
         assert_eq!(
-            base_for(f.repo(), None, "local-only").as_deref(),
+            base_for(f.repo(), None, "local-only", None, None).as_deref(),
             Some("origin/main"),
             "a local-only branch has nothing to rebase onto"
         );
@@ -3441,7 +3533,13 @@ fn push_destination(refspec: &str) -> String {
 ///
 /// `None` means the branch could not be read, and pushes: a remote that
 /// cannot be asked is not a reason to strand work.
-fn has_commits_to_push(repo: &Path, refspec: &str, head_before: Option<&str>) -> bool {
+fn has_commits_to_push(
+    repo: &Path,
+    refspec: &str,
+    head_before: Option<&str>,
+    host: Option<&str>,
+    credential: Option<&SecretString>,
+) -> bool {
     let dest = push_destination(refspec);
     // No local branch named for the destination. That used to mean "this is
     // the first push of it, which creates it" — and on a **clean** tree with
@@ -3472,7 +3570,15 @@ fn has_commits_to_push(repo: &Path, refspec: &str, head_before: Option<&str>) ->
     // inventing a skip from an unreadable comparison is how work ends up
     // stranded.
     let local_has = ro_git::primitives::branch_exists(repo, &dest);
-    let remote_has = remote_branch_exists(repo, &dest);
+    let remote_has = match remote_branch_state(repo, &dest, host, credential) {
+        RemoteBranch::Exists => true,
+        RemoteBranch::Missing => false,
+        // Unanswerable is not absent: say there is work and let the push
+        // resolve the truth, the same answer the undecidable arms below
+        // give. Reading `Unknown` as `Missing` is what let a credential-
+        // blind check invent a "first push" out of an auth failure.
+        RemoteBranch::Unknown => return true,
+    };
     match (local_has, remote_has) {
         (true, true) => {
             let Some(upstream) = current_branch_upstream(repo) else {
@@ -4001,11 +4107,14 @@ mod onto_tests {
 
     // ── The "remote does not have it" warning asks the remote ────────────
     //
-    // `remote_branch_exists` read `refs/remotes/origin/<branch>`, which is
-    // the *local* remote-tracking ref. On any clone that is not a full clone
-    // the answer was "no" for a branch the remote has had for ever — so the
-    // warning claimed ro created a branch it had in fact **overwritten**,
-    // and advised `git push origin --delete <branch>` on a colleague's work.
+    // The first version of this check read `refs/remotes/origin/<branch>`
+    // alone, which is the *local* remote-tracking ref. On any clone that is
+    // not a full clone the answer was "no" for a branch the remote has had
+    // for ever — so the warning claimed ro created a branch it had in fact
+    // **overwritten**, and advised `git push origin --delete <branch>` on a
+    // colleague's work. `remote_branch_state` now asks the tracking ref
+    // first (fresh off the credentialed fetch) and falls back to an
+    // authenticated `ls-remote`, with `Unknown` never reading as `Missing`.
 
     #[test]
     fn a_branch_the_remote_has_since_before_the_clone_does_not_warn() {
@@ -4043,16 +4152,46 @@ mod onto_tests {
             "the fixture must have no tracking ref for `ancient`, or it \
              proves nothing about the local-tracking-ref question"
         );
-        assert!(
-            super::remote_branch_exists(&shallow, "ancient"),
-            "the remote DOES have `ancient`; asking the tracking refs answers no"
+        assert_eq!(
+            super::remote_branch_state(&shallow, "ancient", None, None),
+            super::RemoteBranch::Exists,
+            "the remote DOES have `ancient`; asking only the tracking refs answers no"
         );
 
-        let warnings = super::onto_created_warning(&shallow, Some("ancient"));
+        let warnings = super::onto_created_warning(&shallow, Some("ancient"), None, None);
         assert!(
             warnings.is_empty(),
             "the remote HAS `ancient`; a warning here tells the user to \
              delete a branch somebody else created: {warnings:?}"
+        );
+    }
+
+    /// An **unanswerable** remote must not read as "the branch is absent".
+    ///
+    /// This is the credential-blindness regression: the old ls-remote ran
+    /// with no credential, so every private repo answered non-zero, the
+    /// non-zero was folded into `false`, and the warning fired — advising
+    /// `git push origin --delete` on a branch that existed. `Unknown` now
+    /// suppresses the warning entirely.
+    #[test]
+    fn an_unreachable_remote_warns_about_nothing() {
+        let f = Fixture::new();
+        run_git(
+            f.repo(),
+            &["remote", "set-url", "origin", "/nonexistent/remote.git"],
+        );
+        // `anything` has no tracking ref, so the question really does reach
+        // ls-remote — and ls-remote really does fail against the dead URL.
+
+        assert_eq!(
+            super::remote_branch_state(f.repo(), "anything", None, None),
+            super::RemoteBranch::Unknown,
+            "a remote that cannot be reached must answer Unknown, not Missing"
+        );
+        let warnings = super::onto_created_warning(f.repo(), Some("anything"), None, None);
+        assert!(
+            warnings.is_empty(),
+            "no warning may be built on an unanswerable question: {warnings:?}"
         );
     }
 
