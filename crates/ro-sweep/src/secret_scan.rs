@@ -162,15 +162,145 @@ pub fn scan_text(path: &str, text: &str) -> Vec<SecretFinding> {
     out
 }
 
-/// Scan a file on disk. Binary-looking content is skipped silently.
+/// Scan a file on disk. Binary-looking content is skipped silently —
+/// **except** UTF-16/UTF-32 text, which is ~50% NUL bytes by construction
+/// and would otherwise bypass the scan entirely: a `ghp_` token in a
+/// UTF-16 file is a credential the moment it is committed, and the NUL
+/// density test cannot tell it from a PNG.
 pub fn scan_file(path: &Path) -> Result<Vec<SecretFinding>> {
     let bytes = std::fs::read(path)?;
-    if looks_binary(&bytes) {
+    let Some(text) = text_for_scan(&bytes) else {
         return Ok(Vec::new());
-    }
-    let text = String::from_utf8_lossy(&bytes);
+    };
     let label = path.to_string_lossy().to_string();
     Ok(scan_text(&label, &text))
+}
+
+/// The text a file's bytes should be scanned as, or `None` when the file
+/// is genuinely binary and there is nothing to scan.
+///
+/// Order matters. A BOM is checked **first**: UTF-32LE starts with the same
+/// two bytes as UTF-16LE (`FF FE`), so the longer signature has to win or
+/// every UTF-32 file decodes as mojibake. A BOM-less UTF-16 file is caught
+/// by the NUL-*parity* test inside [`looks_binary`]'s caller — ASCII text
+/// encoded as UTF-16 puts a NUL on exactly one byte of every pair, so the
+/// NULs are not spread through the file the way a binary's are, they sit
+/// on a lattice. Decoding that lattice back to UTF-8 is what keeps the
+/// scan honest on files Notepad and PowerShell produce without a BOM.
+fn text_for_scan(bytes: &[u8]) -> Option<String> {
+    // UTF-32 signatures before UTF-16: `FF FE 00 00` begins with the
+    // UTF-16LE BOM.
+    if bytes.starts_with(&[0xFF, 0xFE, 0x00, 0x00]) {
+        return Some(decode_utf32(bytes, Endian::Little, 4));
+    }
+    if bytes.starts_with(&[0x00, 0x00, 0xFE, 0xFF]) {
+        return Some(decode_utf32(bytes, Endian::Big, 4));
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return Some(decode_utf16(bytes, Endian::Little, 2));
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        return Some(decode_utf16(bytes, Endian::Big, 2));
+    }
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        // A UTF-8 BOM is not an encoding change; strip it and read on.
+        return Some(String::from_utf8_lossy(&bytes[3..]).into_owned());
+    }
+    if looks_binary(bytes) {
+        // No BOM. A BOM-less UTF-16 file still has its NULs on a parity
+        // lattice; anything else really is binary.
+        return bomless_utf16(bytes).map(|endian| decode_utf16(bytes, endian, 0));
+    }
+    Some(String::from_utf8_lossy(bytes).into_owned())
+}
+
+#[derive(Clone, Copy)]
+enum Endian {
+    Little,
+    Big,
+}
+
+/// Decode `bytes` as UTF-16, skipping `skip` leading bytes (the BOM).
+/// Unpaired surrogates become U+FFFD rather than aborting the scan.
+fn decode_utf16(bytes: &[u8], endian: Endian, skip: usize) -> String {
+    let body = &bytes[skip..];
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|c| match endian {
+            Endian::Little => u16::from_le_bytes([c[0], c[1]]),
+            Endian::Big => u16::from_be_bytes([c[0], c[1]]),
+        })
+        .collect();
+    char::decode_utf16(units)
+        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect()
+}
+
+/// Decode `bytes` as UTF-32. There is no `char::decode_utf32` in std, so
+/// each 4-byte unit goes through `char::from_u32`; an unpaired surrogate
+/// or out-of-range value becomes U+FFFD rather than aborting the scan —
+/// a partially-decoded file still scans the part that decoded.
+fn decode_utf32(bytes: &[u8], endian: Endian, skip: usize) -> String {
+    bytes[skip..]
+        .chunks_exact(4)
+        .map(|c| {
+            let v = match endian {
+                Endian::Little => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),
+                Endian::Big => u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
+            };
+            char::from_u32(v).unwrap_or(char::REPLACEMENT_CHARACTER)
+        })
+        .collect()
+}
+
+/// Is this BOM-less content UTF-16 text? Returns the endianness when the
+/// NUL bytes sit on one parity of the byte stream — the signature of
+/// 16-bit text — and `None` for a genuinely binary blob.
+///
+/// UTF-16LE ASCII is `[char, 0x00]` pairs, so every NUL is at an **odd**
+/// offset; UTF-16BE puts them at **even** offsets. A binary scatters its
+/// NULs across both parities. The test needs enough pairs to be sure and
+/// enough skew that coincidence cannot explain it.
+fn bomless_utf16(bytes: &[u8]) -> Option<Endian> {
+    let head = &bytes[..bytes.len().min(8000)];
+    let pairs = head.len() / 2;
+    if pairs < 64 {
+        return None;
+    }
+    let mut nul_even = 0usize;
+    let mut nul_odd = 0usize;
+    for i in 0..pairs {
+        if head[2 * i] == 0 {
+            nul_even += 1;
+        }
+        if head[2 * i + 1] == 0 {
+            nul_odd += 1;
+        }
+    }
+    let total = nul_even + nul_odd;
+    // Fewer than ~10% NULs is not the UTF-16 signature at all.
+    if total * 10 <= head.len() {
+        return None;
+    }
+    // One parity must hold essentially all of them. 85% leaves room for
+    // the occasional NUL inside a multi-byte character while still
+    // rejecting a binary, whose NULs split roughly evenly.
+    let dominant = nul_even.max(nul_odd);
+    if dominant * 20 < total * 17 {
+        return None;
+    }
+    // The *other* byte of each pair should mostly be non-NUL text. If both
+    // parities are NUL-dense the file is zeros, not text.
+    let sparse = nul_even.min(nul_odd);
+    if sparse * 4 > pairs {
+        return None;
+    }
+    // NULs on odd offsets means the high byte is zero → little-endian.
+    Some(if nul_odd > nul_even {
+        Endian::Little
+    } else {
+        Endian::Big
+    })
 }
 
 /// Scan multiple files and aggregate findings.
@@ -325,6 +455,104 @@ mod tests {
         assert!(
             f.iter().any(|x| x.rule == "github_token"),
             "a NUL byte must not disable the scan; findings were: {f:?}"
+        );
+    }
+
+    /// Encode `s` as UTF-16LE/BE bytes, with or without a BOM.
+    fn utf16_bytes(s: &str, endian: Endian, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            match endian {
+                Endian::Little => out.extend_from_slice(&[0xFF, 0xFE]),
+                Endian::Big => out.extend_from_slice(&[0xFE, 0xFF]),
+            }
+        }
+        for u in s.encode_utf16() {
+            match endian {
+                Endian::Little => out.extend_from_slice(&u.to_le_bytes()),
+                Endian::Big => out.extend_from_slice(&u.to_be_bytes()),
+            }
+        }
+        out
+    }
+
+    /// The bypass this fix exists for: UTF-16 text is ~50% NUL bytes, the
+    /// binary heuristic skipped it whole, and a `ghp_` token inside
+    /// committed and pushed clean. Both BOM and BOM-less spellings, both
+    /// endiannesses.
+    #[test]
+    fn a_secret_in_utf16_is_found() {
+        let tmp = TempDir::new().unwrap();
+        let token = "token = \"ghp_ZZZsecretZZZ1234567890ABCDEFGHIJKLMNOP\"";
+        for (name, endian, bom) in [
+            ("le_bom", Endian::Little, true),
+            ("le_nobom", Endian::Little, false),
+            ("be_bom", Endian::Big, true),
+            ("be_nobom", Endian::Big, false),
+        ] {
+            let p = tmp.path().join(format!("creds_{name}.txt"));
+            // Pad past the 64-pair minimum the BOM-less heuristic needs.
+            let body = format!("{token}\n{}", "x".repeat(400));
+            std::fs::write(&p, utf16_bytes(&body, endian, bom)).unwrap();
+            let f = scan_file(&p).unwrap();
+            assert!(
+                f.iter().any(|x| x.rule == "github_token"),
+                "{name}: a ghp_ token in UTF-16 must be found, got {f:?}"
+            );
+        }
+    }
+
+    /// UTF-32LE's BOM begins with the UTF-16LE BOM's two bytes; the longer
+    /// signature has to win or the file decodes as mojibake.
+    #[test]
+    fn a_secret_in_utf32le_is_found() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("creds32.txt");
+        let body = format!(
+            "token = \"ghp_ZZZsecretZZZ1234567890ABCDEFGHIJKLMNOP\"\n{}",
+            "x".repeat(400)
+        );
+        let mut bytes = vec![0xFF, 0xFE, 0x00, 0x00];
+        for c in body.chars() {
+            bytes.extend_from_slice(&(c as u32).to_le_bytes());
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let f = scan_file(&p).unwrap();
+        assert!(
+            f.iter().any(|x| x.rule == "github_token"),
+            "a ghp_ token in UTF-32LE must be found, got {f:?}"
+        );
+    }
+
+    /// The negative control: a real binary is still skipped. NULs spread
+    /// across both parities, which is exactly what the UTF-16 lattice test
+    /// rejects.
+    #[test]
+    fn a_real_binary_is_still_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("blob.bin");
+        // Deterministic bytes, NUL-dense on **both** parities — the shape a
+        // real binary has and the UTF-16 lattice test exists to reject.
+        // (Uniformly random bytes are only ~0.4% NUL and never reach the
+        // binary branch at all.)
+        let mut bytes = Vec::new();
+        let mut x = 0x1234_5678u32;
+        for i in 0..2048usize {
+            if i % 5 < 2 {
+                bytes.extend_from_slice(&[0, 0]);
+            } else {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                let b = x.to_le_bytes();
+                bytes.extend_from_slice(&[b[0] | 1, b[1] | 1]);
+            }
+        }
+        std::fs::write(&p, &bytes).unwrap();
+        let f = scan_file(&p).unwrap();
+        assert!(
+            f.is_empty(),
+            "a binary blob must not produce findings: {f:?}"
         );
     }
 
