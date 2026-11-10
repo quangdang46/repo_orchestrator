@@ -29,7 +29,6 @@ ro-sweep.workspace = true
 # workspace registration, per the bead.
 ro-engine.workspace = true
 clap.workspace = true
-tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true

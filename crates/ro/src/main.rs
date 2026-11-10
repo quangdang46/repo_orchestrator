@@ -789,6 +789,36 @@ fn resolve_paths(cli: &Cli) -> Result<ConfigPaths> {
 }
 
 fn main() {
+    // A closed pipe is not a crash. Rust ignores SIGPIPE, so `ro tags |
+    // head -0` fails the next `println!` with EPIPE and std panics —
+    // "failed printing to stdout: Broken pipe" — which used to surface as
+    // a panic message and exit 101 for what is an ordinary end of stream.
+    // Every `print!`/`println!`/`eprintln!` in the binary funnels through
+    // this one hook, so handling it here covers `tags`, `list`, `status`,
+    // ndjson streams and anything added later, rather than fixing one
+    // call site and leaving the rest.
+    //
+    // Exit 0, not a signal: the consumer asked for less output than ro
+    // had, which is their decision, and `head` exits 0 too. The default
+    // hook still runs for every other panic.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let is_pipe = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.contains("failed printing to"))
+            .unwrap_or(false)
+            || info
+                .payload()
+                .downcast_ref::<String>()
+                .map(|s| s.contains("failed printing to"))
+                .unwrap_or(false);
+        if is_pipe {
+            std::process::exit(0);
+        }
+        previous(info);
+    }));
+
     if let Err(err) = run() {
         // A fatal is its own code. Exiting 1 here reported a config file
         // that will not parse as "some repos succeeded", which is worse
@@ -1244,10 +1274,19 @@ fn run() -> Result<()> {
             // code the removal below reports it as. A typo must not read as
             // a broken installation, and it must not read as one on the
             // `--delete` path and not on the other.
-            let target = ro_sync::manage::find_repo(&conn, &key).map_err(|e| {
+            let mut target = ro_sync::manage::find_repo(&conn, &key).map_err(|e| {
                 eprintln!("error: {e:#}");
                 std::process::exit(exit::EX_USAGE as i32);
             })?;
+            // The row's `clone_url` is a cache of the checkout's `origin`,
+            // and caches go stale: a local `ro add` stores "" until a
+            // remote exists, and an origin added afterwards — or a URL an
+            // older ro fabricated — would otherwise make the origin check
+            // below refuse a checkout that *is* this repo. Reconcile first,
+            // so the comparison is against what the filesystem says now.
+            if let Ok(Some(url)) = ro_sync::manage::reconcile_clone_url(&conn, &target) {
+                target.clone_url = url;
+            }
 
             if delete {
                 let path = std::path::PathBuf::from(&target.local_path);
@@ -2084,13 +2123,38 @@ fn run() -> Result<()> {
         Commands::Untag { repo, tags } => {
             let conn = ro_state::open_db(&db_path)
                 .map_err(|e| exit::FatalError::new(format!("opening state database: {e}")))?;
+            // Which of the requested tags were actually there, read
+            // **before** the delete: afterwards a removed tag and a
+            // never-present one look identical, and "no such tag" has to
+            // name the second kind only.
+            let before = ro_sync::tags::of(&conn, &repo).map_err(usage_for_tag_verb)?;
             let removed = ro_sync::tags::remove(&conn, &repo, &tags).map_err(usage_for_tag_verb)?;
             let now = ro_sync::tags::of(&conn, &repo)?;
+            let missing: Vec<&str> = tags
+                .iter()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty() && !before.iter().any(|b| b == t))
+                .collect();
             if removed == 0 {
-                println!("{repo}: no such tag ({})", now.join(", "));
-            } else {
-                println!("{repo}: removed {removed} ({})", now.join(", "));
+                // Nothing was there to remove. A typo'd tag name used to
+                // print "no such tag" and exit 0 — indistinguishable from
+                // success in a script. It is a usage error: the command
+                // cannot do what it was asked.
+                eprintln!(
+                    "{repo}: no such tag(s): {} (has: {})",
+                    missing.join(", "),
+                    if now.is_empty() {
+                        "none".to_string()
+                    } else {
+                        now.join(", ")
+                    }
+                );
+                std::process::exit(exit::EX_USAGE as i32);
             }
+            if !missing.is_empty() {
+                eprintln!("warning: {repo}: no such tag(s): {}", missing.join(", "));
+            }
+            println!("{repo}: removed {removed} ({})", now.join(", "));
         }
 
         Commands::Tags { repo } => {

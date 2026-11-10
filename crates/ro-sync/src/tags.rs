@@ -9,9 +9,11 @@
 //! # "Make it so" is idempotent, deliberately
 //!
 //! `tag` twice is a no-op at exit 0. `untag` something that is not there
-//! is also a no-op at exit 0. An error here would make shell loops and
-//! scripts awkward for no gain — the user asked for a state, not for a
-//! ceremony, and the row is already in the state they asked for.
+//! is **not** silent: the CLI reports which requested tags were absent
+//! and exits `EX_USAGE` when nothing at all was removed — a typo'd tag
+//! name must not read as success in a script. A *partial* miss warns on
+//! stderr and still exits 0, because the state change the user asked for
+//! did happen.
 //!
 //! # A group is a tag
 //!

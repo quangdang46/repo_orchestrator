@@ -464,12 +464,27 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
 
     // Parse the value as TOML so `4` becomes an integer and `true` a boolean,
     // rather than every assignment landing as a string the schema then rejects.
-    let value: toml_edit::Value = raw_value.parse().map_err(|e| {
-        anyhow::anyhow!(UnwritableSetting(format!(
-            "{raw_value:?} is not a valid TOML value: {e}"
-        )))
-    })?;
-    table.insert(leaf, toml_edit::value(value));
+    //
+    // A bare word is not TOML — but for a **string-typed** key it is exactly
+    // what the user meant: `ro config set agent.engine codex` should write
+    // `engine = "codex"`, not fail on a technicality. The fallback writes the
+    // value quoted, and only when the schema proves the field takes a string
+    // *and* accepts this value — so `core.parallel abc` and `core.layout bogus`
+    // still fail, and a value containing a newline can never smuggle extra
+    // TOML into the file.
+    let item = match raw_value.parse::<toml_edit::Value>() {
+        Ok(v) => toml_edit::value(v),
+        Err(_) => {
+            if !key_takes_bare_string(dotted_key, raw_value) {
+                return Err(anyhow::anyhow!(UnwritableSetting(format!(
+                    "{raw_value:?} is not a valid TOML value, and {dotted_key:?} \
+                     does not take a bare string"
+                ))));
+            }
+            toml_edit::value(raw_value)
+        }
+    };
+    table.insert(leaf, item);
 
     let updated = doc.to_string();
 
@@ -488,6 +503,39 @@ pub fn set_key_in_file(path: &Path, dotted_key: &str, raw_value: &str) -> Result
     std::fs::write(path, &updated)
         .with_context(|| format!("writing config to {}", path.display()))?;
     Ok(())
+}
+
+/// May `raw` be written as a **string** for `dotted_key`?
+///
+/// The probe is the schema itself: build `{key} = "<raw>"` as a TOML
+/// document and ask whether `AppConfig` accepts it. A numeric, boolean
+/// or list field rejects the string; a `String`/`Option<String>` — and a
+/// validated string like `CredentialRef` — accepts it only when the value
+/// is one the field would take. Both halves matter: `core.parallel abc`
+/// fails the type check, and `auth.https notaurl` fails the value check,
+/// so neither reaches the file.
+///
+/// The literal is escaped by hand because the probe must be a *valid*
+/// TOML document or the answer is "no" for the wrong reason. A value
+/// containing a newline or carriage return is refused outright — it is
+/// the one input that could turn a quoted string back into extra TOML.
+fn key_takes_bare_string(dotted_key: &str, raw: &str) -> bool {
+    if raw.contains('\n') || raw.contains('\r') {
+        return false;
+    }
+    let mut literal = String::with_capacity(raw.len() + 2);
+    literal.push('"');
+    for c in raw.chars() {
+        match c {
+            '"' => literal.push_str("\\\""),
+            '\\' => literal.push_str("\\\\"),
+            c if (c as u32) < 0x20 => literal.push_str(&format!("\\u{:04X}", c as u32)),
+            c => literal.push(c),
+        }
+    }
+    literal.push('"');
+    let probe = format!("{dotted_key} = {literal}\n");
+    toml::from_str::<AppConfig>(&probe).is_ok()
 }
 
 /// Write the shipped default config to `path`, creating parent
@@ -1253,5 +1301,56 @@ bin = \"claude\"
             "plain `ro doctor` stays silent about an unrecognised table, so \
              the note must not promise it: {note}"
         );
+    }
+
+    // ── Bare strings for string-typed keys ──────────────────────────────
+
+    /// `ro config set agent.engine codex` is the invocation a user
+    /// actually types. A bare word is not TOML, but for a string key it
+    /// is unambiguous — the value lands quoted, and the file round-trips.
+    #[test]
+    fn a_bare_word_lands_as_a_string_for_a_string_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        set_key_in_file(&path, "agent.engine", "codex").unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("engine = \"codex\""),
+            "the bare word must be written quoted: {raw}"
+        );
+        let cfg: AppConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(cfg.agent.engine.as_deref(), Some("codex"));
+    }
+
+    /// The fallback is keyed on the schema, not on "it looks like a word":
+    /// a non-string key rejects the same input, and a string key rejects a
+    /// value its own validation refuses.
+    #[test]
+    fn a_bare_word_is_refused_where_no_string_belongs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, default_config_toml()).unwrap();
+
+        assert!(set_key_in_file(&path, "core.parallel", "abc").is_err());
+        // `auth.https` is a string key, but `notaurl` is not a CredentialRef.
+        assert!(set_key_in_file(&path, "auth.https", "notaurl").is_err());
+        // …while a valid reference, still bare, is accepted.
+        set_key_in_file(&path, "auth.https", "env:GH_TOKEN").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("https = \"env:GH_TOKEN\""), "got: {raw}");
+    }
+
+    /// A newline in the "bare" value is the one input that could turn a
+    /// quoted string back into extra TOML. It is refused before the probe.
+    #[test]
+    fn a_bare_string_with_a_newline_is_refused() {
+        assert!(!key_takes_bare_string("agent.engine", "codex\n[core]"));
+        assert!(!key_takes_bare_string(
+            "agent.engine",
+            "codex\r\nmalicious = 1"
+        ));
     }
 }

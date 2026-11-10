@@ -111,6 +111,12 @@ owner and the name come from the directory layout — `~/projects/<owner>/
 <name>` — so the directory alone cannot tell two copies of one remote
 apart. A fork is a different remote and stays a different repository.
 
+A checkout with **no `origin`** is stored with an empty clone URL — ro does
+not invent a GitHub URL from the directory layout. When an `origin` is
+added later, `ro status` (and `ro remove` itself) reconciles the row with
+what the checkout actually says, so `ro remove --delete` is not refused by
+a URL that was never real.
+
 ### `ro remove <KEY>`
 Stop tracking a repo. Cascades through dependent rows so the foreign keys stay
 consistent. `--delete` also removes the working copy on disk; that is gated
@@ -138,10 +144,10 @@ ro tags                         # every tag, with how many repos carry it
 ro tags cass                    # one repo's tags
 ```
 
-Tagging twice is a no-op and removing a tag that was never there is a no-op,
-both at exit 0. "Make it so" is idempotent; the row is already in the state
-you asked for, and an error would only make shell loops awkward. The count is
-printed either way, so a run that changed nothing still says so.
+Tagging twice is a no-op at exit 0. `untag` is pickier: removing a tag that
+was never there exits `64` (usage) when *nothing* was removed — a typo'd tag
+name must not read as success in a script — and warns on stderr while still
+exiting 0 when only some of the requested tags were missing.
 
 `ro add --tag` sets tags at enrolment. These three verbs are everything
 after that — re-tagging a repo, and taking a tag off, which is the half that
@@ -334,13 +340,15 @@ does not move the exit code.
 `ro config` prints every setting; `ro config set KEY=VALUE` changes one.
 `ro config print` is the same read, spelled as a subcommand.
 
-**The value is parsed as TOML, not as a string.** `ro config set
-agent.engine=codex` fails with `"codex" is not a valid TOML value`, because an
-unquoted bare word is not a TOML value. Quote anything that is meant to be a
-string:
+**The value is parsed as TOML, with a string fallback for string-typed
+keys.** `ro config set agent.engine=codex` writes `engine = "codex"` —
+when the key's schema type is a string, a bare word is taken as that
+string. Keys whose type is not a string still demand real TOML:
+`core.parallel=abc` is refused, because `abc` is not an integer. Quote
+anything ambiguous:
 
 ```bash
-ro config set 'agent.engine="codex"'   # a string
+ro config set 'agent.engine="codex"'   # a string, quotes optional here
 ro config set core.parallel=4          # an integer
 ro config set 'identity.work.name="Alice"'
 ```
@@ -352,14 +360,15 @@ script provisioning a box does not have to know this version's key space.
 Per-repo settings go to the registry, not the file: `ro config set
 repos.<name>.<key>=<value>` writes the row in `state.db`.
 
-**`[identity]` and `[agent]` are the tables that do something today.**
-`[core]`'s `layout`, `parallel`, `projects_dir` and `timeout_secs`, and
-`[github]`'s `host` and `auth`, are parsed, validated, printed by
-`ro config`, and accepted by `ro config set` — but nothing in the binary reads
-them. A clone lands under `$STATE_DIR/projects/<owner>/<name>` no matter what
-`core.projects_dir` says, `ro ship` fans out four ways regardless of
-`core.parallel`, and the network timeout comes from `ro sync --timeout`, not
-from `core.timeout_secs`. Setting them succeeds and changes nothing.
+**`[identity]` and `[agent]` are the tables that shape what ro *does*;
+`[core]` and `[github]` shape where and how.** `core.projects_dir` and
+`core.layout` choose where `ro add` puts a clone, `core.parallel` is the
+fleet fan-out width, `core.timeout_secs` is the default per-command
+timeout, and `github.host`/`github.auth` pick the forge and the
+credential strategy `ro doctor` probes. A clone still lands under
+`$STATE_DIR/projects/<owner>/<name>` until `core.projects_dir` says
+otherwise — the shipped default means "unchanged", so an existing
+install is not silently relocated on upgrade.
 
 ### `ro schema`
 Machine-readable CLI reference as JSON, for driving `ro` from an agent instead of

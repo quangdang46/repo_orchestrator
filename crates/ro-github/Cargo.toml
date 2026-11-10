@@ -17,8 +17,5 @@ serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-chrono.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
-wiremock.workspace = true

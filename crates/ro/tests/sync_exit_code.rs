@@ -173,6 +173,10 @@ fn register(t: &Test, path: &std::path::Path) -> String {
 }
 
 /// A run that produced a conflict must exit non-zero.
+///
+/// One repo, one conflict: every selected repo failed, so this is the
+/// all-failed code 2 on the shared fleet table — the same verdict `ro
+/// ship` reports when nothing lands.
 #[test]
 fn a_conflicting_sync_exits_nonzero() {
     let t = Test::initialised();
@@ -182,7 +186,7 @@ fn a_conflicting_sync_exits_nonzero() {
     t.cmd()
         .args(["sync", "--strategy", "rebase", &label])
         .assert()
-        .code(1)
+        .code(2)
         .stdout(predicate::str::contains("status=conflict"));
 }
 

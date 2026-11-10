@@ -216,8 +216,11 @@ fn a_malformed_config_set_argument_exits_usage() {
 fn a_config_set_that_names_nothing_is_a_usage_error() {
     let t = Test::initialised();
     for args in [
-        // A bare word is not a TOML value.
-        vec!["config", "set", "agent.engine=codex"],
+        // A bare word is not a TOML value, and `parallel` is not a string
+        // key — the bare-string fallback only applies where the schema
+        // says a string belongs. (`agent.engine=codex` *is* accepted now;
+        // see the bare-string test below.)
+        vec!["config", "set", "core.parallel=abc"],
         // A key ro does not read.
         vec!["config", "set", "core.paralel=4"],
         // A setting ro no longer reads.

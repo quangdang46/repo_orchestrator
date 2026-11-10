@@ -167,6 +167,15 @@ pub fn init(paths: &ConfigPaths) -> Result<bool> {
     if !db_path.exists() {
         let _conn = ro_state::open_db(&db_path)?;
         created = true;
+    } else {
+        // An existing file is not proof of a working database. `init`
+        // used to report "already initialized" on a corrupt `state.db`
+        // without ever opening it, so the first real failure surfaced
+        // three verbs later as an unrelated error. Open it here: a file
+        // SQLite cannot read is reported at the command whose whole job
+        // is to make the state directory trustworthy.
+        ro_state::open_db(&db_path)
+            .with_context(|| format!("state database at {} is not readable", db_path.display()))?;
     }
 
     Ok(created)
@@ -498,14 +507,22 @@ pub fn add_from_input(
                     )
                 }
             };
-            let outcome = ro_git::mutation::clone_with_credential(
+            let outcome = match ro_git::mutation::clone_with_credential(
                 &spec.clone_url,
                 &dest,
                 &clone_opts,
                 extraheader_host(&spec.clone_url).as_deref(),
                 credential.as_ref(),
-            )
-            .map_err(|e| anyhow::anyhow!("cloning {} failed: {e}", spec.clone_url))?;
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    // `clone` already removed `dest` itself; the parent
+                    // directories it created (`projects/<owner>`) are
+                    // still litter, so sweep those too.
+                    remove_clone_leftovers(&dest, projects_dir);
+                    return Err(anyhow::anyhow!("cloning {} failed: {e}", spec.clone_url));
+                }
+            };
 
             // `clone` reports a non-zero git exit in the outcome rather than as
             // an Err — it did run, and the process it ran produced a result.
@@ -515,7 +532,7 @@ pub fn add_from_input(
             if !outcome.result.ok() {
                 // Clean up after ourselves: a failed clone that leaves a
                 // half-written directory behind is the same trap one level down.
-                let _ = std::fs::remove_dir_all(&dest);
+                remove_clone_leftovers(&dest, projects_dir);
                 bail!(
                     "cloning {} failed: {}",
                     spec.clone_url,
@@ -536,7 +553,7 @@ pub fn add_from_input(
             match register(conn, &spec, &dest.to_string_lossy(), opts) {
                 Ok(repo) => Ok(repo),
                 Err(e) => {
-                    let _ = std::fs::remove_dir_all(&dest);
+                    remove_clone_leftovers(&dest, projects_dir);
                     Err(e)
                 }
             }
@@ -545,7 +562,10 @@ pub fn add_from_input(
             let remote = git_remote_url(&path)?;
 
             // The same **repository** must not be enrolled twice, whatever
-            // directory it is checked out in.
+            // directory it is checked out in. A checkout with no `origin`
+            // has no repository identity to compare, so two of them are
+            // simply two local repos — `tracked_by_remote` answers `None`
+            // for an empty URL.
             //
             // The row's identity is `(host, owner, name)`, and for an
             // adopted checkout the owner and the name come from the
@@ -565,9 +585,11 @@ pub fn add_from_input(
             // repository. A fork is a different URL and stays a different
             // repository, which is right: a fork is a different thing to
             // push to.
-            if let Some(existing) = tracked_by_remote(conn, &remote) {
+            if let Some(url) = &remote
+                && let Some(existing) = tracked_by_remote(conn, url)
+            {
                 bail!(
-                    "the remote {remote} is already tracked as {}/{} (id={}). \\
+                    "the remote {url} is already tracked as {}/{} (id={}). \\
                      `ro remove` it first if you want to enrol this checkout.",
                     existing.owner,
                     existing.name,
@@ -575,16 +597,51 @@ pub fn add_from_input(
                 );
             }
 
+            // `host` is identity metadata: read it off the real remote
+            // when there is one, and fall back to the public host for a
+            // local-only checkout (there is no better answer — the row
+            // is not claiming to be on any particular forge).
+            let host = remote
+                .as_deref()
+                .and_then(|u| RepoSpec::parse(u).ok())
+                .map(|s| s.host)
+                .unwrap_or_else(|| "github.com".to_string());
             let spec = RepoSpec {
-                host: "github.com".to_string(),
+                host,
                 owner,
                 name,
                 branch: None,
                 alias: opts.name.clone(),
-                clone_url: remote,
+                clone_url: remote.unwrap_or_default(),
             };
             register(conn, &spec, &path.to_string_lossy(), opts)
         }
+    }
+}
+
+/// Remove what a failed clone left behind: the destination, then any
+/// ancestor directories emptied by that removal, stopping at `boundary`
+/// (which is never itself removed).
+///
+/// `git clone` creates `dest` **and** its parents — `projects/<owner>`
+/// under the nested layout — so removing only `dest` leaves an empty
+/// `<owner>` directory that looks like a tracked fleet member to anyone
+/// browsing the projects dir. `remove_dir` fails on a non-empty
+/// directory, so the walk stops at the first ancestor that still holds
+/// something; nothing outside `boundary` is ever touched, and a
+/// `--clone-to` destination outside the projects dir simply gets `dest`
+/// removed and no ancestor walk at all.
+pub fn remove_clone_leftovers(dest: &Path, boundary: &Path) {
+    let _ = std::fs::remove_dir_all(dest);
+    let mut dir = dest.parent();
+    while let Some(d) = dir {
+        if d == boundary || !d.starts_with(boundary) {
+            break;
+        }
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
     }
 }
 
@@ -604,33 +661,85 @@ fn tracked_by_remote(conn: &Connection, remote: &str) -> Option<TrackedRepo> {
         .find(|r| ro_core::repo_spec::normalize_remote_url(&r.clone_url) == normalised)
 }
 
-/// The origin URL of a local checkout, or a synthesised one.
+/// The origin URL of a local checkout, or `None` when it has no remote.
 ///
 /// A checkout with no remote is an ordinary state — a repo you have not
-/// pushed — so that case must not fail, and the synthesised value is a
-/// real, correct GitHub URL when the layout is the conventional one.
+/// pushed — so that case must not fail, and it stores an **empty**
+/// `clone_url` rather than a synthesised one. The old code invented
+/// `https://github.com/<parent>/<name>.git` from the directory layout:
+/// a URL that names a repository which may not exist, on a row whose
+/// whole purpose is to point at the real remote. It surfaced as a clone
+/// error against a repository nobody created, and it blocked
+/// `ro remove --delete`, which compares the checkout's real origin
+/// against the row's `clone_url` and (correctly) refused the mismatch.
+///
+/// When the user later adds an `origin`, [`reconcile_clone_url`] brings
+/// the row back in line — called from `ro status` and from `ro remove`
+/// itself, so the stored URL is never stale for long.
 ///
 /// A *failed* query is the other case, and it does fail. `remote_url`
-/// returns `Err` when it could not run at all, and answering that with a
-/// synthesised URL would store a `clone_url` nobody has ever seen, on a
-/// row whose whole purpose is to point at the real remote. A wrong
-/// `clone_url` surfaces much later as a clone error against a repository
-/// that does not exist — exactly the "a green row over an unmeasured
-/// fact" shape this bead exists to remove.
-fn git_remote_url(path: &Path) -> Result<String> {
-    if let Some(url) = ro_git::read::remote_url(path, "origin")? {
-        return Ok(url);
+/// returns `Err` when it could not run at all, and answering that with an
+/// empty URL would store "no remote" on a checkout that has one — the
+/// same "green row over an unmeasured fact" shape, pointed the other way.
+fn git_remote_url(path: &Path) -> Result<Option<String>> {
+    ro_git::read::remote_url(path, "origin")
+}
+
+/// Fill in a row's `clone_url` from the checkout's `origin` — **only**
+/// when the row has none.
+///
+/// Returns the URL now stored when it changed, `None` otherwise. The
+/// rule is deliberately narrow: a non-empty `clone_url` is a recorded
+/// fact about where this repo was enrolled from, and the checkout's
+/// current `origin` is *evidence about the checkout*, not permission to
+/// rewrite the row. A remote the user repointed after enrolment is a
+/// real difference — `ro remove --delete` is supposed to notice it —
+/// and reconciling it away would delete a working copy whose remote is
+/// no longer the one the row describes.
+///
+/// The one case that needs healing is the empty string: `ro add <path>`
+/// on a checkout with no `origin` stores "" rather than inventing a
+/// GitHub URL, and an origin added afterwards leaves the row claiming
+/// "no remote" forever. `ro status` and `ro remove` call this so the
+/// stored URL is never stale for long. A checkout that cannot be read
+/// is not evidence the URL is wrong, so errors leave the row alone.
+pub fn reconcile_clone_url(conn: &Connection, repo: &TrackedRepo) -> Result<Option<String>> {
+    if !repo.clone_url.trim().is_empty() {
+        return Ok(None);
     }
-    let owner = path
+    let path = Path::new(&repo.local_path);
+    if !path.join(".git").exists() {
+        return Ok(None);
+    }
+    // The row's `owner`/`name` were read off this path's layout at enrolment
+    // (`<owner>/<name>`), so a `local_path` that no longer ends in that
+    // shape is a repointed row — possibly a corrupted one — and the
+    // checkout it now names is not evidence about the repo the row
+    // describes. Without this check a corrupted row could point at any
+    // git checkout, inherit *its* origin as the row's `clone_url`, and
+    // then pass the `remove --delete` origin gate it exists to fail.
+    let basename_matches = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(&repo.name));
+    let parent_matches = path
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown");
-    Ok(format!("https://github.com/{owner}/{name}.git"))
+        .is_some_and(|n| n.eq_ignore_ascii_case(&repo.owner));
+    if !basename_matches || !parent_matches {
+        return Ok(None);
+    }
+    let remote = match ro_git::read::remote_url(path, "origin") {
+        Ok(Some(url)) if !url.trim().is_empty() => url,
+        _ => return Ok(None),
+    };
+    conn.execute(
+        "UPDATE repos SET clone_url = ?1, updated_at = ?2 WHERE id = ?3",
+        params![remote, now_secs(), repo.id],
+    )
+    .context("reconciling clone_url")?;
+    Ok(Some(remote))
 }
 
 /// Is this repository already tracked?

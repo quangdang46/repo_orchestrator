@@ -203,6 +203,20 @@ pub fn status_repo_with(conn: &Connection, repo_id: &str, fetch_first: bool) -> 
 
     let (owner, name, tracked_branch, local_path) = row;
     let path = std::path::PathBuf::from(&local_path);
+
+    // The row's `clone_url` follows the checkout's `origin`. A local add
+    // stores "" until a remote exists, and an origin added afterwards
+    // leaves the row claiming "no remote" forever. `status` is that
+    // something: reconcile here so `ro remove --delete`, which compares
+    // the real origin against this column, is not refused by a row that
+    // predates the origin. Only an *empty* stored URL is filled — a
+    // non-empty one is a recorded fact, and a checkout whose origin was
+    // repointed is exactly the mismatch the delete gate exists to catch.
+    // Best-effort: an unreadable checkout is not evidence the stored URL
+    // is wrong.
+    if let Ok(tracked) = crate::manage::find_repo(conn, repo_id) {
+        let _ = crate::manage::reconcile_clone_url(conn, &tracked);
+    }
     // The URL the credential is scoped to. Read here rather than inside the
     // `if fetch_first` block so the row shape above stays the single place
     // this query is written.

@@ -1144,6 +1144,12 @@ fn sync_repo_inner(
         match ro_git::mutation::clone_in(&repo.clone_url, local, &clone_opts, &clone_run) {
             Ok(outcome) => {
                 if !outcome.result.ok() {
+                    // A clone that ran and failed leaves the same litter
+                    // a killed one does: `.git` exists, the objects do
+                    // not, and every later sync reads the row as "already
+                    // cloned". Remove the destination and any parent
+                    // directories it created, bounded by the state dir.
+                    crate::manage::remove_clone_leftovers(local, &opts.state_dir);
                     let duration = start.elapsed().as_millis() as u64;
                     let err_msg = outcome.result.stderr.trim().to_string();
                     return Ok(SyncResult {
@@ -1181,6 +1187,9 @@ fn sync_repo_inner(
                 })
             }
             Err(e) => {
+                // `clone_in` removes `local` itself on a spawn/timeout
+                // error; the parent directories are still litter.
+                crate::manage::remove_clone_leftovers(local, &opts.state_dir);
                 let duration = start.elapsed().as_millis() as u64;
                 let err_msg = format!("{e:#}");
                 Ok(SyncResult {
@@ -1750,16 +1759,26 @@ fn sync_all_observed(
     Ok(results)
 }
 
-/// The process exit code for a finished sync run: 0 when every repo is in a
-/// state the user asked for or was deliberately not touched, 1 otherwise.
+/// The process exit code for a finished sync run, on the same table the
+/// fleet verbs use (`crates/ro/src/exit.rs`): 0 when every repo is in a
+/// state the user asked for or was deliberately not touched, 1 when some
+/// failed and some did not, **2 when every repo failed**.
 ///
-/// Public because the CLI has to print this same number, and a caller that
-/// had to re-derive the rule would be a second place for it to go stale.
+/// The all-failed code used to collapse into 1, which is the
+/// inconsistency this fixes: `ro ship` reports 2 for a fleet where
+/// nothing landed, and `ro sync` reported 1 for the same fact — two
+/// numbers for one verdict, and a script keying on the fleet table read
+/// a total sync failure as a partial one.
 pub fn run_exit_code(results: &[SyncResult]) -> i32 {
-    if results.iter().any(|r| status_fails_run(&r.status)) {
-        1
-    } else {
-        0
+    let failed = results
+        .iter()
+        .filter(|r| status_fails_run(&r.status))
+        .count();
+    let succeeded = results.len() - failed;
+    match (failed, succeeded) {
+        (0, _) => 0,
+        (_, 0) => 2,
+        _ => 1,
     }
 }
 
@@ -4187,18 +4206,30 @@ mod run_exit_code_tests {
     }
 
     /// The bug, as a unit test: the conflict is a failure, and it is not the
-    /// string `error`.
+    /// string `error`. A fleet where it is the *only* outcome is all-failed,
+    /// which is exit 2 on the shared table — not the partial code.
     #[test]
     fn an_autostash_conflict_fails_the_run() {
         assert_eq!(
             run_exit_code(&[result(STATUS_AUTOSTASH_CONFLICT)]),
-            1,
-            "a run whose only bad repo is an autostash conflict must not exit 0"
+            2,
+            "a run whose only bad repo is an autostash conflict is all-failed"
         );
         assert_eq!(
             run_exit_code(&[result(STATUS_ERROR)]),
-            1,
+            2,
             "an error fails the run"
+        );
+    }
+
+    /// One success among failures is partial, not total — the same 0/1/2
+    /// split `ro ship` reports.
+    #[test]
+    fn one_success_among_failures_is_partial() {
+        assert_eq!(
+            run_exit_code(&[result(STATUS_ERROR), result(STATUS_SUCCESS)]),
+            1,
+            "a mixed fleet is partial, not all-failed"
         );
     }
 
@@ -4264,8 +4295,9 @@ mod run_exit_code_tests {
         );
         assert_eq!(
             run_exit_code(&[result(STATUS_CONFLICT)]),
-            1,
-            "a run whose only bad repo is a conflicted pull must not exit 0"
+            2,
+            "a run whose only bad repo is a conflicted pull is all-failed, \
+             not partial — the shared fleet table's code for that is 2"
         );
         // And it is still distinguishable from an autostash conflict, which
         // is the whole reason it is not filed as `error`.
@@ -4283,8 +4315,9 @@ mod run_exit_code_tests {
     fn an_unclassified_status_fails_the_run_rather_than_passing() {
         assert_eq!(
             run_exit_code(&[result("some_future_status")]),
-            1,
-            "an unknown status must not be treated as success by default"
+            2,
+            "an unknown status must not be treated as success by default; \
+             a fleet of nothing but it is all-failed"
         );
     }
 
@@ -4353,9 +4386,9 @@ mod run_exit_code_tests {
             )
             .unwrap();
         assert_eq!(
-            recorded, 1,
-            "a run whose results hold an autostash conflict must not be \
-             recorded with exit_code 0 — that is the lie, in the table"
+            recorded, 2,
+            "a run whose results hold an autostash conflict is all-failed \
+             and must be recorded with exit_code 2 — 0 is the lie, in the table"
         );
 
         // And the per-repo row says what happened, so the two are readable
@@ -5091,9 +5124,9 @@ mod wedged_remote {
         );
         assert_eq!(
             run_exit_code(&results),
-            1,
-            "the run fails because the repo could not be synced, not because the \
-             preview was wrong"
+            2,
+            "the run fails because the repo could not be synced — and with \
+             one repo selected, that failure is the whole run"
         );
     }
 }
