@@ -1,6 +1,6 @@
 [package]
 name = "ro-sync"
-description = "Sync, status, prune, import, add, remove, list commands"
+description = "Sync, status, import, add, remove, list commands"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true

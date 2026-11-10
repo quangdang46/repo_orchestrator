@@ -266,8 +266,8 @@ pub enum AddSource {
     Remote(RepoSpec),
     /// An existing checkout on disk: adopt it where it already is.
     Local {
-        /// Canonicalized, so the stored `local_path` compares equal to whatever
-        /// the walker in `prune` produces later.
+        /// Canonicalized, so the stored `local_path` is the form every
+        /// later lookup of this checkout compares equal to.
         path: PathBuf,
         owner: String,
         name: String,
@@ -742,7 +742,7 @@ pub fn remove(conn: &Connection, key: &str) -> Result<TrackedRepo> {
 /// plain `DELETE FROM repos` fails once `sync_results`, `repo_health_snapshots`,
 /// `context_cache`, `plans`, or `jobs` reference the repo. The schema does not
 /// declare `ON DELETE CASCADE`, so we emulate it here in a single transaction
-/// to keep `remove` / `prune` atomic.
+/// to keep `remove` atomic.
 pub fn delete_repo_cascade(conn: &Connection, repo_id: &str) -> rusqlite::Result<()> {
     // Tables with a NOT NULL FK to repos(id) — these would block the parent
     // delete outright and must be cleared first.
