@@ -1758,6 +1758,10 @@ fn run() -> Result<()> {
                 clone_only,
                 pull_only,
                 prune,
+                // The same directory `ro ship` locks under, so a sync and
+                // a ship in two processes contend on one file per repo
+                // rather than racing the same worktree.
+                state_dir: paths.state_dir.clone(),
             };
             let repo_labels = repo_labels_by_id(&conn);
             // `core.parallel` threaded through the seam that exists for exactly

@@ -535,8 +535,13 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
     // (a) Lock. A guard, so it releases on every path including a panic
     //     — a lock left held is a repo nobody can touch until the
     //     process dies.
-    let lock_dir = opts.state_dir.join("locks");
-    let _lock = match ro_git::RepoLock::acquire_default(&lock_dir, repo) {
+    //
+    // `state_dir` is passed **unjoined**: `RepoLock::acquire` adds the
+    // `locks/` component itself. Passing `state_dir.join("locks")` put the
+    // file at `<state>/locks/locks/<hash>.lock` — a path `ro sync`'s lock
+    // (once it has one) would never contend with, which is the whole
+    // point of the lock.
+    let _lock = match ro_git::RepoLock::acquire_default(&opts.state_dir, repo) {
         Ok(l) => l,
         Err(e) => {
             return RepoOutcome::Failed {

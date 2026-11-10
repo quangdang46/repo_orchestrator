@@ -116,6 +116,17 @@ pub struct SyncOptions {
     /// longer exist and never touches the remote, so it is safe to run
     /// across a fleet without asking first.
     pub prune: bool,
+    /// Where the per-repo `RepoLock` files live — `<state_dir>/locks`,
+    /// the same directory `ro ship` locks under, so a `ro sync` and a
+    /// `ro ship` in two processes contend on one file rather than racing
+    /// the same worktree.
+    ///
+    /// The in-process `Mutex` in [`sync_fleet`] only serialises rows inside
+    /// **this** process; a second `ro` binary knows nothing about it. The
+    /// fs4 lock is the cross-process half, and it has to name the same
+    /// directory the ship verbs use or the two locks are different files
+    /// guarding the same repo.
+    pub state_dir: PathBuf,
 }
 
 impl Default for SyncOptions {
@@ -128,6 +139,11 @@ impl Default for SyncOptions {
             clone_only: false,
             pull_only: false,
             prune: false,
+            // A default that is *a* directory, not *the* directory: tests
+            // and library callers get a working lock under temp; the CLI
+            // overwrites this with the real state dir so `ro sync` and
+            // `ro ship` contend on the same file.
+            state_dir: std::env::temp_dir(),
         }
     }
 }
@@ -941,6 +957,82 @@ fn sync_repo_inner(
         ro_git::read::head_oid(local).ok().flatten()
     } else {
         None
+    };
+
+    // The **cross-process** half of the per-path lock. `sync_fleet`'s
+    // `Mutex` serialises two rows inside this process; it says nothing to
+    // a second `ro sync` or a `ro ship` running in another process, and
+    // two `git pull`s in one worktree race for `.git/index.lock`. The fs4
+    // `RepoLock` is the same file `ro ship` takes, under the same
+    // `<state_dir>/locks`, so the two verbs finally contend on one lock.
+    //
+    // A **try**-lock, not a wait: a repo another `ro` is working on is
+    // *skipped*, because the alternative — queueing behind it — turns a
+    // fleet run into a convoy on whichever repo is slowest, and the work
+    // is being done either way. `Ok(None)` is contention and `Err` is a
+    // filesystem problem; `try_acquire` keeps them distinct where
+    // `acquire(.., 0)` could not.
+    //
+    // Dry runs take no lock: they mutate nothing, and a plan that
+    // reported "locked" for a repo it was only reading would be a worse
+    // answer than the plan itself.
+    let _repo_lock = if opts.dry_run {
+        None
+    } else {
+        match repo_file_lock(local, opts) {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => {
+                let duration = start.elapsed().as_millis() as u64;
+                let detail = format!(
+                    "{} is locked by another ro process; skipping rather \
+                     than racing it for the worktree",
+                    repo.local_path
+                );
+                *explicit_row = Some(pending(
+                    &repo.id,
+                    "skipped_locked",
+                    STATUS_SKIPPED,
+                    duration,
+                    Some(&detail),
+                    &pre_oid,
+                    &pre_oid,
+                ));
+                return Ok(SyncResult {
+                    repo_id: repo.id.clone(),
+                    action: "skipped_locked".into(),
+                    status: "skipped".into(),
+                    duration_ms: duration,
+                    error: None,
+                    pre_oid: pre_oid.clone(),
+                    post_oid: pre_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
+                    plan_mismatch: None,
+                    reason: Some(detail),
+                });
+            }
+            Err(e) => {
+                let duration = start.elapsed().as_millis() as u64;
+                let err_msg = format!("could not lock {}: {e:#}", repo.local_path);
+                return Ok(SyncResult {
+                    repo_id: repo.id.clone(),
+                    action: "error".into(),
+                    status: STATUS_ERROR.into(),
+                    duration_ms: duration,
+                    error: Some(err_msg),
+                    pre_oid: pre_oid.clone(),
+                    post_oid: pre_oid,
+                    ahead: None,
+                    behind: None,
+                    unmeasurable_reason: None,
+                    plan: None,
+                    plan_mismatch: None,
+                    reason: None,
+                });
+            }
+        }
     };
 
     // `git remote prune` removes local remote-tracking refs for branches
@@ -1906,6 +1998,28 @@ fn lock_key(raw: &Path) -> PathBuf {
     std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
 }
 
+/// The fs4 lock for one checkout, or `None` when another process holds it.
+///
+/// `RepoLock` keys the lock file on the **canonicalised** repo path, which
+/// fails for a path that does not exist yet — every repo this sync is
+/// about to clone. Canonicalising the parent and re-joining the file name
+/// gives the same key the path will have the moment the clone lands, so a
+/// `ro ship` starting mid-clone still contends on the same file instead of
+/// locking a spelling the other verb never computes.
+fn repo_file_lock(local: &Path, opts: &SyncOptions) -> Result<Option<ro_git::RepoLock>> {
+    let lock_path = if local.exists() {
+        local.to_path_buf()
+    } else {
+        match (local.parent(), local.file_name()) {
+            (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+                .map(|p| p.join(name))
+                .unwrap_or_else(|_| local.to_path_buf()),
+            _ => local.to_path_buf(),
+        }
+    };
+    ro_git::RepoLock::try_acquire(&opts.state_dir, &lock_path)
+}
+
 /// One lock per distinct checkout, shared by every row naming it.
 ///
 /// Keyed on a **canonicalised** path so `/tmp/x`, `/tmp/x/` and a symlink to
@@ -2136,6 +2250,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(open, 0, "a finished sync run must be finalised");
+    }
+
+    /// A repo another `ro` process holds is **skipped**, not raced.
+    ///
+    /// The in-process `Mutex` in `sync_fleet` says nothing to a second
+    /// `ro sync` or a `ro ship` — they are different processes. The fs4
+    /// `RepoLock` under `<state_dir>/locks` is the shared answer, and a
+    /// try-lock means the loser reports `skipped_locked` instead of
+    /// queueing behind the winner or, worse, pulling the same worktree
+    /// concurrently.
+    #[test]
+    fn a_repo_locked_by_another_process_is_skipped_not_raced() {
+        let (tmp, conn) = setup();
+        let remote = init_bare_remote(tmp.path());
+        commit_to_remote(tmp.path(), &remote, "a.txt", "hello");
+
+        let state_dir = tmp.path().join("state");
+        let local_path = tmp.path().join("local").join("proj1");
+        let repo_id = uuid::Uuid::new_v4().to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        conn.execute(
+            "INSERT INTO repos (id, host, owner, name, clone_url, local_path, added_at, updated_at)
+             VALUES (?1, 'github.com', 'alice', 'proj1', ?2, ?3, ?4, ?5)",
+            params![
+                repo_id,
+                remote.to_string_lossy().to_string(),
+                local_path.to_string_lossy().to_string(),
+                now,
+                now
+            ],
+        )
+        .unwrap();
+
+        // First sync clones the checkout, so the lock has a real path.
+        let opts = SyncOptions {
+            state_dir: state_dir.clone(),
+            ..Default::default()
+        };
+        let results = sync_all(&conn, &opts, &[]).unwrap();
+        assert_eq!(results[0].status, "success");
+
+        // Hold the lock exactly as a second `ro` process would.
+        let held = ro_git::RepoLock::try_acquire(&state_dir, &local_path)
+            .unwrap()
+            .expect("the lock is free after the first sync released it");
+
+        let results = sync_all(&conn, &opts, &[]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].action, "skipped_locked",
+            "a contended repo must be skipped, not synced twice: {:?}",
+            results[0]
+        );
+        assert_eq!(results[0].status, "skipped");
+        // A skip is not a failure: another process is doing the work.
+        assert_eq!(run_exit_code(&results), 0);
+
+        drop(held);
+        // …and once it is released the same run syncs normally again.
+        let results = sync_all(&conn, &opts, &[]).unwrap();
+        assert_eq!(results[0].status, "success");
     }
 
     /// `--prune` must actually prune.

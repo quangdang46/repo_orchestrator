@@ -70,18 +70,7 @@ impl RepoLock {
     /// locks to an identifier nothing will ever match — a visible mistake,
     /// rather than a directory that appears from nowhere.
     pub fn acquire(state_dir: &Path, repo_path: &Path, timeout_secs: u64) -> Result<Self> {
-        let lock_dir = state_dir.join("locks");
-        std::fs::create_dir_all(&lock_dir)
-            .with_context(|| format!("creating lock dir {}", lock_dir.display()))?;
-        let lock_path = lock_dir.join(format!("{}.lock", lock_key(repo_path)));
-
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("opening lock file {}", lock_path.display()))?;
+        let (file, lock_path) = open_lock_file(state_dir, repo_path)?;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
@@ -121,6 +110,32 @@ impl RepoLock {
         Self::acquire(state_dir, repo_path, DEFAULT_LOCK_TIMEOUT_SECS)
     }
 
+    /// Try to acquire **once**, without waiting.
+    ///
+    /// `Ok(Some)` is the lock, `Ok(None)` is "another process holds it" —
+    /// a distinct answer from `Err`, which is a filesystem problem. The
+    /// fleet sync needs the distinction: a contended repo is *skipped*
+    /// (another `ro` is doing the work, and doing it twice is the race the
+    /// lock exists to prevent), while a lock file that cannot be opened is
+    /// a failure the run has to report.
+    ///
+    /// `acquire(.., 0)` cannot express this: a zero deadline turns
+    /// contention into the same `Err` a real I/O failure produces, and the
+    /// caller cannot tell them apart.
+    pub fn try_acquire(state_dir: &Path, repo_path: &Path) -> Result<Option<Self>> {
+        let (file, lock_path) = open_lock_file(state_dir, repo_path)?;
+        match file.try_lock_exclusive() {
+            Ok(true) => Ok(Some(Self {
+                file,
+                lock_path,
+                repo_path: repo_path.to_path_buf(),
+            })),
+            Ok(false) => Ok(None),
+            Err(e) => Err(e)
+                .with_context(|| format!("acquiring exclusive lock on {}", lock_path.display())),
+        }
+    }
+
     pub fn lock_path(&self) -> &Path {
         &self.lock_path
     }
@@ -136,6 +151,26 @@ impl Drop for RepoLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
+}
+
+/// Open the lock file for `repo_path` under `state_dir/locks`, creating
+/// the directory and the file if needed. Shared by [`RepoLock::acquire`]
+/// and [`RepoLock::try_acquire`] so the two can never disagree about which
+/// file a repo locks.
+fn open_lock_file(state_dir: &Path, repo_path: &Path) -> Result<(std::fs::File, PathBuf)> {
+    let lock_dir = state_dir.join("locks");
+    std::fs::create_dir_all(&lock_dir)
+        .with_context(|| format!("creating lock dir {}", lock_dir.display()))?;
+    let lock_path = lock_dir.join(format!("{}.lock", lock_key(repo_path)));
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening lock file {}", lock_path.display()))?;
+    Ok((file, lock_path))
 }
 
 /// A stable filename for a repo path.
@@ -195,6 +230,30 @@ mod tests {
         );
         let _reacquired = RepoLock::acquire(&state, &repo, 1)
             .expect("a second acquire must succeed once the first is dropped");
+    }
+
+    /// `try_acquire` tells contention (`None`) apart from an error (`Err`)
+    /// — the distinction `acquire(.., 0)` cannot make, and the one a fleet
+    /// sync needs to skip a repo rather than fail it.
+    #[test]
+    fn try_acquire_reports_contention_as_none_not_error() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let state = tmp.path().join("state");
+
+        let held = RepoLock::try_acquire(&state, &repo)
+            .unwrap()
+            .expect("the lock is free");
+        assert!(
+            RepoLock::try_acquire(&state, &repo).unwrap().is_none(),
+            "a held lock must answer None, not Err"
+        );
+        drop(held);
+        assert!(
+            RepoLock::try_acquire(&state, &repo).unwrap().is_some(),
+            "a released lock must be acquirable again"
+        );
     }
 
     /// A contended acquire still fails, and the message says where the lock
