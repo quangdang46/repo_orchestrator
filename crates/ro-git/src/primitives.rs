@@ -96,10 +96,10 @@ pub fn parse_porcelain(raw: &str) -> Vec<StatusEntry> {
         let code = entry[..2].replace(' ', "");
         let mut path = entry[3..].to_string();
 
-        if code.starts_with('R') || code.starts_with('C') {
-            if let Some(dest) = fields.next() {
-                path = dest.to_string();
-            }
+        if (code.starts_with('R') || code.starts_with('C'))
+            && let Some(dest) = fields.next()
+        {
+            path = dest.to_string();
         }
         out.push(StatusEntry { code, path });
     }

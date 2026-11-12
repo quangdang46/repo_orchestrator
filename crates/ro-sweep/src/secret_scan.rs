@@ -175,11 +175,11 @@ pub const MAX_SCAN_BYTES: u64 = 64 * 1024 * 1024;
 /// UTF-16 file is a credential the moment it is committed, and the NUL
 /// density test cannot tell it from a PNG.
 pub fn scan_file(path: &Path) -> Result<Vec<SecretFinding>> {
-    if let Ok(meta) = path.metadata() {
-        if meta.len() > MAX_SCAN_BYTES {
-            warn_skipped(path, meta.len());
-            return Ok(Vec::new());
-        }
+    if let Ok(meta) = path.metadata()
+        && meta.len() > MAX_SCAN_BYTES
+    {
+        warn_skipped(path, meta.len());
+        return Ok(Vec::new());
     }
     // `take` bounds the read even when metadata lies (or is unavailable),
     // so a pathological file can never allocate more than the cap.
@@ -256,7 +256,9 @@ enum Endian {
 fn decode_utf16(bytes: &[u8], endian: Endian, skip: usize) -> String {
     let body = &bytes[skip..];
     let units: Vec<u16> = body
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| match endian {
             Endian::Little => u16::from_le_bytes([c[0], c[1]]),
             Endian::Big => u16::from_be_bytes([c[0], c[1]]),
@@ -273,7 +275,9 @@ fn decode_utf16(bytes: &[u8], endian: Endian, skip: usize) -> String {
 /// a partially-decoded file still scans the part that decoded.
 fn decode_utf32(bytes: &[u8], endian: Endian, skip: usize) -> String {
     bytes[skip..]
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| {
             let v = match endian {
                 Endian::Little => u32::from_le_bytes([c[0], c[1], c[2], c[3]]),

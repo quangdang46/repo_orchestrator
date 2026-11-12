@@ -38,10 +38,10 @@ pub fn validate(cfg: &AppConfig) -> Result<()> {
     // for **every** repo: `ro commit --dry-run` → exit 70, `error planning
     // o/30: unknown engine "bogus"`. A typo in a flag value is reported at the
     // flag; a typo in a config value must be reported at the config.
-    if let Some(engine) = cfg.agent.engine.as_deref() {
-        if !["claude", "codex", "git"].contains(&engine) {
-            bail!("agent.engine: '{engine}' is not valid (expected: claude | codex | git)");
-        }
+    if let Some(engine) = cfg.agent.engine.as_deref()
+        && !["claude", "codex", "git"].contains(&engine)
+    {
+        bail!("agent.engine: '{engine}' is not valid (expected: claude | codex | git)");
     }
 
     // Everything else this used to validate is gone with its table:

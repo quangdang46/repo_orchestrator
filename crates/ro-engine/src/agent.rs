@@ -1327,31 +1327,30 @@ fn parse_plan(text: &str) -> Vec<CommitGroup> {
             None => break,
         };
         let block = &body[..end_at];
-        if lang.trim() == "ro-commits" {
-            if let Ok(serde_json::Value::Array(items)) =
+        if lang.trim() == "ro-commits"
+            && let Ok(serde_json::Value::Array(items)) =
                 serde_json::from_str::<serde_json::Value>(block.trim())
-            {
-                let groups: Vec<CommitGroup> = items
-                    .iter()
-                    .filter_map(|it| {
-                        let subject = it.get("subject")?.as_str()?.trim().to_string();
-                        if subject.is_empty() {
-                            return None;
-                        }
-                        let files: Vec<String> = it
-                            .get("files")?
-                            .as_array()?
-                            .iter()
-                            .filter_map(|f| f.as_str())
-                            .map(|f| f.trim().trim_matches('"').to_string())
-                            .filter(|f| !f.is_empty())
-                            .collect();
-                        Some(CommitGroup { subject, files })
-                    })
-                    .collect();
-                if !groups.is_empty() {
-                    return groups;
-                }
+        {
+            let groups: Vec<CommitGroup> = items
+                .iter()
+                .filter_map(|it| {
+                    let subject = it.get("subject")?.as_str()?.trim().to_string();
+                    if subject.is_empty() {
+                        return None;
+                    }
+                    let files: Vec<String> = it
+                        .get("files")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|f| f.as_str())
+                        .map(|f| f.trim().trim_matches('"').to_string())
+                        .filter(|f| !f.is_empty())
+                        .collect();
+                    Some(CommitGroup { subject, files })
+                })
+                .collect();
+            if !groups.is_empty() {
+                return groups;
             }
         }
         rest = body.get(end_at + 3..).unwrap_or("");
@@ -1644,28 +1643,28 @@ fn run_with_deadline(
     if let Some(j) = &job {
         j.adopt(&child);
     }
-    if let Some(text) = stdin_text {
-        if let Some(mut pipe) = child.stdin.take() {
-            // Written on its own thread, and the reason is a deadlock.
-            //
-            // A child that never reads stdin — and `ro` cannot know that in
-            // advance — leaves `write_all` blocked once the pipe fills, and
-            // that write happens *before* the poll loop below, so a large
-            // prompt would hang the run with the deadline not yet armed. The
-            // deadline is the only thing standing between a wedged agent and
-            // a wedged fleet, so it must never be behind a blocking write.
-            //
-            // The thread owns the pipe and drops it, so the child still sees
-            // the whole prompt followed by end-of-input. If the child dies
-            // first, the write fails and the thread ends; a thread blocked on
-            // a pipe that just broke is a thread that returns.
-            let owned = text.to_string();
-            std::thread::spawn(move || {
-                use std::io::Write;
-                let _ = pipe.write_all(owned.as_bytes());
-                let _ = pipe.flush();
-            });
-        }
+    if let Some(text) = stdin_text
+        && let Some(mut pipe) = child.stdin.take()
+    {
+        // Written on its own thread, and the reason is a deadlock.
+        //
+        // A child that never reads stdin — and `ro` cannot know that in
+        // advance — leaves `write_all` blocked once the pipe fills, and
+        // that write happens *before* the poll loop below, so a large
+        // prompt would hang the run with the deadline not yet armed. The
+        // deadline is the only thing standing between a wedged agent and
+        // a wedged fleet, so it must never be behind a blocking write.
+        //
+        // The thread owns the pipe and drops it, so the child still sees
+        // the whole prompt followed by end-of-input. If the child dies
+        // first, the write fails and the thread ends; a thread blocked on
+        // a pipe that just broke is a thread that returns.
+        let owned = text.to_string();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = pipe.write_all(owned.as_bytes());
+            let _ = pipe.flush();
+        });
     }
 
     // Both readers are taken **before** the poll loop starts, so there is no

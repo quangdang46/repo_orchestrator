@@ -627,10 +627,10 @@ fn find_nested_repo(
             if SKIP.contains(&name.as_ref()) {
                 continue;
             }
-            if path.is_dir() {
-                if let Some(found) = walk(&path, depth - 1, self_dir) {
-                    return Some(found);
-                }
+            if path.is_dir()
+                && let Some(found) = walk(&path, depth - 1, self_dir)
+            {
+                return Some(found);
             }
         }
         None
@@ -1320,18 +1320,18 @@ fn run() -> Result<()> {
                 // row and the repo, which is more use than "cannot be
                 // inspected". Refusing twice would only cost the better
                 // message.
-                if let Ok(md) = std::fs::symlink_metadata(&path) {
-                    if md.file_type().is_symlink() {
-                        eprintln!(
-                            "refused: {} is a symlink, so it is not the working copy \
+                if let Ok(md) = std::fs::symlink_metadata(&path)
+                    && md.file_type().is_symlink()
+                {
+                    eprintln!(
+                        "refused: {} is a symlink, so it is not the working copy \
                              the row registered — it points somewhere else, and \
                              deleting through it would act on that somewhere \
                              else. Nothing was deleted. Point the row at the \
                              real checkout, or remove the link yourself.",
-                            path.display()
-                        );
-                        std::process::exit(exit::EX_USAGE as i32);
-                    }
+                        path.display()
+                    );
+                    std::process::exit(exit::EX_USAGE as i32);
                 }
 
                 // (2) Refuse if this directory is, or *contains*, a

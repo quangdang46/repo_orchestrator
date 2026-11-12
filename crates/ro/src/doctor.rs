@@ -271,24 +271,24 @@ pub fn run(opts: DoctorOptions) -> DoctorReport {
     // machine is not a diagnostic run, and the "ok" is worse than the write:
     // it tells the user their state is healthy when the only thing that
     // happened is that ro created it.
-    if paths.state_db().exists() {
-        if let Ok(conn) = ro_state::open_db(&paths.state_db()) {
-            // `github.host` is read here. The `base_uri` was a hardcoded
-            // `None`, so every probe went to `github.com` whatever the
-            // config said — a workspace-wide grep for `github.host` found it
-            // only in comments and tests. A user on GitHub Enterprise was
-            // diagnosed against the public API and told their token was
-            // rejected (HTTP 401) when it had never been offered to the
-            // right host. `ro_github::auth::build_client` already takes
-            // `Option<&str>` and builds `https://{host}/api/v3` for a host
-            // that is not `github.com`; it was simply never given one.
-            // A config that will not parse is already reported above;
-            // probing a guessed host on top of it would add a second,
-            // wrong answer to a question that was never asked.
-            if let Ok(cfg) = &config {
-                let host = github_host(cfg);
-                checks.extend(check_repo_write_access(&conn, host.as_deref()));
-            }
+    if paths.state_db().exists()
+        && let Ok(conn) = ro_state::open_db(&paths.state_db())
+    {
+        // `github.host` is read here. The `base_uri` was a hardcoded
+        // `None`, so every probe went to `github.com` whatever the
+        // config said — a workspace-wide grep for `github.host` found it
+        // only in comments and tests. A user on GitHub Enterprise was
+        // diagnosed against the public API and told their token was
+        // rejected (HTTP 401) when it had never been offered to the
+        // right host. `ro_github::auth::build_client` already takes
+        // `Option<&str>` and builds `https://{host}/api/v3` for a host
+        // that is not `github.com`; it was simply never given one.
+        // A config that will not parse is already reported above;
+        // probing a guessed host on top of it would add a second,
+        // wrong answer to a question that was never asked.
+        if let Ok(cfg) = &config {
+            let host = github_host(cfg);
+            checks.extend(check_repo_write_access(&conn, host.as_deref()));
         }
     }
 
@@ -771,18 +771,18 @@ fn upgrade_existing_config(cfg_path: &Path) -> (CheckResult, usize) {
         }
     }
 
-    if added > 0 {
-        if let Err(e) = std::fs::write(cfg_path, doc.to_string()) {
-            return (
-                CheckResult::fail(
-                    "config",
-                    Severity::Required,
-                    format!("could not write {}: {e}", cfg_path.display()),
-                    "check the file's permissions".to_string(),
-                ),
-                0,
-            );
-        }
+    if added > 0
+        && let Err(e) = std::fs::write(cfg_path, doc.to_string())
+    {
+        return (
+            CheckResult::fail(
+                "config",
+                Severity::Required,
+                format!("could not write {}: {e}", cfg_path.display()),
+                "check the file's permissions".to_string(),
+            ),
+            0,
+        );
     }
 
     // Name the tables left alone. Silent divergence between what is in the file
@@ -1045,18 +1045,18 @@ fn check_and_optionally_fix_state(
                 0,
             );
         }
-        if let Some(parent) = db_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return (
-                    CheckResult::fail(
-                        "state",
-                        Severity::Required,
-                        format!("cannot create state dir {}: {e}", parent.display()),
-                        "check XDG_STATE_HOME permissions",
-                    ),
-                    0,
-                );
-            }
+        if let Some(parent) = db_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return (
+                CheckResult::fail(
+                    "state",
+                    Severity::Required,
+                    format!("cannot create state dir {}: {e}", parent.display()),
+                    "check XDG_STATE_HOME permissions",
+                ),
+                0,
+            );
         }
     }
 
@@ -2116,10 +2116,10 @@ layout = \"flat\"
             if header.trim().is_empty() {
                 break;
             }
-            if let Some((name, value)) = header.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("authorization") {
-                    authorization = value.trim().to_string();
-                }
+            if let Some((name, value)) = header.split_once(':')
+                && name.trim().eq_ignore_ascii_case("authorization")
+            {
+                authorization = value.trim().to_string();
             }
         }
         auths

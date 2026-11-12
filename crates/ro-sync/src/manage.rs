@@ -1007,14 +1007,14 @@ fn strip_verbatim(p: std::path::PathBuf) -> std::path::PathBuf {
 pub fn find_repo(conn: &Connection, key: &str) -> Result<TrackedRepo> {
     // Try owner/name
     let parts: Vec<&str> = key.splitn(2, '/').collect();
-    if parts.len() == 2 {
-        if let Ok(r) = conn.query_row(
+    if parts.len() == 2
+        && let Ok(r) = conn.query_row(
             &format!("SELECT {REPO_COLUMNS} FROM repos WHERE LOWER(owner)=LOWER(?1) AND LOWER(name)=LOWER(?2)"),
             params![parts[0], parts[1]],
             row_to_tracked,
-        ) {
-            return Ok(r);
-        }
+        )
+    {
+        return Ok(r);
     }
     // Try alias
     if let Ok(r) = conn.query_row(

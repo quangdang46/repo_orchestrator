@@ -852,10 +852,8 @@ pub fn run_one(plan: &RepoPlan, opts: &RunOptions) -> RepoOutcome {
             // and the branch is deleted before the outcome is reported,
             // so "nothing to commit" also means "nothing changed".
             let nothing = |repo: &Path| {
-                if onto_created {
-                    if let Some(onto) = onto_branch {
-                        unmake_onto_branch(repo, onto, onto_previous.as_deref());
-                    }
+                if onto_created && let Some(onto) = onto_branch {
+                    unmake_onto_branch(repo, onto, onto_previous.as_deref());
                 }
                 RepoOutcome::NothingToCommit
             };

@@ -123,13 +123,13 @@ impl RepoSpec {
         };
 
         // Try SSH format: git@github.com:owner/repo.git
-        if let Some(rest) = spec_part.strip_prefix("git@") {
-            if let Some(colon) = rest.find(':') {
-                let host = &rest[..colon];
-                let path = &rest[colon + 1..];
-                let path = path.strip_suffix(".git").unwrap_or(path);
-                return Self::from_host_owner_name(host, path, branch, alias, "https");
-            }
+        if let Some(rest) = spec_part.strip_prefix("git@")
+            && let Some(colon) = rest.find(':')
+        {
+            let host = &rest[..colon];
+            let path = &rest[colon + 1..];
+            let path = path.strip_suffix(".git").unwrap_or(path);
+            return Self::from_host_owner_name(host, path, branch, alias, "https");
         }
 
         // `https://`, `http://` and `ssh://` all carry a host and a path in
