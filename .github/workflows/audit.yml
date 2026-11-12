@@ -23,9 +23,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1 # v2.0.18
+      - uses: dtolnay/rust-toolchain@stable
+      # The EmbarkStudios docker action defaults to a musl host and trips
+      # over rust-toolchain.toml (stable-x86_64-unknown-linux-musl is never
+      # installed in the container). cargo-deny is a standalone binary —
+      # install it directly instead.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
-          command: check advisories bans licenses sources
+          tool: cargo-deny
+      - run: cargo deny check advisories bans licenses sources
 
   cargo-audit:
     name: cargo-audit
